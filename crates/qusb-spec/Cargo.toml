@@ -1,0 +1,10 @@
+[package]
+name = "qusb-spec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = { version = "2.6.0", features = ["serde"] }
+bytemuck = "1.20.0"
+postcard = "1.0.10"
+serde = { version = "1.0.215", features = ["derive"] }
