@@ -1,16 +1,174 @@
-use std::{borrow::Cow, marker::PhantomData, ops::Deref};
-
+use std::borrow::{Borrow, Cow};
 use bitflags::bitflags;
 use serde::{
-    de::{DeserializeOwned, Visitor},
+    de::{self, Visitor},
     ser::SerializeStruct,
     Deserialize, Serialize,
 };
 
+pub const BUS_ID_SIZE: usize = 32;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct BusId<'a>(pub Cow<'a, LimitedStr<BUS_ID_SIZE>>);
+
+#[derive(Debug, Clone)]
+pub enum QusbReq<'a> {
+    ListDevices,
+    ImportDevice(BusId<'a>),
+}
+
+impl<'a> Serialize for QusbReq<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut ser = serializer.serialize_struct("QusbReq", 2)?;
+        ser.serialize_field("version", &VERSION)?;
+        ser.serialize_field("req", self)?;
+        ser.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for QusbReq<'static> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field { Version, Req }
+
+        #[derive(Debug, Clone, Deserialize)]
+        pub enum Inner {
+            ListDevices,
+            ImportDevice(BusId<'static>),
+        }
+
+        impl From<Inner> for QusbReq<'static> {
+            fn from(value: Inner) -> Self {
+                match value {
+                    Inner::ListDevices => Self::ListDevices,
+                    Inner::ImportDevice(bus_id) => Self::ImportDevice(bus_id),
+                }
+            }
+        }
+        
+        struct QusbReqVisitor;
+        impl<'de> Visitor<'de> for QusbReqVisitor {
+            type Value = QusbReq<'static>;
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::SeqAccess<'de>, {
+                let version: u16 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let req: Inner = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
+
+                if version != VERSION {
+                    Err(de::Error::invalid_value(de::Unexpected::Unsigned(version.into()), &self))
+                } else {
+                    Ok(req.into())
+                }
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                where
+                    A: de::MapAccess<'de>, {
+                let mut version = None;
+                let mut req = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Version => {
+                            if version.is_some() {
+                                return Err(de::Error::duplicate_field("version"));
+                            }
+                            version = Some(map.next_value()?)
+                        }
+                        Field::Req => {
+                            if req.is_some() {
+                                return Err(de::Error::duplicate_field("req"));
+                            }
+                            req = Some(map.next_value()?)
+                        }
+                    }
+                }
+
+                let version: u16 = version.ok_or_else(|| de::Error::missing_field("version"))?;
+                let req: Inner = req.ok_or_else(|| de::Error::missing_field("req"))?;
+
+                if version != VERSION {
+                    Err(de::Error::invalid_value(de::Unexpected::Unsigned(version.into()), &self))
+                } else {
+                    Ok(req.into())
+                }
+            }
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a valid QusbReq containing a VERSION and REQUEST")
+            }
+        }
+
+        const FIELDS: &[&str] = &["version", "req"];
+        deserializer.deserialize_struct("QusbReq", FIELDS, QusbReqVisitor)
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct LimitedStr<const MAX_LENGTH: usize>(str);
+
+impl<const MAX_LENGTH: usize> Borrow<LimitedStr<MAX_LENGTH>> for LimitedString<MAX_LENGTH> {
+    fn borrow(&self) -> &LimitedStr<MAX_LENGTH> {
+        unsafe { LimitedStr::<MAX_LENGTH>::from_str_unchecked(self.0.borrow()) }
+    }
+}
+
+impl<const MAX_LENGTH: usize> LimitedStr<MAX_LENGTH> {
+    pub const fn from_str(s: &str) -> Option<&Self> {
+        if s.len() <= MAX_LENGTH {
+            Some(unsafe { Self::from_str_unchecked(s) })
+        } else {
+            None
+        }
+    }
+
+    pub const unsafe fn from_str_unchecked(s: &str) -> &Self {
+        union StrRepr<'a, const MAX_LENGTH: usize> {
+            normal_str: &'a str,
+            limited_str: &'a LimitedStr<MAX_LENGTH>,
+        }
+        unsafe { StrRepr::<MAX_LENGTH> { normal_str: s }.limited_str }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct LimitedString<const MAX_LENGTH: usize>(String);
+
+impl<const MAX_LENGTH: usize> ToOwned for LimitedStr<MAX_LENGTH> {
+    type Owned = LimitedString<MAX_LENGTH>;
+
+    fn to_owned(&self) -> Self::Owned {
+        LimitedString(self.0.to_owned())
+    }
+}
+
+impl<const MAX_LENGTH: usize> LimitedString<MAX_LENGTH> {
+    pub fn from_string(s: String) -> Result<Self, String> {
+        if s.len() <= MAX_LENGTH {
+            Ok(Self(s))
+        } else {
+            Err(s)
+        }
+    }
+}
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(transparent)]
-    pub struct Command: u16 {
+    struct CommandOld: u16 {
         const OP_REQUEST = 0x80 << 8;
         const OP_REPLY = 0x00 << 8;
 
@@ -28,7 +186,7 @@ bitflags! {
     }
 }
 
-const VERSION: u16 = 0x0111;
+const VERSION: u16 = 0x0112;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]
@@ -52,159 +210,6 @@ impl core::fmt::Display for ResponseStatus {
             ResponseStatus::Unexpected => write!(f, "Unexpected response"),
         }
     }
-}
-
-pub trait Request {
-    const COMMAND: Command;
-}
-
-pub struct QusbReq<T: Request> {
-    req: T,
-}
-
-impl<T> Serialize for QusbReq<T>
-where
-    T: Request + Serialize,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = serializer.serialize_struct("QusbReq", 4)?;
-        state.serialize_field("version", &VERSION)?;
-        state.serialize_field("command", &T::COMMAND)?;
-        state.serialize_field("status", &ResponseStatus::Success)?;
-        state.serialize_field("req", &self.req)?;
-        state.end()
-    }
-}
-
-impl<'de, T> Deserialize<'de> for QusbReq<T>
-where
-    T: Request + DeserializeOwned,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field {
-            Version,
-            Command,
-            Status,
-            Req,
-        }
-
-        struct QusbReqVisitor<T>(PhantomData<T>);
-        impl<'de, T> Visitor<'de> for QusbReqVisitor<T>
-        where
-            T: Request + DeserializeOwned,
-        {
-            type Value = QusbReq<T>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str(
-                    "a valid QusbReq containing a VERSION, COMMAND, 0 STATUS, and REQUEST",
-                )
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let version: u16 = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let _command: Command = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                let _status: ResponseStatus = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let req: T = seq
-                    .next_element()?
-                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
-
-                // Check version
-                if version != VERSION {
-                    Err(serde::de::Error::invalid_value(
-                        serde::de::Unexpected::Unsigned(version.into()),
-                        &self,
-                    ))
-                } else {
-                    Ok(QusbReq { req })
-                }
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut version = None;
-                let mut command = None;
-                let mut status = None;
-                let mut req = None;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Version => {
-                            if version.is_some() {
-                                return Err(serde::de::Error::duplicate_field("version"));
-                            }
-                            version = Some(map.next_value()?);
-                        }
-                        Field::Command => {
-                            if command.is_some() {
-                                return Err(serde::de::Error::duplicate_field("command"));
-                            }
-                            command = Some(map.next_value()?);
-                        }
-                        Field::Status => {
-                            if status.is_some() {
-                                return Err(serde::de::Error::duplicate_field("status"));
-                            }
-                            status = Some(map.next_value()?);
-                        }
-                        Field::Req => {
-                            if req.is_some() {
-                                return Err(serde::de::Error::duplicate_field("status"));
-                            }
-                            req = Some(map.next_value()?);
-                        }
-                    }
-                }
-
-                let version: u16 =
-                    version.ok_or_else(|| serde::de::Error::missing_field("version"))?;
-                let _command: Command =
-                    command.ok_or_else(|| serde::de::Error::missing_field("command"))?;
-                let _status: ResponseStatus =
-                    status.ok_or_else(|| serde::de::Error::missing_field("status"))?;
-                let req: T = req.ok_or_else(|| serde::de::Error::missing_field("req"))?;
-
-                // Check version
-                if version != VERSION {
-                    Err(serde::de::Error::invalid_value(
-                        serde::de::Unexpected::Unsigned(version.into()),
-                        &self,
-                    ))
-                } else {
-                    Ok(QusbReq { req })
-                }
-            }
-        }
-
-        const FIELDS: &[&str] = &["version", "command", "status", "req"];
-        deserializer.deserialize_struct("QusbReq", FIELDS, QusbReqVisitor(PhantomData))
-    }
-}
-
-struct Import<'a> {
-    bus_id: Cow<'a, str>,
-}
-
-impl Request for Import<'_> {
-    const COMMAND: Command = Command::OP_REQ_IMPORT;
 }
 
 #[cfg(test)]
