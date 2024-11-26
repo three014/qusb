@@ -1,0 +1,13 @@
+[package]
+name = "qusb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2.6.0"
+quinn = "0.11.6"
+rcgen = "0.13.1"
+thiserror = "2.0.3"
+tokio = "1.41.1"
+spec = { package = "qusb-spec", path = "../qusb-spec" }
+
