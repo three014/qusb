@@ -1,170 +1,72 @@
-use std::borrow::{Borrow, Cow};
-use bitflags::bitflags;
-use serde::{
-    de::{self, Visitor},
-    ser::SerializeStruct,
-    Deserialize, Serialize,
-};
+use serde::{de, Deserialize, Serialize};
+use std::num::NonZeroU64;
+use thiserror::Error;
 
 pub const BUS_ID_SIZE: usize = 32;
+pub const VERSION: u16 = 0x0211;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbDeviceId {
+    bus_number: u8,
+    device_addr: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportedDevice {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbDevices {
+    list: Vec<UsbDeviceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbDeviceInfo {}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
-pub struct BusId<'a>(pub Cow<'a, LimitedStr<BUS_ID_SIZE>>);
+pub struct TransactionId(pub NonZeroU64);
 
-#[derive(Debug, Clone)]
-pub enum QusbReq<'a> {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct PayloadId(pub NonZeroU64);
+
+#[derive(Debug, Error, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Error {
+    #[error("request failed")]
+    Failed = 1,
+    #[error("device busy (exported)")]
+    DevBusy,
+    #[error("device in error state")]
+    DevErr,
+    #[error("device not found")]
+    NoDev,
+    #[error("unexpected response")]
+    Unexpected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QusbResp {
+    version: u16,
+    transaction_id: TransactionId,
+    resp: Result<Option<TransactionId>, Error>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InnerReq {
     ListDevices,
-    ImportDevice(BusId<'a>),
-}
-
-impl<'a> Serialize for QusbReq<'a> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut ser = serializer.serialize_struct("QusbReq", 2)?;
-        ser.serialize_field("version", &VERSION)?;
-        ser.serialize_field("req", self)?;
-        ser.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for QusbReq<'static> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de> {
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field { Version, Req }
-
-        #[derive(Debug, Clone, Deserialize)]
-        pub enum Inner {
-            ListDevices,
-            ImportDevice(BusId<'static>),
-        }
-
-        impl From<Inner> for QusbReq<'static> {
-            fn from(value: Inner) -> Self {
-                match value {
-                    Inner::ListDevices => Self::ListDevices,
-                    Inner::ImportDevice(bus_id) => Self::ImportDevice(bus_id),
-                }
-            }
-        }
-        
-        struct QusbReqVisitor;
-        impl<'de> Visitor<'de> for QusbReqVisitor {
-            type Value = QusbReq<'static>;
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-                where
-                    A: serde::de::SeqAccess<'de>, {
-                let version: u16 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
-                let req: Inner = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
-
-                if version != VERSION {
-                    Err(de::Error::invalid_value(de::Unexpected::Unsigned(version.into()), &self))
-                } else {
-                    Ok(req.into())
-                }
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-                where
-                    A: de::MapAccess<'de>, {
-                let mut version = None;
-                let mut req = None;
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Version => {
-                            if version.is_some() {
-                                return Err(de::Error::duplicate_field("version"));
-                            }
-                            version = Some(map.next_value()?)
-                        }
-                        Field::Req => {
-                            if req.is_some() {
-                                return Err(de::Error::duplicate_field("req"));
-                            }
-                            req = Some(map.next_value()?)
-                        }
-                    }
-                }
-
-                let version: u16 = version.ok_or_else(|| de::Error::missing_field("version"))?;
-                let req: Inner = req.ok_or_else(|| de::Error::missing_field("req"))?;
-
-                if version != VERSION {
-                    Err(de::Error::invalid_value(de::Unexpected::Unsigned(version.into()), &self))
-                } else {
-                    Ok(req.into())
-                }
-            }
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a valid QusbReq containing a VERSION and REQUEST")
-            }
-        }
-
-        const FIELDS: &[&str] = &["version", "req"];
-        deserializer.deserialize_struct("QusbReq", FIELDS, QusbReqVisitor)
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(transparent)]
-#[repr(transparent)]
-pub struct LimitedStr<const MAX_LENGTH: usize>(str);
-
-impl<const MAX_LENGTH: usize> Borrow<LimitedStr<MAX_LENGTH>> for LimitedString<MAX_LENGTH> {
-    fn borrow(&self) -> &LimitedStr<MAX_LENGTH> {
-        unsafe { LimitedStr::<MAX_LENGTH>::from_str_unchecked(self.0.borrow()) }
-    }
-}
-
-impl<const MAX_LENGTH: usize> LimitedStr<MAX_LENGTH> {
-    pub const fn from_str(s: &str) -> Option<&Self> {
-        if s.len() <= MAX_LENGTH {
-            Some(unsafe { Self::from_str_unchecked(s) })
-        } else {
-            None
-        }
-    }
-
-    pub const unsafe fn from_str_unchecked(s: &str) -> &Self {
-        union StrRepr<'a, const MAX_LENGTH: usize> {
-            normal_str: &'a str,
-            limited_str: &'a LimitedStr<MAX_LENGTH>,
-        }
-        unsafe { StrRepr::<MAX_LENGTH> { normal_str: s }.limited_str }
-    }
+    ImportDevice(UsbDeviceId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-#[repr(transparent)]
-pub struct LimitedString<const MAX_LENGTH: usize>(String);
-
-impl<const MAX_LENGTH: usize> ToOwned for LimitedStr<MAX_LENGTH> {
-    type Owned = LimitedString<MAX_LENGTH>;
-
-    fn to_owned(&self) -> Self::Owned {
-        LimitedString(self.0.to_owned())
-    }
+pub struct QusbReq {
+    pub version: u16,
+    pub transaction_id: TransactionId,
+    pub req: InnerReq,
 }
 
-impl<const MAX_LENGTH: usize> LimitedString<MAX_LENGTH> {
-    pub fn from_string(s: String) -> Result<Self, String> {
-        if s.len() <= MAX_LENGTH {
-            Ok(Self(s))
-        } else {
-            Err(s)
-        }
-    }
-}
-
+/*
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     #[serde(transparent)]
@@ -185,8 +87,6 @@ bitflags! {
         const OP_REP_EXPORT = Self::OP_REPLY.bits() | Self::OP_EXPORT.bits();
     }
 }
-
-const VERSION: u16 = 0x0112;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]
@@ -211,6 +111,7 @@ impl core::fmt::Display for ResponseStatus {
         }
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {}

@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bitflags = { version = "2.6.0", features = ["serde"] }
-bytemuck = "1.20.0"
 nusb = "0.1.12"
-postcard = "1.0.10"
 serde = { version = "1.0.215", features = ["derive"] }
+thiserror = "2.0.3"
