@@ -1,4 +1,5 @@
-use serde::{de, Deserialize, Serialize};
+use nohash_hasher::IsEnabled;
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
 use thiserror::Error;
 
@@ -7,8 +8,8 @@ pub const VERSION: u16 = 0x0211;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDeviceId {
-    bus_number: u8,
-    device_addr: u8,
+    pub bus_number: u8,
+    pub device_addr: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,15 +23,17 @@ pub struct UsbDevices {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDeviceInfo {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 #[repr(transparent)]
-pub struct TransactionId(pub NonZeroU64);
+pub struct ReqId(pub NonZeroU64);
+impl IsEnabled for ReqId {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 #[repr(transparent)]
 pub struct PayloadId(pub NonZeroU64);
+impl IsEnabled for PayloadId {}
 
 #[derive(Debug, Error, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Error {
@@ -46,24 +49,35 @@ pub enum Error {
     Unexpected,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QusbResp {
-    version: u16,
-    transaction_id: TransactionId,
-    resp: Result<Option<TransactionId>, Error>,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Header {
+    pub version: u16,
+    pub stream_type: StreamType,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StreamType {
+    Req,
+    UniData(PayloadId),
+    BiData(PayloadId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum InnerReq {
+pub struct Resp {
+    pub id: ReqId,
+    pub payload: Result<Option<PayloadId>, Error>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Req {
+    pub id: ReqId,
+    pub op: Operation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Operation {
     ListDevices,
     ImportDevice(UsbDeviceId),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QusbReq {
-    pub version: u16,
-    pub transaction_id: TransactionId,
-    pub req: InnerReq,
 }
 
 /*

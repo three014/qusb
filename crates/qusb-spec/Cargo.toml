@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nusb = "0.1.12"
+nohash-hasher = "0.2.0"
 serde = { version = "1.0.215", features = ["derive"] }
 thiserror = "2.0.3"
