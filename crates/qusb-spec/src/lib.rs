@@ -21,7 +21,7 @@ pub trait RequestTrait: Sized + Serialize + DeserializeOwned {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
-    ListUsbDevices(ListUsbDevices),
+    ListUsbDevices,
     ImportUsbDevice(UsbDeviceId),
 }
 
