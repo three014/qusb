@@ -5,5 +5,8 @@ edition = "2021"
 
 [dependencies]
 nohash-hasher = "0.2.0"
+rand = "0.8.5"
+rkyv = "0.8.9"
+rkyv_derive = "0.8.9"
 serde = { version = "1.0.215", features = ["derive"] }
 thiserror = "2.0.3"

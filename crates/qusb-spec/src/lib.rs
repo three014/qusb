@@ -1,10 +1,38 @@
 use nohash_hasher::IsEnabled;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::num::NonZeroU64;
 use thiserror::Error;
 
 pub const BUS_ID_SIZE: usize = 32;
-pub const VERSION: u16 = 0x0211;
+pub const VERSION: Version = Version(0x0200);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Version(u16);
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#06x}", self.0)
+    }
+}
+
+pub trait RequestTrait: Sized + Serialize + DeserializeOwned {
+    type Response: Sized + Serialize + DeserializeOwned;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Request {
+    ListUsbDevices(ListUsbDevices),
+    ImportUsbDevice(UsbDeviceId),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ListUsbDevices;
+
+pub type Response<T> = Result<T, Error>;
+
+impl RequestTrait for Request {
+    type Response = UsbDeviceInfo;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDeviceId {
@@ -23,11 +51,17 @@ pub struct UsbDevices {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDeviceInfo {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 #[repr(transparent)]
-pub struct ReqId(pub NonZeroU64);
+pub struct ReqId(NonZeroU64);
 impl IsEnabled for ReqId {}
+
+impl ReqId {
+    fn new() -> Self {
+        Self(rand::random())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
@@ -45,8 +79,10 @@ pub enum Error {
     DevErr,
     #[error("device not found")]
     NoDev,
-    #[error("unexpected response")]
-    Unexpected,
+    #[error("unexpected request")]
+    UnexpectedReq,
+    #[error("unexpected request")]
+    UnexpectedResp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -57,27 +93,47 @@ pub struct Header {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StreamType {
-    Req,
-    UniData(PayloadId),
-    BiData(PayloadId),
+    Ctrl,
+    Data(PayloadId),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Dir {
+    Bi = 0,
+    Uni = 1,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Resp {
     pub id: ReqId,
-    pub payload: Result<Option<PayloadId>, Error>,
+    pub payload: Result<Option<(PayloadId, Dir)>, Error>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Req {
     pub id: ReqId,
     pub op: Operation,
+}
+
+impl Req {
+    pub fn new(op: Operation) -> Self {
+        Self {
+            id: ReqId::new(),
+            op,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Operation {
     ListDevices,
     ImportDevice(UsbDeviceId),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Control {
+    Request(Req),
+    Response(Resp),
 }
 
 /*
