@@ -8,11 +8,13 @@ bitflags = "2.6.0"
 quinn = { version = "0.11.6", features = ["runtime-tokio"] }
 rcgen = "0.13.1"
 thiserror = "2.0.3"
-tokio = { version = "1.41.1", features = ["io-util"] }
+tokio = { version = "1.41.1", features = ["io-util", "sync"] }
 spec = { package = "qusb-spec", path = "../qusb-spec" }
 # postcard = { version = "1.0.10", features = ["use-std"] }
 postcard = { version = "1.0.10" }
 nohash-hasher = "0.2.0"
 rand = "0.8.5"
+evmap = "10.0.2"
 serde = "1.0.215"
+bytes = "1.9.0"
 

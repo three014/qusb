@@ -3,178 +3,345 @@ use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls,
 };
-use rand::random;
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    collections::HashMap,
-    hash::BuildHasherDefault,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     path::Path,
-    pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
 };
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufStream, BufWriter,
-};
+use tokio::io::BufReader;
 use usb_ids::UsbIds;
 
 mod usb_ids;
+mod utils;
+mod stream;
+
+pub type Sender<T> = stream::Sender<T, quinn::SendStream>;
+pub type Receiver<T> = stream::Receiver<spec::Response<T>, BufReader<quinn::RecvStream>>;
+
+mod state {
+    use serde::{de::DeserializeOwned, Serialize};
+    use tokio::io::BufReader;
+    use crate::{stream, Error};
+
+    pub struct VersionSender(pub(crate) crate::Sender<spec::Version>);
+    impl VersionSender {
+        pub async fn send(mut self) -> Result<ReqSender, Error> {
+            self.0.send(&spec::VERSION).await?;
+            Ok(ReqSender(self.0.convert()))
+        }
+    }
+
+    pub struct VersionReceiver(pub(crate) stream::Receiver<spec::Version, BufReader<quinn::RecvStream>>);
+    impl VersionReceiver {
+        pub async fn recv<T: DeserializeOwned>(mut self) -> Result<stream::Receiver<T, BufReader<quinn::RecvStream>>, Error> {
+            let version = self.0.recv().await?;
+            if version != spec::VERSION {
+                Err(Error::VersionMismatch(version))
+            } else {
+                Ok(self.0.convert::<T>())
+            }
+        }
+    }
+
+    pub struct RespSender<T: Serialize>(crate::Sender<spec::Response<T>>);
+    impl<T: Serialize> RespSender<T> {
+        pub async fn send_data(&mut self, data: T) -> Result<(), Error> {
+            self.0.send(&Ok(data)).await
+        }
+
+        pub async fn send_err(mut self, data: spec::Error) -> Result<(), Error> {
+            self.0.send(&Err(data)).await
+        }
+
+        pub fn convert<R: Serialize>(self) -> RespSender<R> {
+            RespSender(self.0.convert())
+        }
+    }
+
+    pub struct RespReceiver<T: DeserializeOwned>(pub(crate) crate::Receiver<T>);
+    impl<T: DeserializeOwned> RespReceiver<T> {
+        pub async fn recv(&mut self) -> Result<spec::Response<T>, Error> {
+            self.0.recv().await
+        }
+
+        pub fn convert<R: DeserializeOwned>(self) -> RespReceiver<R> {
+            RespReceiver(self.0.convert())
+        }
+    }
+
+    pub struct ReqSender(crate::Sender<spec::Request>);
+    impl ReqSender {
+        pub async fn send<T: Serialize>(mut self, req: spec::Request) -> Result<crate::Sender<T>, Error> {
+            self.0.send(&req).await?;
+            Ok(self.0.convert::<T>())
+        }
+    }
+
+    // TODO: Add ReqReceiver
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0}")]
+    Serde(#[from] postcard::Error),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("unsupported protocol version (their version: {0}, our version: {ver})", ver = spec::VERSION)]
+    VersionMismatch(spec::Version)
+}
 
 static USB_IDS: LazyLock<UsbIds> =
     LazyLock::new(|| usb_ids::parse(Path::new("./usb-ids")).unwrap());
 
-#[derive(Debug)]
-struct RWStream {
-    tx: quinn::SendStream,
-    rx: quinn::RecvStream,
-}
-
-impl AsyncRead for RWStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.rx).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for RWStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.tx), cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.tx), cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.tx), cx)
-    }
-}
-
-#[derive(Debug)]
-struct ReqLine {
-    tx: Mutex<BufWriter<quinn::SendStream>>,
-    rx: Mutex<BufReader<quinn::RecvStream>>,
-}
 
 #[derive(Debug)]
 struct Session {
     conn: quinn::Connection,
-    req_line: ReqLine,
-    req_data: Mutex<HashMap<spec::ReqId, spec::Req, nohash_hasher::BuildNoHashHasher<spec::ReqId>>>,
-    unclaimed_unidata_lines: HashMap<
-        spec::PayloadId,
-        BufReader<quinn::RecvStream>,
-        nohash_hasher::BuildNoHashHasher<spec::PayloadId>,
-    >,
-    unclaimed_bidata_lines: HashMap<
-        spec::PayloadId,
-        BufStream<RWStream>,
-        nohash_hasher::BuildNoHashHasher<spec::PayloadId>,
-    >,
 }
 
 impl Session {
-    pub async fn send_req(&self, op: spec::Operation) -> spec::ReqId {
-        let id = spec::ReqId(random());
-        let req = postcard::to_vec_cobs::<_, 32>(&spec::Req { id, op }).unwrap();
-        let mut tx = self.req_line.tx.lock().unwrap();
-        let mut written = 0;
-        while written < req.len() {
-            written += tx.write(&req[written..]).await.unwrap();
-        }
-        tx.flush().await.unwrap();
+    pub async fn open_stream<T: Serialize, R: DeserializeOwned>(
+        &self,
+    ) -> Result<(state::ReqSender, state::RespReceiver<R>), quinn::ConnectionError> {
+        let (tx, rx) = self.conn.open_bi().await?;
+        let (tx, rx) = stream::new::<spec::Version, spec::Response<()>>(tx, rx);
 
-        id
+        let tx = state::VersionSender(tx).send().await.unwrap();
+        let mut rx = state::RespReceiver::<()>(rx);
+        if let Err(_err) = rx.recv().await.unwrap() {
+            panic!("something happened")
+        }
+        Ok((tx, rx.convert()))
     }
 
-    pub async fn recv_req(&self, id: spec::ReqId) -> spec::Req {
-        if let Some(req) = self.req_data.lock().unwrap().remove(&id) {
-            return req;
-        }
-
-        let mut buf = vec![0; 256];
-        loop {
-            buf.clear();
-            let _read = self
-                .req_line
-                .rx
-                .lock()
-                .unwrap()
-                .read_until(0, &mut buf)
-                .await
-                .unwrap();
-
-            let req: spec::Req = postcard::from_bytes_cobs(&mut buf).unwrap();
-            if req.id == id {
-                return req;
-            }
-            self.req_data.lock().unwrap().insert(id, req);
-        }
+    pub async fn accept_stream<T: Serialize, R: DeserializeOwned>(
+        &self,
+    ) -> Result<(state::RespSender<T>, Receiver<R>), quinn::ConnectionError> {
+        let (tx, rx) = self.conn.accept_bi().await?;
+        // Ok(stream::new(tx, rx))
+        todo!()
     }
+    // pub async fn open_ctrl(&self) -> ctrl::Requester {
+    //     let (tx, rx) = self.conn.open_bi().await.unwrap();
+    //     ctrl::ConnectingReq::new(tx, rx).handshake().await
+    // }
 
-    async fn connect(conn: quinn::Connecting) -> Self {
-        let conn = conn.await.unwrap();
-        let (mut tx, rx) = conn.open_bi().await.unwrap();
-        let header = postcard::to_vec_cobs::<_, 32>(&spec::Header {
-            version: spec::VERSION,
-            stream_type: spec::StreamType::Req,
-        })
-        .unwrap();
-        let mut written = 0;
-        while written < header.len() {
-            written += tx.write(&header[written..]).await.unwrap();
-        }
+    // pub async fn accept_ctrl(&self) -> ctrl::Responder {
+    //     let (tx, rx) = self.conn.accept_bi().await.unwrap();
+    //     ctrl::ConnectingResp::new(tx, rx).handshake().await
+    // }
 
-        Self {
-            conn,
-            req_line: ReqLine {
-                tx: Mutex::new(BufWriter::with_capacity(1024, tx)),
-                rx: Mutex::new(BufReader::with_capacity(1024, rx)),
-            },
-            req_data: Mutex::new(HashMap::with_hasher(BuildHasherDefault::default())),
-            unclaimed_unidata_lines: HashMap::with_hasher(BuildHasherDefault::default()),
-            unclaimed_bidata_lines: HashMap::with_hasher(BuildHasherDefault::default()),
-        }
-    }
+    // pub async fn send_req(&self, req: spec::Req) -> spec::ReqId {
+    //     // let id = req.id;
+    //     let req = postcard::to_vec_cobs::<_, 32>(&spec::Control::Request(req)).unwrap();
+    //     let mut tx = self.ctrl.tx.lock().unwrap();
+    //     let mut written = 0;
+    //     while written < req.len() {
+    //         written += tx.write(&req[written..]).await.unwrap();
+    //     }
+    //     tx.flush().await.unwrap();
 
-    async fn accept(conn: quinn::Incoming) -> Self {
-        let conn = conn.await.unwrap();
-        let (tx, rx) = conn.accept_bi().await.unwrap();
+    //     //id
+    //     todo!()
+    // }
 
-        let mut rx = BufReader::with_capacity(1024, rx);
-        let mut buf = vec![0; 128];
-        let _read = rx.read_until(0, &mut buf).await.unwrap();
-        let header: spec::Header = postcard::from_bytes_cobs(&mut buf).unwrap();
-        if header.version != spec::VERSION {
-            panic!("Wrong version!");
-        }
+    // pub async fn send_resp_bi(
+    //     &self,
+    //     resp: spec::Resp,
+    // ) -> Option<(quinn::SendStream, quinn::RecvStream)> {
+    //     let data_tx = if let Ok(Some((payload, dir))) = &resp.payload {
+    //         match dir {
+    //             spec::Dir::Bi => {
+    //                 let header = postcard::to_vec_cobs::<_, 32>(&spec::Header {
+    //                     version: spec::VERSION,
+    //                     stream_type: spec::StreamType::Data(*payload),
+    //                 })
+    //                 .unwrap();
+    //                 let (mut tx, rx) = self.conn.open_bi().await.unwrap();
+    //                 let mut written = 0;
+    //                 while written < header.len() {
+    //                     written += tx.write(&header[written..]).await.unwrap();
+    //                 }
+    //                 Some((tx, rx))
+    //             }
+    //             _ => panic!("Wrong direction"),
+    //         }
+    //     } else {
+    //         None
+    //     };
+    //     let resp = postcard::to_vec_cobs::<_, 32>(&spec::Control::Response(resp)).unwrap();
+    //     let mut tx = self.ctrl.tx.lock().unwrap();
+    //     let mut written = 0;
+    //     while written < resp.len() {
+    //         written += tx.write(&resp[written..]).await.unwrap();
+    //     }
+    //     tx.flush().await.unwrap();
 
-        if header.stream_type != spec::StreamType::Req {
-            panic!("First stream was not a request!");
-        }
+    //     data_tx
+    // }
 
-        Self {
-            conn,
-            req_line: ReqLine {
-                tx: Mutex::new(BufWriter::with_capacity(1024, tx)),
-                rx: Mutex::new(rx),
-            },
-            req_data: Mutex::new(HashMap::with_hasher(BuildHasherDefault::default())),
-            unclaimed_unidata_lines: HashMap::with_hasher(BuildHasherDefault::default()),
-            unclaimed_bidata_lines: HashMap::with_hasher(BuildHasherDefault::default()),
-        }
+    // pub async fn send_resp_uni(&self, resp: spec::Resp) -> Option<quinn::SendStream> {
+    //     let data_tx = if let Ok(Some((payload, dir))) = &resp.payload {
+    //         match dir {
+    //             spec::Dir::Uni => {
+    //                 let header = postcard::to_vec_cobs::<_, 32>(&spec::Header {
+    //                     version: spec::VERSION,
+    //                     stream_type: spec::StreamType::Data(*payload),
+    //                 })
+    //                 .unwrap();
+    //                 let mut tx = self.conn.open_uni().await.unwrap();
+    //                 let mut written = 0;
+    //                 while written < header.len() {
+    //                     written += tx.write(&header[written..]).await.unwrap();
+    //                 }
+    //                 Some(tx)
+    //             }
+    //             _ => panic!("Wrong direction"),
+    //         }
+    //     } else {
+    //         None
+    //     };
+    //     let resp = postcard::to_vec_cobs::<_, 32>(&spec::Control::Response(resp)).unwrap();
+    //     let mut tx = self.ctrl.tx.lock().unwrap();
+    //     let mut written = 0;
+    //     while written < resp.len() {
+    //         written += tx.write(&resp[written..]).await.unwrap();
+    //     }
+    //     tx.flush().await.unwrap();
+
+    //     data_tx
+    // }
+
+    // pub async fn recv_resp_uni(&self, id: spec::ReqId) -> Option<BufReader<quinn::RecvStream>> {
+    //     // BUG: What happens when function call "A" checks for their response object "A_r" as
+    //     //      function call "B" is currently receiving "A_r", then putting
+    //     //      "A_r" into the unclaimed bin after checking.
+    //     let resp = if let Some(resp) = self.ctrl_data.resp.lock().unwrap().remove(&id) {
+    //         resp
+    //     } else {
+    //         let mut buf = Vec::with_capacity(256);
+    //         loop {
+    //             buf.clear();
+    //             let _read = self
+    //                 .ctrl
+    //                 .rx
+    //                 .lock()
+    //                 .unwrap()
+    //                 .read_until(0, &mut buf)
+    //                 .await
+    //                 .unwrap();
+
+    //             match postcard::from_bytes_cobs(&mut buf).unwrap() {
+    //                 spec::Control::Request(req) => {
+    //                     // self.ctrl_data.req.lock().unwrap().insert(id, req);
+    //                 }
+    //                 spec::Control::Response(resp) => {
+    //                     // if resp.id == id {
+    //                     //     break resp;
+    //                     // }
+    //                     // self.ctrl_data.resp.lock().unwrap().insert(id, resp);
+    //                 }
+    //             }
+    //         }
+    //     };
+
+    //     if let Some((resp_payload_id, dir)) = resp.payload.unwrap() {
+    //         match dir {
+    //             spec::Dir::Uni => loop {
+    //                 let mut rx = BufReader::new(self.conn.accept_uni().await.unwrap());
+    //                 let mut buf = Vec::new();
+    //                 let _read = rx.read_until(0, &mut buf).await.unwrap();
+
+    //                 let header: spec::Header = postcard::from_bytes_cobs(&mut buf).unwrap();
+    //                 if header.version != spec::VERSION {
+    //                     panic!("wrong version!");
+    //                 }
+
+    //                 match header.stream_type {
+    //                     spec::StreamType::Data(new_stream_id) => {
+    //                         if new_stream_id == resp_payload_id {
+    //                             break Some(rx);
+    //                         } else {
+    //                             self.unclaimed_unidata_lines
+    //                                 .lock()
+    //                                 .unwrap()
+    //                                 .insert(new_stream_id, rx);
+    //                         }
+    //                     }
+    //                     _ => panic!("expected a data stream"),
+    //                 }
+    //             },
+    //             _ => panic!("wrong direction"),
+    //         }
+    //     } else {
+    //         None
+    //     }
+    // }
+
+    // pub async fn recv_req(&self, id: spec::ReqId) -> spec::Req {
+    //     if let Some(req) = self.ctrl_data.req.lock().unwrap().remove(&id) {
+    //         req
+    //     } else {
+    //         let mut buf = Vec::with_capacity(256);
+    //         loop {
+    //             buf.clear();
+    //             let _read = self
+    //                 .ctrl
+    //                 .rx
+    //                 .lock()
+    //                 .unwrap()
+    //                 .read_until(0, &mut buf)
+    //                 .await
+    //                 .unwrap();
+
+    //             match postcard::from_bytes_cobs(&mut buf).unwrap() {
+    //                 spec::Control::Request(req) => {
+    //                     // if req.id == id {
+    //                     //     return req;
+    //                     // }
+    //                     // self.ctrl_data.req.lock().unwrap().insert(id, req);
+    //                 }
+    //                 spec::Control::Response(resp) => {
+    //                     // self.ctrl_data.resp.lock().unwrap().insert(id, resp);
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
+    // async fn connect(conn: quinn::Connecting) -> Self {
+    //     let conn = conn.await.unwrap();
+    //     let (mut tx, rx) = conn.open_bi().await.unwrap();
+    //     let header = postcard::to_vec_cobs::<_, 32>(&spec::Header {
+    //         version: spec::VERSION,
+    //         stream_type: spec::StreamType::Ctrl,
+    //     })
+    //     .unwrap();
+    //     let mut written = 0;
+    //     while written < header.len() {
+    //         written += tx.write(&header[written..]).await.unwrap();
+    //     }
+
+    //     Self {
+    //         conn,
+    //         ctrl: ControlLine {
+    //             tx: Mutex::new(BufWriter::with_capacity(1024, tx)),
+    //             rx: Mutex::new(BufReader::with_capacity(1024, rx)),
+    //         },
+    //         ctrl_data: ControlData {
+    //             req: Mutex::new(HashMap::with_hasher(BuildHasherDefault::default())),
+    //             resp: Mutex::new(HashMap::with_hasher(BuildHasherDefault::default())),
+    //         },
+    //         unclaimed_unidata_lines: Mutex::new(
+    //             HashMap::with_hasher(BuildHasherDefault::default()),
+    //         ),
+    //         unclaimed_bidata_lines: Mutex::new(HashMap::with_hasher(BuildHasherDefault::default())),
+    //     }
+    // }
+
+    async fn new(conn: quinn::Connection) -> Result<Self, quinn::ConnectionError> {
+        Ok(Self { conn })
     }
 }
 
@@ -210,22 +377,15 @@ impl Peer {
     pub async fn serve(&self) {
         while let Some(incoming) = self.endpoint.accept().await {
             tokio::spawn(async move {
-                let conn = incoming.await.unwrap();
-                loop {
-                    let stream = conn.accept_bi().await;
-                    let (mut send, mut recv) = match stream {
-                        Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            return Err(e);
-                        }
-                        Ok(s) => s,
-                    };
-                    tokio::spawn(async move {
-                        let req = recv.read_to_end(64 * 1024).await.unwrap();
-                    });
-                }
+                // let session = Session::accept(incoming).await;
+
+                // Two things:
+                // 1. I gotta fix the request line to work with
+                //    responses, not just requests.
+                // 2. I'd like to use a channel-type system to
+                //    allow the caller to send/recv data to
+                //    this session, which ultimately I don't want
+                //    to go anywhere.
             });
         }
     }
