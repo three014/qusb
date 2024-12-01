@@ -1,25 +1,25 @@
 // use bitflags::bitflags;
+use crate::utils::SkipServerVerification;
+use futures_util::StreamExt;
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls,
 };
 use serde::{de::DeserializeOwned, Serialize};
+use state::State;
 use std::{
-    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
-    path::Path,
-    sync::{Arc, LazyLock},
+    future::Future, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, ops::Deref, os::unix::ffi::OsStrExt, path::Path, sync::{Arc, LazyLock}
 };
 use tokio::io::BufReader;
 use usb_ids::UsbIds;
 
-mod stream;
 mod state;
+mod stream;
 mod usb_ids;
 mod utils;
 
 pub type Sender<T> = stream::Sender<T, quinn::SendStream>;
 pub type Receiver<T> = stream::Receiver<T, BufReader<quinn::RecvStream>>;
-
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -34,126 +34,212 @@ pub enum Error {
 static USB_IDS: LazyLock<UsbIds> =
     LazyLock::new(|| usb_ids::parse(Path::new("./usb-ids")).unwrap());
 
+pub fn usb_ids() -> &'static UsbIds {
+    USB_IDS.deref()
+}
+
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
 }
 
 impl Session {
-    pub async fn open_stream<R: DeserializeOwned>(
-        &self,
-    ) -> Result<(state::ReqSender, state::RespReceiver<R>), Error> {
-        let (tx, rx) = self.conn.open_bi().await.map_err(|err| Error::Io(err.into()))?;
-        let (tx, rx) = stream::new::<spec::Version, spec::Response<()>>(tx, rx);
+    #[tracing::instrument(skip_all, level = "trace")]
+    pub async fn open_stream(&self) -> Result<State<state::ClientReq>, Error> {
+        let (tx, rx) = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|err| Error::from(std::io::Error::from(err)))?;
+        let idle = State::new_client(tx, rx);
+        Ok(idle.verify_version().await?)
+    }
 
-        let tx = state::VersionSender(tx).send().await?;
-        let mut rx = state::RespReceiver::<()>(rx);
-        if let Err(_err) = rx.recv().await? {
-            panic!("something happened")
+    #[tracing::instrument(skip_all, level = "trace")]
+    pub async fn accept_stream(&self) -> Result<State<state::ServerGetReq>, Error> {
+        let (tx, rx) = self
+            .conn
+            .accept_bi()
+            .await
+            .map_err(|err| Error::from(std::io::Error::from(err)))?;
+        let listening = State::new_server(tx, rx);
+        Ok(listening.verify_version().await?)
+    }
+
+    const fn new(conn: quinn::Connection) -> Self {
+        Self { conn }
+    }
+
+    #[tracing::instrument(skip_all, level = "trace")]
+    pub async fn list_devices(&self) -> Result<Vec<spec::UsbDeviceInfo<'static>>, Error> {
+        let client = self.open_stream().await.unwrap();
+
+        let mut list_devices = client.list_devices().await?;
+        tracing::trace!("Requested 'ListDevices'");
+        let mut devices = vec![];
+        while let Some(dev) = list_devices.next().await? {
+            tracing::trace!("Got a device from server: {:?}", dev);
+            devices.push(dev);
         }
-        Ok((tx, rx.convert()))
-    }
-
-    pub async fn accept_stream<T: Serialize>(
-        &self,
-    ) -> Result<(state::RespSender<T>, state::ReqReceiver), quinn::ConnectionError> {
-        let (tx, rx) = self.conn.accept_bi().await?;
-        let (tx, rx) = stream::new::<spec::Response<()>, spec::Version>(tx, rx);
-
-        let rx = state::VersionReceiver(rx).recv().await.unwrap();
-        let mut tx = state::RespSender(tx);
-        tx.send_data(()).await.unwrap();
-        Ok((tx.convert(), rx))
-    }
-
-    const fn new(conn: quinn::Connection) -> Result<Self, quinn::ConnectionError> {
-        Ok(Self { conn })
+        tracing::trace!("Finished receiving devices from the server");
+        Ok(devices)
     }
 }
 
-pub async fn list_devices(peer_addr: SocketAddr, peer_name: &str) -> Result<Vec<spec::UsbDeviceInfo>, Error> {
-    let client = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        .with_no_client_auth();
+#[tracing::instrument(skip_all, level = "trace")]
+pub fn peer(
+    server_tls: rustls::ServerConfig,
+    client_tls: rustls::ClientConfig,
+    bind: Option<SocketAddr>,
+    transport: quinn::TransportConfig,
+) -> (Client, Server) {
+    let server_tls =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls).unwrap()));
+    let mut client_tls =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
+    client_tls.transport_config(Arc::new(transport));
 
-    let server = {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let priv_key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let mut endpoint = quinn::Endpoint::server(
+        server_tls,
+        bind.unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()),
+    )
+    .unwrap();
+    endpoint.set_default_client_config(client_tls);
 
-        rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], priv_key.into())
-        .unwrap()
-    };
-
-    let peer = Peer::new(server, client, None, quinn::TransportConfig::default()).unwrap();
-    let session = peer.connect(peer_addr, peer_name).await;
-    let (tx, mut rx) = session.open_stream::<spec::UsbDeviceInfo>().await.unwrap();
-
-    let _ = tx.send::<()>(spec::Request::ListUsbDevices).await.unwrap();
-
-    let mut devices = vec![];
-    while let Ok(dev) = rx.recv().await.unwrap() {
-        devices.push(dev);
-    }
-
-    Ok(devices)
+    (
+        Client {
+            endpoint: endpoint.clone(),
+        },
+        Server { endpoint },
+    )
 }
 
-#[derive(Debug, Clone)]
-pub struct Peer {
+pub struct Client {
     endpoint: quinn::Endpoint,
 }
 
-impl Peer {
-    pub fn new(
-        server_tls: rustls::ServerConfig,
-        client_tls: rustls::ClientConfig,
-        bind_addr: Option<SocketAddr>,
-        transport_cfg: quinn::TransportConfig,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let server_tls = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(server_tls).unwrap(),
-        ));
-        let mut client_tls =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
-        client_tls.transport_config(Arc::new(transport_cfg));
-
-        let mut endpoint = quinn::Endpoint::server(
-            server_tls,
-            bind_addr.unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()),
-        )
-        .unwrap();
-        endpoint.set_default_client_config(client_tls);
-
-        Ok(Peer { endpoint })
+impl Client {
+    #[tracing::instrument(skip(self), level = "debug")]
+    pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Session {
+        let conn = self
+            .endpoint
+            .connect(peer_addr, peer_name)
+            .unwrap()
+            .await
+            .unwrap();
+        Session::new(conn)
     }
+}
 
-    pub async fn serve(&self) {
-        while let Some(incoming) = self.endpoint.accept().await {
-            tokio::spawn(async move {
-                // let session = Session::accept(incoming).await;
+#[derive(Debug)]
+pub struct Server {
+    endpoint: quinn::Endpoint,
+}
 
-                // Two things:
-                // 1. I gotta fix the request line to work with
-                //    responses, not just requests.
-                // 2. I'd like to use a channel-type system to
-                //    allow the caller to send/recv data to
-                //    this session, which ultimately I don't want
-                //    to go anywhere.
-            });
+impl Server {
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub fn serve<F, Fut>(self, session_handler: F) -> ServerHandle
+    where
+        F: FnOnce(Session, tokio_util::sync::CancellationToken) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = Result<(), Error>> + Send,
+    {
+        let cancel_for_handle = tokio_util::sync::CancellationToken::new();
+        let cancel_for_serve = cancel_for_handle.clone();
+        let handle = tokio::spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            tracing::info!("Server ready to accept new connections");
+            loop {
+                tokio::select! {
+                    incoming = self.endpoint.accept() => {
+                        if let Some(incoming) = incoming {
+                            let cancel_for_session = cancel_for_serve.clone();
+                            let handle = session_handler.clone();
+                            tracing::debug!("Incoming connection from {}", incoming.remote_address());
+                            set.spawn(async move {
+                                let conn = incoming.await.map_err(|err| Error::Io(err.into()))?;
+                                tracing::trace!("Established new session with {} - RTT {:?}", conn.remote_address(), conn.rtt());
+                                let session = Session::new(conn);
+                                handle(session, cancel_for_session).await
+                            });
+                        } else {
+                            break;
+                        }
+                    },
+                    _ = cancel_for_serve.cancelled() => {
+                        break;
+                    }
+
+                }
+            }
+
+            while let Some(result) = set.join_next_with_id().await {
+                match result {
+                    Ok((id, Ok(_))) => tracing::info!("Session {id} completed successfully"),
+                    Ok((id, Err(cause))) => tracing::warn! { %cause, "Session {id} failed" },
+                    Err(_) => todo!(),
+                }
+            }
+
+            Ok(())
+        });
+        ServerHandle {
+            handle,
+            cancel_token: cancel_for_handle,
         }
     }
+}
 
-    pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Session {
-        let conn = self.endpoint.connect(peer_addr, peer_name).unwrap().await.unwrap();
-        Session::new(conn).unwrap()
+#[tracing::instrument(skip_all, level = "trace")]
+pub async fn handle_list_devices(state: State<state::ServerDecideResp>) -> Result<(), Error> {
+    let mut stream = state.list_devices();
+
+    for device in nusb::list_devices()? {
+        let to_send = spec::UsbDeviceInfo {
+            id: spec::UsbDeviceId {
+                bus_number: device.bus_number(),
+                device_addr: device.device_address(),
+            },
+            bus_id: spec::BusId(std::borrow::Cow::Borrowed(
+                device
+                    .sysfs_path()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )),
+            vendor_id: device.vendor_id(),
+            product_id: device.product_id(),
+            class: device.class(),
+            subclass: device.subclass(),
+            protocol: device.protocol(),
+            interfaces: device
+                .interfaces()
+                .map(|int| spec::InterfaceInfo {
+                    interface_number: int.interface_number(),
+                    class: int.subclass(),
+                    subclass: int.subclass(),
+                    protocol: int.protocol(),
+                })
+                .collect(),
+        };
+
+        stream.send_device(&to_send).await?;
+    }
+
+    stream.finish().await
+}
+
+pub struct ServerHandle {
+    handle: tokio::task::JoinHandle<Result<(), Error>>,
+    cancel_token: tokio_util::sync::CancellationToken,
+}
+
+impl ServerHandle {
+    pub async fn shutdown(self) {
+        self.cancel_token.cancel();
+        self.handle.await.unwrap().unwrap();
     }
 }
 
@@ -176,56 +262,52 @@ impl Peer {
 //     }
 // }
 
-#[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
-    }
-}
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn list_devices_works() {
+        let (server, cert) = utils::make_self_signed();
+        let mut certs = rustls::RootCertStore::empty();
+        certs.add(cert).unwrap();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(Arc::new(certs))
+            .with_no_client_auth();
+        let (client, server) = peer(
+            server,
+            client,
+            Some("127.0.0.1:7640".parse().unwrap()),
+            quinn::TransportConfig::default(),
+        );
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
+        let handle = server.serve(|session, _cancel_handle| async move {
+            let stream = session.accept_stream().await.unwrap();
+            tracing::trace!("Accepted new stream");
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
+            let (req, stream) = stream.recv_req().await.unwrap();
+            tracing::trace!("Received request from client: {req:?}");
+            match req {
+                spec::Request::ListUsbDevices => {
+                    handle_list_devices(stream).await?;
+                }
+                spec::Request::ImportUsbDevice(_) => panic!("Not what this test is for"),
+            }
 
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
+            tracing::trace!("Finished serving req");
+            Ok(())
+        });
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        {
+            let session = client
+                .connect("127.0.0.1:7640".parse().unwrap(), "localhost")
+                .await;
+            tracing::info!("Connected to {}", session.conn.remote_address());
+
+            let devs = session.list_devices().await.unwrap();
+        }
+
+        handle.shutdown().await;
     }
 }

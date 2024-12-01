@@ -8,7 +8,60 @@ use crate::{
     Error,
 };
 
-pub fn new<T, R>(
+pub struct Sender2<W: AsyncWrite> {
+    tx: W,
+    buf: Vec<u8>,
+}
+
+impl<W: AsyncWrite> Sender2<W> {
+    pub(crate) fn new(tx: W) -> Self {
+        Self {
+            tx,
+            buf: Vec::new(),
+        }
+    }
+
+    pub(crate) fn as_writer_mut(&mut self) -> &mut W {
+        &mut self.tx
+    }
+}
+
+impl<W: AsyncWrite + Unpin> Sender2<W> {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub async fn send<T: Serialize + std::fmt::Debug>(&mut self, item: &T) -> Result<(), Error> {
+        serialize_into_writer::<T, _>(item, &mut self.tx, &mut self.buf).await
+    }
+}
+
+pub struct Receiver2<R: AsyncBufRead> {
+    rx: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncBufRead> Receiver2<R> {
+    pub(crate) fn new(rx: R) -> Self {
+        Self {
+            rx,
+            buf: Vec::new(),
+        }
+    }
+
+    pub(crate) fn as_reader_mut(&mut self) -> &mut R {
+        &mut self.rx
+    }
+}
+
+impl<R: AsyncBufRead + Unpin> Receiver2<R> {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub async fn recv<T: DeserializeOwned + std::fmt::Debug>(
+        &mut self,
+    ) -> Result<Option<T>, Error> {
+        deserialize_from_reader(&mut self.rx, &mut self.buf).await
+    }
+}
+
+#[tracing::instrument(level = "trace")]
+pub(crate) fn new<T, R>(
     tx: quinn::SendStream,
     rx: quinn::RecvStream,
 ) -> (
@@ -16,20 +69,21 @@ pub fn new<T, R>(
     Receiver<R, BufReader<quinn::RecvStream>>,
 )
 where
-    T: Serialize,
-    R: DeserializeOwned,
+    T: Serialize + std::fmt::Debug,
+    R: DeserializeOwned + std::fmt::Debug,
 {
     (Sender::new(tx), Receiver::new(BufReader::new(rx)))
 }
 
-pub struct Sender<T: Serialize, W: AsyncWrite> {
+#[derive(Debug)]
+pub struct Sender<T: Serialize + std::fmt::Debug, W: AsyncWrite + std::fmt::Debug> {
     phantom: PhantomData<T>,
     tx: W,
     buf: Vec<u8>,
 }
 
-impl<T: Serialize, W: AsyncWrite> Sender<T, W> {
-    pub const fn new(tx: W) -> Self {
+impl<T: Serialize + std::fmt::Debug, W: AsyncWrite + std::fmt::Debug> Sender<T, W> {
+    pub fn new(tx: W) -> Self {
         Self {
             phantom: PhantomData,
             tx,
@@ -37,7 +91,8 @@ impl<T: Serialize, W: AsyncWrite> Sender<T, W> {
         }
     }
 
-    pub fn convert<U: Serialize>(mut self) -> Sender<U, W> {
+    #[tracing::instrument(level = "trace")]
+    pub fn convert<U: Serialize + std::fmt::Debug>(mut self) -> Sender<U, W> {
         self.buf.clear();
         Sender {
             phantom: PhantomData,
@@ -45,22 +100,30 @@ impl<T: Serialize, W: AsyncWrite> Sender<T, W> {
             buf: self.buf,
         }
     }
+
+    pub fn into_writer(self) -> W {
+        self.tx
+    }
 }
 
-impl<T: Serialize, W: AsyncWrite + Unpin> Sender<T, W> {
+impl<T: Serialize + std::fmt::Debug, W: AsyncWrite + Unpin + std::fmt::Debug> Sender<T, W> {
+    #[tracing::instrument(level = "trace")]
     pub async fn send(&mut self, obj: &T) -> Result<(), Error> {
+        let min_reserve = 128_usize.saturating_sub(self.buf.len());
+        self.buf.reserve(min_reserve);
         serialize_into_writer::<T, _>(obj, &mut self.tx, &mut self.buf).await
     }
 }
 
-pub struct Receiver<T: DeserializeOwned, R: AsyncBufRead> {
+#[derive(Debug)]
+pub struct Receiver<T: DeserializeOwned + std::fmt::Debug, R: AsyncBufRead + std::fmt::Debug> {
     phantom: PhantomData<T>,
     rx: R,
     buf: Vec<u8>,
 }
 
-impl<T: DeserializeOwned, R: AsyncBufRead> Receiver<T, R> {
-    pub const fn new(rx: R) -> Self {
+impl<T: DeserializeOwned + std::fmt::Debug, R: AsyncBufRead + std::fmt::Debug> Receiver<T, R> {
+    pub fn new(rx: R) -> Self {
         Self {
             phantom: PhantomData,
             rx,
@@ -68,7 +131,8 @@ impl<T: DeserializeOwned, R: AsyncBufRead> Receiver<T, R> {
         }
     }
 
-    pub fn convert<U: DeserializeOwned>(mut self) -> Receiver<U, R> {
+    #[tracing::instrument(level = "trace")]
+    pub fn convert<U: DeserializeOwned + std::fmt::Debug>(mut self) -> Receiver<U, R> {
         self.buf.clear();
         Receiver {
             phantom: PhantomData,
@@ -76,91 +140,104 @@ impl<T: DeserializeOwned, R: AsyncBufRead> Receiver<T, R> {
             buf: self.buf,
         }
     }
+
+    pub fn into_reader(self) -> R {
+        self.rx
+    }
 }
 
-impl<T: DeserializeOwned, R: AsyncBufRead + Unpin> Receiver<T, R> {
-    pub async fn recv(&mut self) -> Result<T, Error> {
+impl<T, R> Receiver<T, R>
+where
+    T: DeserializeOwned + std::fmt::Debug,
+    R: AsyncBufRead + Unpin + std::fmt::Debug,
+{
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub async fn recv(&mut self) -> Result<Option<T>, Error> {
+        let min_reserve = 128_usize.saturating_sub(self.buf.len());
+        self.buf.reserve(min_reserve);
         deserialize_from_reader(&mut self.rx, &mut self.buf).await
     }
 }
 
-// pub struct ConnectingReq {
-//     tx: quinn::SendStream,
-//     rx: BufReader<quinn::RecvStream>,
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// impl ConnectingReq {
-//     pub fn new(tx: quinn::SendStream, rx: quinn::RecvStream) -> Self {
-//         Self {
-//             tx,
-//             rx: BufReader::new(rx),
-//         }
-//     }
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn version_sends_properly() {
+        let tx_buf = Vec::<u8>::with_capacity(256);
 
-//     pub async fn handshake(mut self) -> Requester {
-//         let mut buf = Vec::new();
-//         utils::serialize_into_writer(
-//             &spec::VERSION,
-//             &mut self.tx,
-//             &mut buf,
-//         )
-//         .await
-//         .unwrap();
-//         buf.clear();
+        let mut tx = Sender::<spec::Version, Vec<u8>>::new(tx_buf);
+        tracing::debug!("About to send my message!");
+        tx.send(&spec::VERSION).await.unwrap();
 
-//         let status: Result<(), spec::Error> =
-//             utils::deserialize_from_reader(&mut self.rx, &mut buf)
-//                 .await
-//                 .unwrap();
-//         buf.clear();
+        let rx_buf = tx.tx;
+        let mut rx = Receiver::<spec::Version, BufReader<&[u8]>>::new(BufReader::with_capacity(
+            256, &*rx_buf,
+        ));
+        tracing::debug!("About to recv my message!");
+        let version = rx.recv().await.unwrap();
 
-//         if let Err(err) = status {
-//             match err {
-//                 spec::Error::UnexpectedReq => {
-//                     panic!("remote peer thought we had a weird request?")
-//                 }
-//                 _ => {
-//                     unreachable!("huh??")
-//                 }
-//             }
-//         }
+        assert_eq!(version.unwrap(), spec::VERSION);
+    }
 
-//         Requester {
-//             tx: self.tx,
-//             rx: self.rx,
-//             scratch: buf,
-//         }
-//     }
-// }
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn can_send_multiple_messages_with_same_type() {
+        let tx_buf = Vec::<u8>::with_capacity(256);
 
-// pub struct ConnectingResp {
-//     tx: quinn::SendStream,
-//     rx: BufReader<quinn::RecvStream>,
-// }
+        let data = spec::UsbDeviceInfo {
+            id: spec::UsbDeviceId {
+                bus_number: 2,
+                device_addr: 1,
+            },
+            bus_id: spec::BusId(std::borrow::Cow::Borrowed("1-2".try_into().unwrap())),
+            vendor_id: 2,
+            product_id: 6,
+            class: 4,
+            subclass: 45,
+            protocol: 1,
+            interfaces: vec![
+                spec::InterfaceInfo {
+                    interface_number: 1,
+                    class: 2,
+                    subclass: 1,
+                    protocol: 3,
+                },
+                spec::InterfaceInfo {
+                    interface_number: 2,
+                    class: 9,
+                    subclass: 1,
+                    protocol: 3,
+                },
+            ],
+        };
 
-// impl ConnectingResp {
-//     pub fn new(tx: quinn::SendStream, rx: quinn::RecvStream) -> Self {
-//         Self {
-//             tx,
-//             rx: BufReader::new(rx)
-//         }
-//     }
+        let mut data2 = data.clone();
+        data2.id = spec::UsbDeviceId {
+            bus_number: 29,
+            device_addr: 45,
+        };
+        data2.bus_id = spec::BusId(std::borrow::Cow::Borrowed("1-2.4.5".try_into().unwrap()));
 
-//     pub async fn handshake(mut self) -> Responder {
-//         let mut buf = Vec::new();
+        let mut tx = Sender::<spec::UsbDeviceInfo, Vec<u8>>::new(tx_buf);
+        tracing::debug!("About to send my messages!");
+        tx.send(&data2).await.unwrap();
+        tx.send(&data).await.unwrap();
 
-//         let header: spec::Header = utils::deserialize_from_reader(&mut self.rx, &mut buf).await.unwrap();
-//         buf.clear();
+        let rx_buf = tx.tx;
+        let mut rx = Receiver::<spec::UsbDeviceInfo, BufReader<&[u8]>>::new(
+            BufReader::with_capacity(256, &*rx_buf),
+        );
 
-//         if header.version != spec::VERSION || header.stream_type != spec::StreamType::Ctrl {
-//             utils::serialize_into_writer(&Err::<(), _>(spec::Error::UnexpectedReq), &mut self.tx, &mut buf).await.unwrap();
-//             buf.clear();
-//             panic!("we got a weird request");
-//         }
+        tracing::debug!("About to recv my messages!");
+        let data_copied2 = rx.recv().await.unwrap();
+        let data_copied = rx.recv().await.unwrap();
+        // println!("{data2:#?}");
+        // println!("{data_copied2:#?}");
 
-//         utils::serialize_into_writer(&Ok::<_, spec::Error>(()), &mut self.tx, &mut buf).await.unwrap();
-//         buf.clear();
-
-//         Responder { tx: self.tx, rx: self.rx, scratch: buf }
-//     }
-// }
+        // The copies of the data should be somewhat different than what was sent,
+        // since we're getting back `String`s instead of `&str`s
+    }
+}

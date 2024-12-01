@@ -1,6 +1,6 @@
-use nohash_hasher::IsEnabled;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::num::NonZeroU64;
+use std::{borrow::{Borrow, BorrowMut}, ops::Deref};
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const BUS_ID_SIZE: usize = 32;
@@ -15,24 +15,13 @@ impl std::fmt::Display for Version {
     }
 }
 
-pub trait RequestTrait: Sized + Serialize + DeserializeOwned {
-    type Response: Sized + Serialize + DeserializeOwned;
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     ListUsbDevices,
     ImportUsbDevice(UsbDeviceId),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ListUsbDevices;
-
 pub type Response<T> = Result<T, Error>;
-
-impl RequestTrait for Request {
-    type Response = UsbDeviceInfo;
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsbDeviceId {
@@ -44,32 +33,40 @@ pub struct UsbDeviceId {
 pub struct ImportedDevice {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsbDevices {
-    list: Vec<UsbDeviceInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsbDeviceInfo {}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 #[repr(transparent)]
-pub struct ReqId(NonZeroU64);
-impl IsEnabled for ReqId {}
+pub struct BusId<'a>(pub std::borrow::Cow<'a, lstr::LimitedStr<32>>);
 
-impl ReqId {
-    fn new() -> Self {
-        Self(rand::random())
+impl Deref for BusId<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(transparent)]
-#[repr(transparent)]
-pub struct PayloadId(pub NonZeroU64);
-impl IsEnabled for PayloadId {}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbDeviceInfo<'a> {
+    pub id: UsbDeviceId,
+    pub bus_id: BusId<'a>,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+    pub interfaces: Vec<InterfaceInfo>
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceInfo {
+    pub interface_number: u8,
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+}
 
 #[derive(Debug, Error, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Error {
     #[error("request failed")]
     Failed = 1,
@@ -83,57 +80,11 @@ pub enum Error {
     UnexpectedReq,
     #[error("unexpected request")]
     UnexpectedResp,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Header {
-    pub version: u16,
-    pub stream_type: StreamType,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StreamType {
-    Ctrl,
-    Data(PayloadId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Dir {
-    Bi = 0,
-    Uni = 1,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Resp {
-    pub id: ReqId,
-    pub payload: Result<Option<(PayloadId, Dir)>, Error>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Req {
-    pub id: ReqId,
-    pub op: Operation,
-}
-
-impl Req {
-    pub fn new(op: Operation) -> Self {
-        Self {
-            id: ReqId::new(),
-            op,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Operation {
-    ListDevices,
-    ImportDevice(UsbDeviceId),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Control {
-    Request(Req),
-    Response(Resp),
+    #[error("unexpected version - client: {client}, server: {server}")]
+    VersionMismatch {
+        client: Version,
+        server: Version
+    },
 }
 
 /*
