@@ -15,7 +15,7 @@ impl std::fmt::Display for Version {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Request {
     ListUsbDevices,
     ImportUsbDevice(UsbDeviceId),
@@ -23,7 +23,7 @@ pub enum Request {
 
 pub type Response<T> = Result<T, Error>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UsbDeviceId {
     pub bus_number: u8,
     pub device_addr: u8,

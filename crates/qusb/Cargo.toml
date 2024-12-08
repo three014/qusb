@@ -8,8 +8,8 @@ bitflags = "2.6.0"
 quinn = { version = "0.11.6", features = ["runtime-tokio"] }
 rcgen = "0.13.1"
 thiserror = "2.0.3"
-tokio = { version = "1.41.1", features = ["io-util", "sync", "macros"] }
-spec = { package = "qusb-spec", path = "../qusb-spec" }
+tokio = { version = "1.41.1", features = ["io-util", "sync", "macros", "rt", "rt-multi-thread"] }
+proto = { package = "qusb-proto", path = "../qusb-proto" }
 postcard = { version = "1.0.10" }
 nohash-hasher = "0.2.0"
 rand = "0.8.5"
@@ -21,6 +21,7 @@ tokio-util = "0.7.12"
 nusb = "0.1.12"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
+vhci = { package = "usb_vhci", git = "https://github.com/three014/usb_vhci" }
 
 [dev-dependencies]
 tracing-test = "0.2.5"

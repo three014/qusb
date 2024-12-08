@@ -3,6 +3,7 @@ use std::{pin::Pin, sync::Arc};
 use quinn::rustls;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
+pub use vhci::utils::*;
 
 use crate::Error;
 

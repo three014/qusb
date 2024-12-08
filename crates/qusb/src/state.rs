@@ -1,18 +1,17 @@
-use std::marker::PhantomData;
-
 use crate::Error;
 use tokio::io::BufReader;
 
 pub struct ClientIdle;
 pub struct ClientReq;
 pub struct ClientListDevices;
+pub struct ClientAttachDev(proto::UsbDeviceInfo<'static>);
 pub struct ServerListening;
 pub struct ServerGetReq;
-pub struct ServerDecideResp;
+pub struct ServerDecideResp(proto::Request);
 pub struct ServerListDevices;
 
 pub struct State<T> {
-    _p: PhantomData<T>,
+    _s: T,
     tx: crate::stream::Sender2<quinn::SendStream>,
     rx: crate::stream::Receiver2<BufReader<quinn::RecvStream>>,
 }
@@ -22,7 +21,7 @@ impl State<ClientIdle> {
     pub fn new_client(tx: quinn::SendStream, rx: quinn::RecvStream) -> Self {
         tracing::trace!("New client-side stream ready to go!");
         Self {
-            _p: PhantomData,
+            _s: ClientIdle,
             tx: crate::stream::Sender2::new(tx),
             rx: crate::stream::Receiver2::new(BufReader::with_capacity(1024, rx)),
         }
@@ -30,19 +29,19 @@ impl State<ClientIdle> {
 
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn verify_version(self) -> Result<State<ClientReq>, Error> {
-        let Self { _p, mut tx, mut rx } = self;
-        tx.send(&spec::VERSION).await?;
+        let Self { _s, mut tx, mut rx } = self;
+        tx.send(&proto::VERSION).await?;
         let result = rx
-            .recv::<spec::Response<()>>()
+            .recv::<proto::Response<()>>()
             .await?
             .expect("Server should return a response in this state");
         let next_state = match result {
             Ok(_) => State {
-                _p: PhantomData,
+                _s: ClientReq,
                 tx,
                 rx,
             },
-            Err(spec::Error::VersionMismatch { client: _, server }) => {
+            Err(proto::Error::VersionMismatch { client: _, server }) => {
                 Err(Error::VersionMismatch(server))?
             }
             _ => unreachable!("Not a valid error in this state"),
@@ -55,28 +54,57 @@ impl State<ClientIdle> {
 impl State<ClientReq> {
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn list_devices(self) -> Result<State<ClientListDevices>, Error> {
-        let Self { _p, mut tx, rx } = self;
-        tx.send(&spec::Request::ListUsbDevices).await?;
+        let Self { _s, mut tx, rx } = self;
+        tx.send(&proto::Request::ListUsbDevices).await?;
         tracing::trace!("Sent request to list available USB devices to server");
         tx.as_writer_mut().finish().unwrap();
         Ok(State {
-            _p: PhantomData,
+            _s: ClientListDevices,
             tx,
             rx,
         })
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub async fn attach_device(
+        self,
+        id: proto::UsbDeviceId,
+    ) -> Result<State<ClientAttachDev>, Error> {
+        let Self { _s, mut tx, mut rx } = self;
+        tx.send(&proto::Request::ImportUsbDevice(id)).await?;
+        tracing::trace!("Sent request to attach USB device with this id: {id:?}");
+        let resp = rx
+            .recv()
+            .await?
+            .expect("Should receive a response from server");
+        match resp {
+            proto::Response::Ok(dev) => Ok(State {
+                _s: ClientAttachDev(dev),
+                tx,
+                rx,
+            }),
+            proto::Response::Err(proto::Error::NoDev) => Err(Error::DevNotFound(id)),
+            _ => todo!(),
+        }
     }
 }
 
 impl State<ClientListDevices> {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn next(&mut self) -> Result<Option<spec::UsbDeviceInfo<'static>>, Error> {
+    pub async fn next(&mut self) -> Result<Option<proto::UsbDeviceInfo<'static>>, Error> {
         match self.rx.recv().await? {
             Some(dev) => Ok(Some(dev)),
             None => {
                 // self.rx.as_reader_mut().get_mut().received_reset().await.unwrap();
                 Ok(None)
-            },
+            }
         }
+    }
+}
+
+impl State<ClientAttachDev> {
+    pub fn dev(&self) -> &proto::UsbDeviceInfo {
+        &self._s.0
     }
 }
 
@@ -85,7 +113,7 @@ impl State<ServerListening> {
     pub fn new_server(tx: quinn::SendStream, rx: quinn::RecvStream) -> Self {
         tracing::trace!("New server-side stream ready to go!");
         Self {
-            _p: PhantomData,
+            _s: ServerListening,
             tx: crate::stream::Sender2::new(tx),
             rx: crate::stream::Receiver2::new(BufReader::with_capacity(1024, rx)),
         }
@@ -93,24 +121,24 @@ impl State<ServerListening> {
 
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn verify_version(self) -> Result<State<ServerGetReq>, Error> {
-        let Self { _p, mut tx, mut rx } = self;
+        let Self { _s, mut tx, mut rx } = self;
         let version = rx
-            .recv::<spec::Version>()
+            .recv::<proto::Version>()
             .await?
             .expect("We can't get here without the client sending a proper message");
-        if version != spec::VERSION {
-            tx.send::<spec::Response<()>>(&spec::Response::Err(spec::Error::VersionMismatch {
+        if version != proto::VERSION {
+            tx.send::<proto::Response<()>>(&proto::Response::Err(proto::Error::VersionMismatch {
                 client: version,
-                server: spec::VERSION,
+                server: proto::VERSION,
             }))
             .await?;
             Err(Error::VersionMismatch(version))
         } else {
-            tx.send::<spec::Response<()>>(&spec::Response::Ok(()))
+            tx.send::<proto::Response<()>>(&proto::Response::Ok(()))
                 .await?;
             tracing::trace!("Verified that client and server have the same version");
             Ok(State {
-                _p: PhantomData,
+                _s: ServerGetReq,
                 tx,
                 rx,
             })
@@ -120,21 +148,18 @@ impl State<ServerListening> {
 
 impl State<ServerGetReq> {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn recv_req(self) -> Result<(spec::Request, State<ServerDecideResp>), Error> {
-        let Self { _p, tx, mut rx } = self;
+    pub async fn recv_req(self) -> Result<State<ServerDecideResp>, Error> {
+        let Self { _s, tx, mut rx } = self;
         let req = rx
-            .recv::<spec::Request>()
+            .recv::<proto::Request>()
             .await?
             .expect("Client should have sent a request");
         tracing::trace!("Received a request from client");
-        Ok((
-            req,
-            State {
-                _p: PhantomData,
-                tx,
-                rx,
-            },
-        ))
+        Ok(State {
+            _s: ServerDecideResp(req),
+            tx,
+            rx,
+        })
     }
 }
 
@@ -142,16 +167,20 @@ impl State<ServerDecideResp> {
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn list_devices(self) -> State<ServerListDevices> {
         State {
-            _p: PhantomData,
+            _s: ServerListDevices,
             tx: self.tx,
             rx: self.rx,
         }
+    }
+
+    pub fn req(&self) -> proto::Request {
+        self._s.0
     }
 }
 
 impl State<ServerListDevices> {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn send_device(&mut self, dev: &spec::UsbDeviceInfo<'_>) -> Result<(), Error> {
+    pub async fn send_device(&mut self, dev: &proto::UsbDeviceInfo<'_>) -> Result<(), Error> {
         self.tx.send(&dev).await?;
         tracing::trace!("Sent a message to client");
         Ok(())
@@ -166,19 +195,19 @@ impl State<ServerListDevices> {
     }
 }
 
-// pub struct VersionSender(pub(crate) crate::Sender<spec::Version>);
+// pub struct VersionSender(pub(crate) crate::Sender<proto::Version>);
 // impl VersionSender {
 //     pub async fn send(mut self) -> Result<ReqSender, Error> {
-//         self.0.send(&spec::VERSION).await?;
+//         self.0.send(&proto::VERSION).await?;
 //         Ok(ReqSender(self.0.convert()))
 //     }
 // }
 
-// pub struct VersionReceiver(pub(crate) crate::Receiver<spec::Version>);
+// pub struct VersionReceiver(pub(crate) crate::Receiver<proto::Version>);
 // impl VersionReceiver {
 //     pub async fn recv(mut self) -> Result<ReqReceiver, Error> {
 //         let version = self.0.recv().await?.unwrap();
-//         if version != spec::VERSION {
+//         if version != proto::VERSION {
 //             Err(Error::VersionMismatch(version))
 //         } else {
 //             Ok(ReqReceiver(self.0.convert()))
@@ -186,13 +215,13 @@ impl State<ServerListDevices> {
 //     }
 // }
 
-// pub struct RespSender<T: Serialize + std::fmt::Debug>(pub(crate) crate::Sender<spec::Response<T>>);
+// pub struct RespSender<T: Serialize + std::fmt::Debug>(pub(crate) crate::Sender<proto::Response<T>>);
 // impl<T: Serialize + std::fmt::Debug> RespSender<T> {
 //     pub async fn send_data(&mut self, data: T) -> Result<(), Error> {
 //         self.0.send(&Ok(data)).await
 //     }
 
-//     pub async fn send_err(mut self, data: spec::Error) -> Result<(), Error> {
+//     pub async fn send_err(mut self, data: proto::Error) -> Result<(), Error> {
 //         self.0.send(&Err(data)).await
 //     }
 
@@ -202,10 +231,10 @@ impl State<ServerListDevices> {
 // }
 
 // pub struct RespReceiver<T: DeserializeOwned + std::fmt::Debug>(
-//     pub(crate) crate::Receiver<spec::Response<T>>,
+//     pub(crate) crate::Receiver<proto::Response<T>>,
 // );
 // impl<T: DeserializeOwned + std::fmt::Debug> RespReceiver<T> {
-//     pub async fn recv(&mut self) -> Result<Option<spec::Response<T>>, Error> {
+//     pub async fn recv(&mut self) -> Result<Option<proto::Response<T>>, Error> {
 //         self.0.recv().await
 //     }
 
@@ -214,22 +243,22 @@ impl State<ServerListDevices> {
 //     }
 // }
 
-// pub struct ReqSender(crate::Sender<spec::Request>);
+// pub struct ReqSender(crate::Sender<proto::Request>);
 // impl ReqSender {
 //     pub async fn send<T: Serialize + std::fmt::Debug>(
 //         mut self,
-//         req: spec::Request,
+//         req: proto::Request,
 //     ) -> Result<crate::Sender<T>, Error> {
 //         self.0.send(&req).await?;
 //         Ok(self.0.convert::<T>())
 //     }
 // }
 
-// pub struct ReqReceiver(crate::Receiver<spec::Request>);
+// pub struct ReqReceiver(crate::Receiver<proto::Request>);
 // impl ReqReceiver {
 //     pub async fn recv<T: DeserializeOwned + std::fmt::Debug>(
 //         mut self,
-//     ) -> Result<(spec::Request, crate::Receiver<T>), Error> {
+//     ) -> Result<(proto::Request, crate::Receiver<T>), Error> {
 //         let req = self.0.recv().await?;
 //         Ok((req, self.0.convert()))
 //     }

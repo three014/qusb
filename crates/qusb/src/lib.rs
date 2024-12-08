@@ -1,17 +1,19 @@
-// use bitflags::bitflags;
-use crate::utils::SkipServerVerification;
-use futures_util::StreamExt;
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     rustls,
 };
-use serde::{de::DeserializeOwned, Serialize};
 use state::State;
 use std::{
-    future::Future, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, ops::Deref, os::unix::ffi::OsStrExt, path::Path, sync::{Arc, LazyLock}
+    future::Future,
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    ops::Deref,
+    path::Path,
+    sync::{Arc, LazyLock},
+    time::Duration,
 };
 use tokio::io::BufReader;
 use usb_ids::UsbIds;
+use utils::OpenBoundedU8;
 
 mod state;
 mod stream;
@@ -27,8 +29,10 @@ pub enum Error {
     Serde(#[from] postcard::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
-    #[error("unsupported qusb protocol version (their version: {0}, our version: {ver})", ver = spec::VERSION)]
-    VersionMismatch(spec::Version),
+    #[error("unsupported qusb protocol version (their version: {0}, our version: {ver})", ver = proto::VERSION)]
+    VersionMismatch(proto::Version),
+    #[error("device with id {0:?} not found")]
+    DevNotFound(proto::UsbDeviceId),
 }
 
 static USB_IDS: LazyLock<UsbIds> =
@@ -41,6 +45,7 @@ pub fn usb_ids() -> &'static UsbIds {
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
+    vhci: vhci::Vhci,
 }
 
 impl Session {
@@ -66,23 +71,100 @@ impl Session {
         Ok(listening.verify_version().await?)
     }
 
-    const fn new(conn: quinn::Connection) -> Self {
-        Self { conn }
+    fn new(conn: quinn::Connection, num_ports: OpenBoundedU8<0, 32>) -> Result<Self, Error> {
+        Ok(Self {
+            conn,
+            vhci: vhci::Vhci::open(num_ports).map_err(Error::from)?,
+        })
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    pub async fn list_devices(&self) -> Result<Vec<spec::UsbDeviceInfo<'static>>, Error> {
-        let client = self.open_stream().await.unwrap();
+    pub async fn list_devices(&self) -> Result<Vec<proto::UsbDeviceInfo<'static>>, Error> {
+        let mut client = self.open_stream().await.unwrap().list_devices().await?;
 
-        let mut list_devices = client.list_devices().await?;
         tracing::trace!("Requested 'ListDevices'");
         let mut devices = vec![];
-        while let Some(dev) = list_devices.next().await? {
+        while let Some(dev) = client.next().await? {
             tracing::trace!("Got a device from server: {:?}", dev);
             devices.push(dev);
         }
         tracing::trace!("Finished receiving devices from the server");
         Ok(devices)
+    }
+
+    pub async fn attach_device(&mut self, id: proto::UsbDeviceId) -> Result<(), Error> {
+        use vhci::*;
+        let client = self.open_stream().await?.attach_device(id).await?;
+
+        let mut addr = 0xff;
+        let mut stat = PortStat {
+            status: PortStatus::empty(),
+            change: PortChange::empty(),
+            index: Port::new(1).unwrap(),
+            flags: PortFlag::empty(),
+        };
+
+        loop {
+            let work = match self.vhci.fetch_work() {
+                Ok(work) => work,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::TimedOut
+                        || err.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    continue
+                }
+                Err(err)
+                    if err
+                        .raw_os_error()
+                        .expect("vhci should contain a libc errno")
+                        == libc::ENODATA =>
+                {
+                    continue
+                }
+                Err(err) => Err(err)?,
+            };
+
+            match work {
+                Work::Handle(_) => todo!(),
+                Work::Urb(urb) => todo!(),
+                Work::PortStat(port_stat) => {
+                    let prev = stat;
+                    stat = port_stat;
+
+                    if stat.index.get() != 1 {
+                        break;
+                    }
+
+                    if stat.change.contains(PortChange::CONNECTION) {
+                        addr = 0xff;
+                    }
+                    if stat.change.contains(PortChange::RESET)
+                        && stat.status.complement().contains(PortStatus::RESET)
+                        && stat.status.contains(PortStatus::ENABLE)
+                    {
+                        addr = 0;
+                    }
+                    if prev.status.contains(PortStatus::POWER)
+                        && stat.status.complement().contains(PortStatus::POWER)
+                    {
+                    }
+                    if prev.status.complement().contains(PortStatus::POWER)
+                        && stat.status.contains(PortStatus::POWER)
+                    {
+                        self.vhci.port_connect(stat.index, DataRate::Full)?;
+                    }
+                }
+            }
+
+            break;
+        }
+
+        // We unfortunately need two queues; one for submitted urbs
+        // and one for the return values of urbs
+        //
+        //
+
+        todo!()
     }
 }
 
@@ -120,14 +202,14 @@ pub struct Client {
 
 impl Client {
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Session {
+    pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Result<Session, Error> {
         let conn = self
             .endpoint
             .connect(peer_addr, peer_name)
             .unwrap()
             .await
-            .unwrap();
-        Session::new(conn)
+            .map_err(std::io::Error::from)?;
+        Session::new(conn, OpenBoundedU8::new(4).unwrap())
     }
 }
 
@@ -148,6 +230,17 @@ impl Server {
         let handle = tokio::spawn(async move {
             let mut set = tokio::task::JoinSet::new();
             tracing::info!("Server ready to accept new connections");
+
+            async fn check_for_completed_task(
+                set: &mut tokio::task::JoinSet<Result<(), Error>>,
+            ) -> Option<Result<(tokio::task::Id, Result<(), Error>), tokio::task::JoinError>>
+            {
+                if set.is_empty() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                set.join_next_with_id().await
+            }
+
             loop {
                 tokio::select! {
                     incoming = self.endpoint.accept() => {
@@ -158,7 +251,7 @@ impl Server {
                             set.spawn(async move {
                                 let conn = incoming.await.map_err(|err| Error::Io(err.into()))?;
                                 tracing::trace!("Established new session with {} - RTT {:?}", conn.remote_address(), conn.rtt());
-                                let session = Session::new(conn);
+                                let session = Session::new(conn, OpenBoundedU8::new(4).unwrap())?;
                                 handle(session, cancel_for_session).await
                             });
                         } else {
@@ -167,8 +260,16 @@ impl Server {
                     },
                     _ = cancel_for_serve.cancelled() => {
                         break;
-                    }
+                    },
 
+                    maybe_complete = check_for_completed_task(&mut set) => {
+                        match maybe_complete {
+                            Some(Ok((id, Ok(_)))) => tracing::info!("Session {id} completed successfully"),
+                            Some(Ok((id, Err(cause)))) => tracing::warn! { %cause, "Session {id} failed" },
+                            Some(Err(_)) => todo!(),
+                            _ => (),
+                        }
+                    }
                 }
             }
 
@@ -194,12 +295,12 @@ pub async fn handle_list_devices(state: State<state::ServerDecideResp>) -> Resul
     let mut stream = state.list_devices();
 
     for device in nusb::list_devices()? {
-        let to_send = spec::UsbDeviceInfo {
-            id: spec::UsbDeviceId {
+        let to_send = proto::UsbDeviceInfo {
+            id: proto::UsbDeviceId {
                 bus_number: device.bus_number(),
                 device_addr: device.device_address(),
             },
-            bus_id: spec::BusId(std::borrow::Cow::Borrowed(
+            bus_id: proto::BusId(std::borrow::Cow::Borrowed(
                 device
                     .sysfs_path()
                     .file_name()
@@ -216,7 +317,7 @@ pub async fn handle_list_devices(state: State<state::ServerDecideResp>) -> Resul
             protocol: device.protocol(),
             interfaces: device
                 .interfaces()
-                .map(|int| spec::InterfaceInfo {
+                .map(|int| proto::InterfaceInfo {
                     interface_number: int.interface_number(),
                     class: int.subclass(),
                     subclass: int.subclass(),
@@ -286,13 +387,14 @@ mod tests {
             let stream = session.accept_stream().await.unwrap();
             tracing::trace!("Accepted new stream");
 
-            let (req, stream) = stream.recv_req().await.unwrap();
+            let stream = stream.recv_req().await.unwrap();
+            let req = stream.req();
             tracing::trace!("Received request from client: {req:?}");
             match req {
-                spec::Request::ListUsbDevices => {
+                proto::Request::ListUsbDevices => {
                     handle_list_devices(stream).await?;
                 }
-                spec::Request::ImportUsbDevice(_) => panic!("Not what this test is for"),
+                proto::Request::ImportUsbDevice(_) => panic!("Not what this test is for"),
             }
 
             tracing::trace!("Finished serving req");
@@ -302,10 +404,11 @@ mod tests {
         {
             let session = client
                 .connect("127.0.0.1:7640".parse().unwrap(), "localhost")
-                .await;
+                .await
+                .unwrap();
             tracing::info!("Connected to {}", session.conn.remote_address());
 
-            let devs = session.list_devices().await.unwrap();
+            let _devs = session.list_devices().await.unwrap();
         }
 
         handle.shutdown().await;
