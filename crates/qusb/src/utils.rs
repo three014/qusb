@@ -1,6 +1,6 @@
 use std::{pin::Pin, sync::Arc};
 
-use quinn::rustls;
+use crate::rustls;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
 pub use vhci::utils::*;
@@ -34,7 +34,7 @@ use crate::Error;
 // }
 
 #[tracing::instrument(level = "trace", skip(writer))]
-pub async fn serialize_into_writer<T: Serialize + std::fmt::Debug, W: AsyncWrite + Unpin>(
+pub(crate) async fn serialize_into_writer<T: Serialize + std::fmt::Debug, W: AsyncWrite + Unpin>(
     item: &T,
     writer: &mut W,
     buf: &mut Vec<u8>,
@@ -57,7 +57,7 @@ pub async fn serialize_into_writer<T: Serialize + std::fmt::Debug, W: AsyncWrite
 }
 
 #[tracing::instrument(level = "trace", skip(reader))]
-pub async fn deserialize_from_reader<
+pub(crate) async fn deserialize_from_reader<
     T: DeserializeOwned + std::fmt::Debug,
     R: AsyncBufRead + Sized + Unpin,
 >(
@@ -76,7 +76,7 @@ pub async fn deserialize_from_reader<
 }
 
 #[derive(Debug)]
-pub struct RWStream {
+pub(crate) struct RWStream {
     tx: quinn::SendStream,
     rx: quinn::RecvStream,
 }

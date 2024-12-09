@@ -1,7 +1,11 @@
-use std::{borrow::{Borrow, BorrowMut}, ops::Deref};
+use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod utils {
+    pub use lstr;
+}
 
 pub const BUS_ID_SIZE: usize = 32;
 pub const VERSION: Version = Version(0x0200);
@@ -18,7 +22,7 @@ impl std::fmt::Display for Version {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Request {
     ListUsbDevices,
-    ImportUsbDevice(UsbDeviceId),
+    Borrow(UsbDeviceId),
 }
 
 pub type Response<T> = Result<T, Error>;
@@ -28,9 +32,6 @@ pub struct UsbDeviceId {
     pub bus_number: u8,
     pub device_addr: u8,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportedDevice {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -54,7 +55,7 @@ pub struct UsbDeviceInfo<'a> {
     pub class: u8,
     pub subclass: u8,
     pub protocol: u8,
-    pub interfaces: Vec<InterfaceInfo>
+    pub interfaces: Vec<InterfaceInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,10 +82,7 @@ pub enum Error {
     #[error("unexpected request")]
     UnexpectedResp,
     #[error("unexpected version - client: {client}, server: {server}")]
-    VersionMismatch {
-        client: Version,
-        server: Version
-    },
+    VersionMismatch { client: Version, server: Version },
 }
 
 /*

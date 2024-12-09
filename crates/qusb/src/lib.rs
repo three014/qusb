@@ -1,7 +1,4 @@
-use quinn::{
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-    rustls,
-};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use state::State;
 use std::{
     future::Future,
@@ -11,17 +8,15 @@ use std::{
     sync::{Arc, LazyLock},
     time::Duration,
 };
-use tokio::io::BufReader;
 use usb_ids::UsbIds;
 use utils::OpenBoundedU8;
+
+pub use quinn::rustls;
 
 mod state;
 mod stream;
 mod usb_ids;
-mod utils;
-
-pub type Sender<T> = stream::Sender<T, quinn::SendStream>;
-pub type Receiver<T> = stream::Receiver<T, BufReader<quinn::RecvStream>>;
+pub mod utils;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -49,6 +44,10 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn remote_address(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
     #[tracing::instrument(skip_all, level = "trace")]
     pub async fn open_stream(&self) -> Result<State<state::ClientReq>, Error> {
         let (tx, rx) = self
@@ -92,9 +91,9 @@ impl Session {
         Ok(devices)
     }
 
-    pub async fn attach_device(&mut self, id: proto::UsbDeviceId) -> Result<(), Error> {
+    pub async fn borrow_device(&mut self, id: proto::UsbDeviceId) -> Result<(), Error> {
         use vhci::*;
-        let client = self.open_stream().await?.attach_device(id).await?;
+        let client = self.open_stream().await?.borrow_device(id).await?;
 
         let mut addr = 0xff;
         let mut stat = PortStat {
@@ -196,6 +195,7 @@ pub fn peer(
     )
 }
 
+#[derive(Debug, Clone)]
 pub struct Client {
     endpoint: quinn::Endpoint,
 }
@@ -326,7 +326,7 @@ pub async fn handle_list_devices(state: State<state::ServerDecideResp>) -> Resul
                 .collect(),
         };
 
-        stream.send_device(&to_send).await?;
+        stream.send_device_info(&to_send).await?;
     }
 
     stream.finish().await
@@ -338,9 +338,9 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self) -> Result<Result<(), Error>, tokio::task::JoinError> {
         self.cancel_token.cancel();
-        self.handle.await.unwrap().unwrap();
+        self.handle.await
     }
 }
 
@@ -362,55 +362,3 @@ impl ServerHandle {
 //         const SERVER = 0b1000;
 //     }
 // }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn list_devices_works() {
-        let (server, cert) = utils::make_self_signed();
-        let mut certs = rustls::RootCertStore::empty();
-        certs.add(cert).unwrap();
-        let client = rustls::ClientConfig::builder()
-            .with_root_certificates(Arc::new(certs))
-            .with_no_client_auth();
-        let (client, server) = peer(
-            server,
-            client,
-            Some("127.0.0.1:7640".parse().unwrap()),
-            quinn::TransportConfig::default(),
-        );
-
-        let handle = server.serve(|session, _cancel_handle| async move {
-            let stream = session.accept_stream().await.unwrap();
-            tracing::trace!("Accepted new stream");
-
-            let stream = stream.recv_req().await.unwrap();
-            let req = stream.req();
-            tracing::trace!("Received request from client: {req:?}");
-            match req {
-                proto::Request::ListUsbDevices => {
-                    handle_list_devices(stream).await?;
-                }
-                proto::Request::ImportUsbDevice(_) => panic!("Not what this test is for"),
-            }
-
-            tracing::trace!("Finished serving req");
-            Ok(())
-        });
-
-        {
-            let session = client
-                .connect("127.0.0.1:7640".parse().unwrap(), "localhost")
-                .await
-                .unwrap();
-            tracing::info!("Connected to {}", session.conn.remote_address());
-
-            let _devs = session.list_devices().await.unwrap();
-        }
-
-        handle.shutdown().await;
-    }
-}

@@ -4,7 +4,7 @@ use tokio::io::BufReader;
 pub struct ClientIdle;
 pub struct ClientReq;
 pub struct ClientListDevices;
-pub struct ClientAttachDev(proto::UsbDeviceInfo<'static>);
+pub struct ClientBorrowDev(proto::UsbDeviceInfo<'static>);
 pub struct ServerListening;
 pub struct ServerGetReq;
 pub struct ServerDecideResp(proto::Request);
@@ -66,12 +66,12 @@ impl State<ClientReq> {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn attach_device(
+    pub async fn borrow_device(
         self,
         id: proto::UsbDeviceId,
-    ) -> Result<State<ClientAttachDev>, Error> {
+    ) -> Result<State<ClientBorrowDev>, Error> {
         let Self { _s, mut tx, mut rx } = self;
-        tx.send(&proto::Request::ImportUsbDevice(id)).await?;
+        tx.send(&proto::Request::Borrow(id)).await?;
         tracing::trace!("Sent request to attach USB device with this id: {id:?}");
         let resp = rx
             .recv()
@@ -79,7 +79,7 @@ impl State<ClientReq> {
             .expect("Should receive a response from server");
         match resp {
             proto::Response::Ok(dev) => Ok(State {
-                _s: ClientAttachDev(dev),
+                _s: ClientBorrowDev(dev),
                 tx,
                 rx,
             }),
@@ -102,7 +102,7 @@ impl State<ClientListDevices> {
     }
 }
 
-impl State<ClientAttachDev> {
+impl State<ClientBorrowDev> {
     pub fn dev(&self) -> &proto::UsbDeviceInfo {
         &self._s.0
     }
@@ -180,7 +180,7 @@ impl State<ServerDecideResp> {
 
 impl State<ServerListDevices> {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn send_device(&mut self, dev: &proto::UsbDeviceInfo<'_>) -> Result<(), Error> {
+    pub async fn send_device_info(&mut self, dev: &proto::UsbDeviceInfo<'_>) -> Result<(), Error> {
         self.tx.send(&dev).await?;
         tracing::trace!("Sent a message to client");
         Ok(())
