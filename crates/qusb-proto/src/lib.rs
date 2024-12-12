@@ -1,11 +1,10 @@
 use std::ops::Deref;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub mod utils {
-    pub use lstr;
-}
+pub use lstr;
+
+pub mod urb;
 
 pub const BUS_ID_SIZE: usize = 32;
 pub const VERSION: Version = Version(0x0200);
@@ -85,51 +84,12 @@ pub enum Error {
     VersionMismatch { client: Version, server: Version },
 }
 
+
 /*
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    #[serde(transparent)]
-    struct CommandOld: u16 {
-        const OP_REQUEST = 0x80 << 8;
-        const OP_REPLY = 0x00 << 8;
-
-        const OP_IMPORT = 0x03;
-        const OP_REQ_IMPORT = Self::OP_REQUEST.bits() | Self::OP_IMPORT.bits();
-        const OP_REP_IMPORT = Self::OP_REPLY.bits() | Self::OP_IMPORT.bits();
-
-        const OP_DEVLIST = 0x05;
-        const OP_REQ_DEVLIST = Self::OP_REQUEST.bits() | Self::OP_DEVLIST.bits();
-        const OP_REP_DEVLIST = Self::OP_REPLY.bits() | Self:: OP_DEVLIST.bits();
-
-        const OP_EXPORT = 0x06;
-        const OP_REQ_EXPORT = Self::OP_REQUEST.bits() | Self::OP_EXPORT.bits();
-        const OP_REP_EXPORT = Self::OP_REPLY.bits() | Self::OP_EXPORT.bits();
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[repr(u16)]
-pub enum ResponseStatus {
-    Success = 0x00,
-    Failed = 0x01,
-    DevBusy = 0x02,
-    DevErr = 0x03,
-    NoDev = 0x04,
-    Unexpected = 0x05,
-}
-
-impl core::fmt::Display for ResponseStatus {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ResponseStatus::Success => write!(f, "Request succeeded"),
-            ResponseStatus::Failed => write!(f, "Request failed"),
-            ResponseStatus::DevBusy => write!(f, "Device busy (exported)"),
-            ResponseStatus::DevErr => write!(f, "Device in error state"),
-            ResponseStatus::NoDev => write!(f, "Device not found"),
-            ResponseStatus::Unexpected => write!(f, "Unexpected response"),
-        }
-    }
-}
+I want to send ISO packets using QUIC
+datagrams, not with QUIC streams.
+ISO packets are best effort and unreliable
+so I might as well do the same thing.
 */
 
 #[cfg(test)]

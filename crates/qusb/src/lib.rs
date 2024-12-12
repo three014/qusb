@@ -16,6 +16,7 @@ pub use quinn::rustls;
 mod state;
 mod stream;
 mod usb_ids;
+mod dev;
 pub mod utils;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,13 +38,17 @@ pub fn usb_ids() -> &'static UsbIds {
     USB_IDS.deref()
 }
 
+
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
-    vhci: vhci::Vhci,
 }
 
 impl Session {
+    fn new(conn: quinn::Connection, num_ports: OpenBoundedU8<0, 32>) -> Self {
+        Self { conn }
+    }
+
     pub fn remote_address(&self) -> SocketAddr {
         self.conn.remote_address()
     }
@@ -70,13 +75,6 @@ impl Session {
         Ok(listening.verify_version().await?)
     }
 
-    fn new(conn: quinn::Connection, num_ports: OpenBoundedU8<0, 32>) -> Result<Self, Error> {
-        Ok(Self {
-            conn,
-            vhci: vhci::Vhci::open(num_ports).map_err(Error::from)?,
-        })
-    }
-
     #[tracing::instrument(skip_all, level = "trace")]
     pub async fn list_devices(&self) -> Result<Vec<proto::UsbDeviceInfo<'static>>, Error> {
         let mut client = self.open_stream().await.unwrap().list_devices().await?;
@@ -92,7 +90,7 @@ impl Session {
     }
 
     pub async fn borrow_device(&mut self, id: proto::UsbDeviceId) -> Result<(), Error> {
-        use vhci::*;
+        use ::vhci::*;
         let client = self.open_stream().await?.borrow_device(id).await?;
 
         let mut addr = 0xff;
@@ -103,61 +101,6 @@ impl Session {
             flags: PortFlag::empty(),
         };
 
-        loop {
-            let work = match self.vhci.fetch_work() {
-                Ok(work) => work,
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::TimedOut
-                        || err.kind() == std::io::ErrorKind::Interrupted =>
-                {
-                    continue
-                }
-                Err(err)
-                    if err
-                        .raw_os_error()
-                        .expect("vhci should contain a libc errno")
-                        == libc::ENODATA =>
-                {
-                    continue
-                }
-                Err(err) => Err(err)?,
-            };
-
-            match work {
-                Work::Handle(_) => todo!(),
-                Work::Urb(urb) => todo!(),
-                Work::PortStat(port_stat) => {
-                    let prev = stat;
-                    stat = port_stat;
-
-                    if stat.index.get() != 1 {
-                        break;
-                    }
-
-                    if stat.change.contains(PortChange::CONNECTION) {
-                        addr = 0xff;
-                    }
-                    if stat.change.contains(PortChange::RESET)
-                        && stat.status.complement().contains(PortStatus::RESET)
-                        && stat.status.contains(PortStatus::ENABLE)
-                    {
-                        addr = 0;
-                    }
-                    if prev.status.contains(PortStatus::POWER)
-                        && stat.status.complement().contains(PortStatus::POWER)
-                    {
-                    }
-                    if prev.status.complement().contains(PortStatus::POWER)
-                        && stat.status.contains(PortStatus::POWER)
-                    {
-                        self.vhci.port_connect(stat.index, DataRate::Full)?;
-                    }
-                }
-            }
-
-            break;
-        }
-
         // We unfortunately need two queues; one for submitted urbs
         // and one for the return values of urbs
         //
@@ -165,34 +108,6 @@ impl Session {
 
         todo!()
     }
-}
-
-#[tracing::instrument(skip_all, level = "trace")]
-pub fn peer(
-    server_tls: rustls::ServerConfig,
-    client_tls: rustls::ClientConfig,
-    bind: Option<SocketAddr>,
-    transport: quinn::TransportConfig,
-) -> (Client, Server) {
-    let server_tls =
-        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls).unwrap()));
-    let mut client_tls =
-        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
-    client_tls.transport_config(Arc::new(transport));
-
-    let mut endpoint = quinn::Endpoint::server(
-        server_tls,
-        bind.unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()),
-    )
-    .unwrap();
-    endpoint.set_default_client_config(client_tls);
-
-    (
-        Client {
-            endpoint: endpoint.clone(),
-        },
-        Server { endpoint },
-    )
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +124,7 @@ impl Client {
             .unwrap()
             .await
             .map_err(std::io::Error::from)?;
-        Session::new(conn, OpenBoundedU8::new(4).unwrap())
+        Ok(Session::new(conn, OpenBoundedU8::new(4).unwrap()))
     }
 }
 
@@ -251,7 +166,7 @@ impl Server {
                             set.spawn(async move {
                                 let conn = incoming.await.map_err(|err| Error::Io(err.into()))?;
                                 tracing::trace!("Established new session with {} - RTT {:?}", conn.remote_address(), conn.rtt());
-                                let session = Session::new(conn, OpenBoundedU8::new(4).unwrap())?;
+                                let session = Session::new(conn, OpenBoundedU8::new(4).unwrap());
                                 handle(session, cancel_for_session).await
                             });
                         } else {
@@ -287,6 +202,18 @@ impl Server {
             handle,
             cancel_token: cancel_for_handle,
         }
+    }
+}
+
+pub struct ServerHandle {
+    handle: tokio::task::JoinHandle<Result<(), Error>>,
+    cancel_token: tokio_util::sync::CancellationToken,
+}
+
+impl ServerHandle {
+    pub async fn shutdown(self) -> Result<Result<(), Error>, tokio::task::JoinError> {
+        self.cancel_token.cancel();
+        self.handle.await
     }
 }
 
@@ -332,18 +259,6 @@ pub async fn handle_list_devices(state: State<state::ServerDecideResp>) -> Resul
     stream.finish().await
 }
 
-pub struct ServerHandle {
-    handle: tokio::task::JoinHandle<Result<(), Error>>,
-    cancel_token: tokio_util::sync::CancellationToken,
-}
-
-impl ServerHandle {
-    pub async fn shutdown(self) -> Result<Result<(), Error>, tokio::task::JoinError> {
-        self.cancel_token.cancel();
-        self.handle.await
-    }
-}
-
 // bitflags! {
 //     struct Features: u8 {
 //         /// Controls whether Qusb can borrow other peers' USB devices.
@@ -362,3 +277,31 @@ impl ServerHandle {
 //         const SERVER = 0b1000;
 //     }
 // }
+
+#[tracing::instrument(skip_all, level = "trace")]
+pub fn peer(
+    server_tls: rustls::ServerConfig,
+    client_tls: rustls::ClientConfig,
+    bind: Option<SocketAddr>,
+    transport: quinn::TransportConfig,
+) -> (Client, Server) {
+    let server_tls =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls).unwrap()));
+    let mut client_tls =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
+    client_tls.transport_config(Arc::new(transport));
+
+    let mut endpoint = quinn::Endpoint::server(
+        server_tls,
+        bind.unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()),
+    )
+    .unwrap();
+    endpoint.set_default_client_config(client_tls);
+
+    (
+        Client {
+            endpoint: endpoint.clone(),
+        },
+        Server { endpoint },
+    )
+}

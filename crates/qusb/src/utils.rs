@@ -1,11 +1,13 @@
-use std::{pin::Pin, sync::Arc};
-
+use std::{collections::HashMap, sync::Arc};
 use crate::rustls;
+use nohash_hasher::BuildNoHashHasher;
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
-pub use vhci::utils::*;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+pub use vhci::utils::{ClosedBoundedI16, OpenBoundedU8, TimeoutMillis};
 
 use crate::Error;
+
+pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 
 // #[derive(Debug)]
 // pub struct BorrowedBuffer<'a> {
@@ -64,55 +66,15 @@ pub(crate) async fn deserialize_from_reader<
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> Result<Option<T>, Error> {
-    tracing::trace!("Trying to read a message from the buffer");
+    // tracing::trace!("Trying to read a message from the buffer");
     if 0 == reader.read_until(0, buf).await? {
-        tracing::trace!("No bytes read! Must be EOF");
+        // tracing::trace!("No bytes read! Must be EOF");
         return Ok(None);
     }
-    tracing::trace!("Success! buf: {buf:?} - Now attempting to deserialize the message");
+    // tracing::trace!("Success! buf: {buf:?} - Now attempting to deserialize the message");
     let recv: T = postcard::from_bytes_cobs(buf)?;
     buf.clear();
     Ok(Some(recv))
-}
-
-#[derive(Debug)]
-pub(crate) struct RWStream {
-    tx: quinn::SendStream,
-    rx: quinn::RecvStream,
-}
-
-impl AsyncRead for RWStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.rx).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for RWStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.tx), cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.tx), cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.tx), cx)
-    }
 }
 
 #[derive(Debug)]

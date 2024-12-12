@@ -1,7 +1,7 @@
 use quinn::rustls;
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 pub fn addr(port: u16) -> SocketAddr {
