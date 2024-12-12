@@ -698,6 +698,7 @@ dependencies = [
  "bitflags",
  "futures-core",
  "futures-util",
+ "heapless 0.8.0",
  "nohash-hasher",
  "nusb",
  "postcard",
