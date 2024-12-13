@@ -716,20 +716,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "qusb-borrower"
-version = "0.1.0"
-
-[[package]]
 name = "qusb-cli"
 version = "0.1.0"
-
-[[package]]
-name = "qusb-lender"
-version = "0.1.0"
-dependencies = [
- "nusb",
- "quinn",
-]
 
 [[package]]
 name = "qusb-proto"
@@ -1012,9 +1000,9 @@ dependencies = [
 
 [[package]]
 name = "semver"
-version = "1.0.23"
+version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61697e0a1c7e512e84a621326239844a24d8207b4669b41bc18b32ea5cbf988b"
+checksum = "3cb6eb87a131f756572d7fb904f6e7b68633f09cca868c5df1c4b8d1a694bbba"
 
 [[package]]
 name = "serde"
@@ -1347,7 +1335,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "usb_vhci"
 version = "0.1.0"
-source = "git+https://github.com/three014/usb_vhci#eff67c75390564c7f767e05ced207188830a5b87"
+source = "git+https://github.com/three014/usb_vhci#df3f16022b74f00eb7371b0d0813aefeb94008ee"
 dependencies = [
  "bit-vec",
  "bitflags",

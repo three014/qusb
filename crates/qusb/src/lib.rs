@@ -13,10 +13,10 @@ use utils::OpenBoundedU8;
 
 pub use quinn::rustls;
 
+mod dev;
 mod state;
 mod stream;
 mod usb_ids;
-mod dev;
 pub mod utils;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,14 +38,13 @@ pub fn usb_ids() -> &'static UsbIds {
     USB_IDS.deref()
 }
 
-
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
 }
 
 impl Session {
-    fn new(conn: quinn::Connection, num_ports: OpenBoundedU8<0, 32>) -> Self {
+    fn new(conn: quinn::Connection) -> Self {
         Self { conn }
     }
 
@@ -113,6 +112,7 @@ impl Session {
 #[derive(Debug, Clone)]
 pub struct Client {
     endpoint: quinn::Endpoint,
+    dev: dev::Controller,
 }
 
 impl Client {
@@ -124,13 +124,14 @@ impl Client {
             .unwrap()
             .await
             .map_err(std::io::Error::from)?;
-        Ok(Session::new(conn, OpenBoundedU8::new(4).unwrap()))
+        Ok(Session::new(conn))
     }
 }
 
 #[derive(Debug)]
 pub struct Server {
     endpoint: quinn::Endpoint,
+    dev: dev::Controller,
 }
 
 impl Server {
@@ -166,7 +167,7 @@ impl Server {
                             set.spawn(async move {
                                 let conn = incoming.await.map_err(|err| Error::Io(err.into()))?;
                                 tracing::trace!("Established new session with {} - RTT {:?}", conn.remote_address(), conn.rtt());
-                                let session = Session::new(conn, OpenBoundedU8::new(4).unwrap());
+                                let session = Session::new(conn);
                                 handle(session, cancel_for_session).await
                             });
                         } else {
@@ -298,10 +299,16 @@ pub fn peer(
     .unwrap();
     endpoint.set_default_client_config(client_tls);
 
+    let dev = dev::Controller::start(OpenBoundedU8::new(4).unwrap()).unwrap();
+
     (
         Client {
             endpoint: endpoint.clone(),
+            dev: dev.clone(),
         },
-        Server { endpoint },
+        Server {
+            endpoint,
+            dev,
+        },
     )
 }

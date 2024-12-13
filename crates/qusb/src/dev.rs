@@ -4,11 +4,16 @@ use std::{
 };
 
 use tokio::sync::{mpsc, oneshot};
-use vhci::{DataRate, Port, UrbHandle, Vhci, Work};
+use vhci::{DataRate, Port, Urb, UrbHandle, Vhci, Work};
 
 use crate::utils::{OpenBoundedU8, SimpleMap};
 
 mod task;
+
+pub struct FetchData {
+    urb: Urb,
+    tx: oneshot::Sender<std::io::Result<Urb>>,
+}
 
 pub enum RegisterPort {
     Any,
@@ -100,25 +105,45 @@ impl Mailer {
 pub struct Controller {
     handle: Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<()>>>>>,
     register_tx: mpsc::Sender<Register>,
+    fetch_data_tx: mpsc::Sender<FetchData>,
 }
 
 impl Controller {
     pub fn start(num_ports: OpenBoundedU8<0, 32>) -> std::io::Result<Self> {
-        let (register_tx, mut register_rx) = mpsc::channel::<Register>(8);
+        let (register_tx, mut register_rx) = mpsc::channel::<Register>(4);
+        let (fetch_data_tx, mut fetch_data_rx) = mpsc::channel::<FetchData>(8);
         let mut vhci = Vhci::open(num_ports)?;
 
         let runner = move || -> std::io::Result<()> {
+            use task::*;
             let mut mailer = Mailer::default();
             let mut work_queue = VecDeque::new();
-
-            let mut sched = task::Scheduler::<3>::new();
-            sched.push(task::recv_register);
-            sched.push(task::mail_outgoing_work);
-            sched.push(task::recv_work);
+            let mut sched = task::Scheduler::<4>::new();
+            sched.push(Task {
+                name: TaskName::Register,
+                f: register,
+                pri: Priority::Background,
+            });
+            sched.push(Task {
+                name: TaskName::FetchData,
+                f: fetch_data,
+                pri: Priority::Normal,
+            });
+            sched.push(Task {
+                name: TaskName::MailOutgoing,
+                f: mail_outgoing_work,
+                pri: Priority::High,
+            });
+            sched.push(Task {
+                name: TaskName::RecvWork,
+                f: recv_work,
+                pri: Priority::High,
+            });
 
             while sched
-                .run_next(task::TaskData {
+                .run_next(Context {
                     register_rx: &mut register_rx,
+                    fetch_data_rx: &mut fetch_data_rx,
                     vhci: &mut vhci,
                     mailer: &mut mailer,
                     outgoing: &mut work_queue,
@@ -136,6 +161,7 @@ impl Controller {
         Ok(Self {
             handle,
             register_tx,
+            fetch_data_tx,
         })
     }
 
@@ -152,6 +178,14 @@ impl Controller {
         };
 
         self.register_tx.send(register).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    pub async fn fetch_data(&mut self, urb: Urb) -> std::io::Result<Urb> {
+        let (tx, rx) = oneshot::channel();
+        let fetch_data = FetchData { urb, tx };
+
+        self.fetch_data_tx.send(fetch_data).await.unwrap();
         rx.await.unwrap()
     }
 
@@ -202,9 +236,39 @@ mod tests {
 
     #[test]
     fn controller_idles() {
-        let controller = Controller::start(OpenBoundedU8::new(1).unwrap()).unwrap();
+        let controller = Controller::start(OpenBoundedU8::new(3).unwrap()).unwrap();
 
         thread::sleep(Duration::from_secs(1));
+        controller.shutdown();
+    }
+
+    #[tokio::test]
+    async fn can_listen_for_work() {
+        let mut controller = Controller::start(OpenBoundedU8::new(8).unwrap()).unwrap();
+
+        let mut a = controller
+            .register(RegisterPort::Any, DataRate::Full)
+            .await
+            .unwrap();
+
+        let mut b = controller
+            .register(RegisterPort::Any, DataRate::Full)
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            tokio::select! {
+                work = a.recv() => {
+                    let work = work.unwrap();
+                    println!("{work:?}");
+                },
+                work = b.recv() => {
+                    let work = work.unwrap();
+                    println!("{work:?}");
+                }
+            }
+        }
+
         controller.shutdown();
     }
 }
