@@ -10,9 +10,17 @@ use crate::utils::{OpenBoundedU8, SimpleMap};
 
 mod task;
 
-pub struct FetchData {
-    urb: Urb,
-    tx: oneshot::Sender<std::io::Result<Urb>>,
+pub struct Ctrl<S, R> {
+    data: S,
+    tx: oneshot::Sender<std::io::Result<R>>,
+}
+
+impl<S, R> Ctrl<S, R> {
+    pub fn new(data: S) -> (oneshot::Receiver<std::io::Result<R>>, Ctrl<S, R>) {
+        let (tx, rx) = oneshot::channel();
+        let ctrl = Self { data, tx };
+        (rx, ctrl)
+    }
 }
 
 pub enum RegisterPort {
@@ -23,7 +31,6 @@ pub enum RegisterPort {
 pub struct Register {
     port: RegisterPort,
     data_rate: DataRate,
-    tx: oneshot::Sender<std::io::Result<mpsc::Receiver<Work>>>,
 }
 
 #[derive(Debug, Default)]
@@ -104,52 +111,66 @@ impl Mailer {
 #[derive(Debug, Clone)]
 pub struct Controller {
     handle: Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<()>>>>>,
-    register_tx: mpsc::Sender<Register>,
-    fetch_data_tx: mpsc::Sender<FetchData>,
+    register_tx: mpsc::Sender<Ctrl<Register, mpsc::Receiver<Work>>>,
+    fetch_data_tx: mpsc::Sender<Ctrl<Urb, Urb>>,
+    disconnect_tx: mpsc::Sender<Ctrl<Port, ()>>,
 }
 
 impl Controller {
     pub fn start(num_ports: OpenBoundedU8<0, 32>) -> std::io::Result<Self> {
-        let (register_tx, mut register_rx) = mpsc::channel::<Register>(4);
-        let (fetch_data_tx, mut fetch_data_rx) = mpsc::channel::<FetchData>(8);
+        let (register_tx, mut register_rx) = mpsc::channel(4);
+        let (fetch_data_tx, mut fetch_data_rx) = mpsc::channel(8);
+        let (disconnect_tx, mut disconnect_rx) = mpsc::channel(2);
         let mut vhci = Vhci::open(num_ports)?;
 
         let runner = move || -> std::io::Result<()> {
             use task::*;
             let mut mailer = Mailer::default();
             let mut work_queue = VecDeque::new();
-            let mut sched = task::Scheduler::<4>::new();
-            sched.push(Task {
-                name: TaskName::Register,
-                f: register,
-                pri: Priority::Background,
-            });
-            sched.push(Task {
-                name: TaskName::FetchData,
-                f: fetch_data,
-                pri: Priority::Normal,
-            });
-            sched.push(Task {
-                name: TaskName::MailOutgoing,
-                f: mail_outgoing_work,
-                pri: Priority::High,
-            });
-            sched.push(Task {
-                name: TaskName::RecvWork,
-                f: recv_work,
-                pri: Priority::High,
-            });
+            let mut sched = task::Scheduler::<5>::new();
+            sched.push(Task::new(
+                TaskName::Register,
+                register,
+                Nice::new(20).unwrap(),
+                2,
+            ));
+            sched.push(Task::new(TaskName::FetchData, fetch_data, Nice::NORMAL, 2));
+            sched.push(Task::new(
+                TaskName::Disconnect,
+                disconnect,
+                Nice::new(24).unwrap(),
+                0,
+            ));
+            sched.push(Task::new(
+                TaskName::MailOutgoing,
+                mail_outgoing_work,
+                Nice::new(24).unwrap(),
+                2,
+            ));
+            sched.push(Task::new(
+                TaskName::RecvWork,
+                recv_work,
+                Nice::new(1).unwrap(),
+                4,
+            ));
 
-            while sched
-                .run_next(Context {
-                    register_rx: &mut register_rx,
-                    fetch_data_rx: &mut fetch_data_rx,
-                    vhci: &mut vhci,
-                    mailer: &mut mailer,
-                    outgoing: &mut work_queue,
-                })
-                .is_continue()
-            {}
+            let start = std::time::Instant::now();
+            let mut sleep_time = std::time::Duration::ZERO;
+            while let std::ops::ControlFlow::Continue(sched_sleep_time) = sched.run_next(Context {
+                register_rx: &mut register_rx,
+                fetch_data_rx: &mut fetch_data_rx,
+                disconnect_rx: &mut disconnect_rx,
+                vhci: &mut vhci,
+                mailer: &mut mailer,
+                outgoing: &mut work_queue,
+            }) {
+                sleep_time += sched_sleep_time;
+            }
+            let elapsed = start.elapsed();
+            println!("Total run time: {elapsed:?}");
+            println!("Task run time: {:?}", sched.time_running());
+            println!("Scheduler sleep time: {:?}", sleep_time);
+            println!("{sched:#?}");
 
             // TODO: Disconnect all devices somehow
 
@@ -162,6 +183,7 @@ impl Controller {
             handle,
             register_tx,
             fetch_data_tx,
+            disconnect_tx,
         })
     }
 
@@ -170,22 +192,23 @@ impl Controller {
         port: RegisterPort,
         data_rate: DataRate,
     ) -> std::io::Result<mpsc::Receiver<Work>> {
-        let (tx, rx) = oneshot::channel();
-        let register = Register {
-            port,
-            data_rate,
-            tx,
-        };
+        let (rx, register) = Ctrl::new(Register { port, data_rate });
 
         self.register_tx.send(register).await.unwrap();
         rx.await.unwrap()
     }
 
     pub async fn fetch_data(&mut self, urb: Urb) -> std::io::Result<Urb> {
-        let (tx, rx) = oneshot::channel();
-        let fetch_data = FetchData { urb, tx };
+        let (rx, fetch_data) = Ctrl::new(urb);
 
         self.fetch_data_tx.send(fetch_data).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    pub async fn disconnect(&mut self, port: Port) -> std::io::Result<()> {
+        let (rx, disconnect) = Ctrl::new(port);
+
+        self.disconnect_tx.send(disconnect).await.unwrap();
         rx.await.unwrap()
     }
 
@@ -238,7 +261,7 @@ mod tests {
     fn controller_idles() {
         let controller = Controller::start(OpenBoundedU8::new(3).unwrap()).unwrap();
 
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(500));
         controller.shutdown();
     }
 
@@ -247,27 +270,35 @@ mod tests {
         let mut controller = Controller::start(OpenBoundedU8::new(8).unwrap()).unwrap();
 
         let mut a = controller
-            .register(RegisterPort::Any, DataRate::Full)
+            .register(RegisterPort::Port(Port::new(4).unwrap()), DataRate::Full)
             .await
             .unwrap();
 
         let mut b = controller
-            .register(RegisterPort::Any, DataRate::Full)
+            .register(RegisterPort::Port(Port::new(2).unwrap()), DataRate::Full)
             .await
             .unwrap();
 
         for _ in 0..4 {
             tokio::select! {
                 work = a.recv() => {
-                    let work = work.unwrap();
-                    println!("{work:?}");
+                    if let Some(work) = work {
+                        println!("{work:?}");
+                    }
                 },
                 work = b.recv() => {
-                    let work = work.unwrap();
-                    println!("{work:?}");
+                    if let Some(work) = work {
+                        println!("{work:?}");
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    break;
                 }
             }
         }
+
+        controller.disconnect(Port::new(4).unwrap()).await.unwrap();
+        controller.disconnect(Port::new(2).unwrap()).await.unwrap();
 
         controller.shutdown();
     }

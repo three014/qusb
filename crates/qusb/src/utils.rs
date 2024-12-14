@@ -1,7 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
 use crate::rustls;
 use nohash_hasher::BuildNoHashHasher;
 use serde::{de::DeserializeOwned, Serialize};
+use std::{collections::HashMap, f64::consts::SQRT_2, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use vhci::utils::{ClosedBoundedI16, OpenBoundedU8, TimeoutMillis};
 
@@ -34,6 +34,65 @@ pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 //         self.index += cnt;
 //     }
 // }
+
+/*
+void preciseSleep(double seconds) {
+    using namespace std;
+    using namespace std::chrono;
+
+    static double estimate = 5e-3;
+    static double mean = 5e-3;
+    static double m2 = 0;
+    static int64_t count = 1;
+
+    while (seconds > estimate) {
+        auto start = high_resolution_clock::now();
+        this_thread::sleep_for(milliseconds(1));
+        auto end = high_resolution_clock::now();
+
+        double observed = (end - start).count() / 1e9;
+        seconds -= observed;
+
+        ++count;
+        double delta = observed - mean;
+        mean += delta / count;
+        m2   += delta * (observed - mean);
+        double stddev = sqrt(m2 / (count - 1));
+        estimate = mean + stddev;
+    }
+
+    // spin lock
+    auto start = high_resolution_clock::now();
+    while ((high_resolution_clock::now() - start).count() / 1e9 < seconds);
+}
+*/
+
+pub(crate) fn precise_sleep(mut seconds: f64) {
+    let clock = quanta::Clock::new();
+    let mut estimate = 5e-3;
+    let mut mean = 5e-3;
+    let mut m2 = 0.0;
+    let mut count = 1;
+
+    while seconds > estimate {
+        let start = clock.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let observed = start.elapsed().as_secs_f64();
+        seconds -= observed;
+
+        count += 1;
+        let delta = observed - mean;
+        mean += delta / count as f64;
+        m2 += delta * (observed - mean);
+        let stddev = (m2 / (count - 1) as f64).sqrt();
+        estimate = mean + stddev;
+    }
+
+    // spin lock
+    let start = clock.now();
+    while start.elapsed().as_secs_f64() < seconds {}
+}
 
 #[tracing::instrument(level = "trace", skip(writer))]
 pub(crate) async fn serialize_into_writer<T: Serialize + std::fmt::Debug, W: AsyncWrite + Unpin>(
