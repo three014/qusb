@@ -1,7 +1,7 @@
 use crate::rustls;
 use nohash_hasher::BuildNoHashHasher;
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::HashMap, f64::consts::SQRT_2, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub use vhci::utils::{ClosedBoundedI16, OpenBoundedU8, TimeoutMillis};
 
@@ -9,64 +9,11 @@ use crate::Error;
 
 pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 
-// #[derive(Debug)]
-// pub struct BorrowedBuffer<'a> {
-//     pub data: &'a mut [u8],
-//     pub index: usize,
-// }
-
-// impl Buf for BorrowedBuffer<'_> {
-//     #[tracing::instrument(level = "trace")]
-//     fn remaining(&self) -> usize {
-//         self.data.len() - self.index
-//     }
-
-//     #[tracing::instrument(level = "trace")]
-//     fn chunk(&self) -> &[u8] {
-//         &self.data[self.index..]
-//     }
-
-//     #[tracing::instrument(level = "trace")]
-//     fn advance(&mut self, cnt: usize) {
-//         if cnt > self.remaining() {
-//             panic!("cannot advance buffer that far")
-//         }
-//         self.index += cnt;
-//     }
-// }
-
-/*
-void preciseSleep(double seconds) {
-    using namespace std;
-    using namespace std::chrono;
-
-    static double estimate = 5e-3;
-    static double mean = 5e-3;
-    static double m2 = 0;
-    static int64_t count = 1;
-
-    while (seconds > estimate) {
-        auto start = high_resolution_clock::now();
-        this_thread::sleep_for(milliseconds(1));
-        auto end = high_resolution_clock::now();
-
-        double observed = (end - start).count() / 1e9;
-        seconds -= observed;
-
-        ++count;
-        double delta = observed - mean;
-        mean += delta / count;
-        m2   += delta * (observed - mean);
-        double stddev = sqrt(m2 / (count - 1));
-        estimate = mean + stddev;
-    }
-
-    // spin lock
-    auto start = high_resolution_clock::now();
-    while ((high_resolution_clock::now() - start).count() / 1e9 < seconds);
-}
-*/
-
+/// A synchronous sleep function that uses
+/// spinlocking for small sleep durations.
+///
+/// Credit goes to [Blat Blatnik](https://blog.bearcats.nl/accurate-sleep-function/)
+/// for the implementation.
 pub(crate) fn precise_sleep(mut seconds: f64) {
     let clock = quanta::Clock::new();
     let mut estimate = 5e-3;
