@@ -279,7 +279,7 @@ mod tests {
             .await
             .unwrap();
 
-        for _ in 0..4 {
+        for _ in 0..8 {
             tokio::select! {
                 work = a.recv() => {
                     if let Some(work) = work {

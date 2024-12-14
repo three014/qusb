@@ -10,6 +10,8 @@ use vhci::{
 
 use super::{Ctrl, Mailer, Register, RegisterPort};
 
+/// Keeps track of a task's decision to sleep
+/// for some amount of time.
 #[derive(Debug, Clone, Copy)]
 pub struct Sleeper {
     next_run: Instant,
@@ -21,34 +23,42 @@ impl PartialEq for Sleeper {
         self.next_run.eq(&other.next_run)
     }
 }
-
 impl Eq for Sleeper {}
-
 impl Ord for Sleeper {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.next_run.cmp(&other.next_run)
     }
 }
-
 impl PartialOrd for Sleeper {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// Used to identify a task in the blocked map.
+///
+/// The names listed here **MUST** correspond to the names
+/// used in the [`Task`] block and **CANNOT** be used more than
+/// once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaskName {
-    Register,
+    Register = 0,
     FetchData,
     Disconnect,
     MailOutgoing,
     RecvWork,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// The priority of a task in the scheduler. Lower values
+/// mean the task is more likely to be scheduled.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Nice(crate::utils::OpenBoundedU8<0, 25>);
 
 impl Nice {
+    /// Creates a new [`Nice`] value.
+    ///
+    /// Returns `None` if the value is not in
+    /// the allowed range.
     pub const fn new(p: u8) -> Option<Self> {
         if let Some(num) = crate::utils::OpenBoundedU8::new(p) {
             Some(Self(num))
@@ -57,6 +67,7 @@ impl Nice {
         }
     }
 
+    /// Returns the inner value.
     pub const fn get(&self) -> u8 {
         self.0.get()
     }
@@ -64,6 +75,13 @@ impl Nice {
     pub const NORMAL: Self = Self::new(16).unwrap();
 }
 
+impl std::fmt::Debug for Nice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Nice").field(&self.get()).finish()
+    }
+}
+
+/// External data that all tasks are allowed to use.
 #[derive(Debug)]
 pub struct Context<'a> {
     pub register_rx: &'a mut mpsc::Receiver<Ctrl<Register, mpsc::Receiver<Work>>>,
@@ -74,6 +92,7 @@ pub struct Context<'a> {
     pub outgoing: &'a mut VecDeque<Work>,
 }
 
+/// Represents a task for the scheduler to run.
 pub struct Task {
     name: TaskName,
     f: for<'a> fn(Context<'a>) -> ControlFlow<(), (Context<'a>, bool)>,
@@ -118,25 +137,21 @@ impl std::fmt::Debug for Task {
             .finish()
     }
 }
-
 impl Ord for Task {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.timer.cmp(&other.timer)
     }
 }
-
 impl PartialOrd for Task {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-
 impl PartialEq for Task {
     fn eq(&self, other: &Self) -> bool {
         self.timer.eq(&other.timer)
     }
 }
-
 impl Eq for Task {}
 
 #[derive(Debug)]
@@ -149,9 +164,13 @@ pub struct Scheduler<const N: usize> {
 
 impl<const N: usize> Scheduler<N> {
     pub fn new() -> Self {
+        let mut blocked = Vec::new();
+        for _ in 0..N {
+            blocked.push(None).unwrap();
+        }
         Self {
             ready: BinaryHeap::new(),
-            blocked: Vec::new(),
+            blocked,
             sleep: BinaryHeap::new(),
             clock: quanta::Clock::new(),
         }
@@ -159,7 +178,6 @@ impl<const N: usize> Scheduler<N> {
 
     pub fn push(&mut self, task: Task) {
         self.ready.push(task).unwrap();
-        self.blocked.push(None).unwrap();
     }
 
     pub fn time_running(&self) -> Duration {
@@ -197,14 +215,13 @@ impl<const N: usize> Scheduler<N> {
                 f,
                 nice,
                 tries,
-                mut tries_left,
+                tries_left,
             } = next;
             let now = self.clock.now();
             let (data, made_progress) = f(ctx)?;
             // timer += now.elapsed();
-            let elapsed = now.elapsed().as_secs_f64()
-                * ((1.0 / Nice::NORMAL.get() as f64) * nice.get() as f64);
-            timer += Duration::from_secs_f64(elapsed);
+            let elapsed = now.elapsed();
+            timer += elapsed.mul_f64((1.0 / Nice::NORMAL.get() as f64) * nice.get() as f64);
 
             // ---- Step 4: Check the state of the task, possibly move
             //      task to the blocked queue and possibly set a sleeper ----
@@ -237,7 +254,8 @@ impl<const N: usize> Scheduler<N> {
                 TaskName::Register if !made_progress && tries_left == 0 => {
                     self.sleep
                         .push(Sleeper {
-                            next_run: self.clock.now() + Duration::from_millis(10),
+                            next_run: self.clock.now()
+                                + elapsed.mul_f64(tries as f64 * nice.get() as f64),
                             task_name: TaskName::Register,
                         })
                         .unwrap();
@@ -245,12 +263,11 @@ impl<const N: usize> Scheduler<N> {
                         .insert(Task::new(name, f, nice, tries).with_timer(timer));
                 }
                 TaskName::Register if !made_progress => {
-                    tries_left -= 1;
                     self.ready
                         .push(
                             Task::new(name, f, nice, tries)
                                 .with_timer(timer)
-                                .with_tries_left(tries_left),
+                                .with_tries_left(tries_left - 1),
                         )
                         .unwrap();
                 }
@@ -265,7 +282,7 @@ impl<const N: usize> Scheduler<N> {
                     // us to fetch any data, so we'll sleep for a bit
                     self.sleep
                         .push(Sleeper {
-                            next_run: self.clock.now() + Duration::from_millis(2),
+                            next_run: self.clock.now() + elapsed.mul_f64(tries as f64 * nice.get() as f64),
                             task_name: TaskName::FetchData,
                         })
                         .unwrap();
@@ -273,12 +290,11 @@ impl<const N: usize> Scheduler<N> {
                         .insert(Task::new(name, f, nice, tries).with_timer(timer));
                 }
                 TaskName::FetchData if !made_progress => {
-                    tries_left -= 1;
                     self.ready
                         .push(
                             Task::new(name, f, nice, tries)
                                 .with_timer(timer)
-                                .with_tries_left(tries_left),
+                                .with_tries_left(tries_left - 1),
                         )
                         .unwrap()
                 }
@@ -293,7 +309,7 @@ impl<const N: usize> Scheduler<N> {
                     // so we'll sleep for a bit
                     self.sleep
                         .push(Sleeper {
-                            next_run: self.clock.now() + Duration::from_millis(500),
+                            next_run: self.clock.now() + elapsed.mul_f64((tries + 1) as f64 * nice.get() as f64),
                             task_name: TaskName::Disconnect,
                         })
                         .unwrap();
@@ -301,12 +317,11 @@ impl<const N: usize> Scheduler<N> {
                         .insert(Task::new(name, f, nice, tries).with_timer(timer));
                 }
                 TaskName::Disconnect if !made_progress => {
-                    tries_left -= 1;
                     self.ready
                         .push(
                             Task::new(name, f, nice, tries)
                                 .with_timer(timer)
-                                .with_tries_left(tries_left),
+                                .with_tries_left(tries_left - 1),
                         )
                         .unwrap();
                 }
@@ -336,7 +351,7 @@ impl<const N: usize> Scheduler<N> {
                     // We are active, but we didn't have any work, so we can sleep for a liiiitle bit
                     self.sleep
                         .push(Sleeper {
-                            next_run: self.clock.now() + Duration::from_millis(1),
+                            next_run: self.clock.now() + elapsed.mul_f64((tries + 1) as f64 * nice.get() as f64),
                             task_name: TaskName::RecvWork,
                         })
                         .unwrap();
@@ -344,12 +359,11 @@ impl<const N: usize> Scheduler<N> {
                         .insert(Task::new(name, f, nice, tries).with_timer(timer));
                 }
                 TaskName::RecvWork if !made_progress => {
-                    tries_left -= 1;
                     self.ready
                         .push(
                             Task::new(name, f, nice, tries)
                                 .with_timer(timer)
-                                .with_tries_left(tries_left),
+                                .with_tries_left(tries_left - 1),
                         )
                         .unwrap();
                 }

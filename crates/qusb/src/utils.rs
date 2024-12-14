@@ -41,48 +41,56 @@ pub(crate) fn precise_sleep(mut seconds: f64) {
     while start.elapsed().as_secs_f64() < seconds {}
 }
 
+/// Serializes an object that implements [`serde::Serialize`] into an async writer.
+/// Uses a user-provided buffer to prevent unneeded allocations, but does reallocate
+/// the buffer if not big enough to hold the serialized data.
 #[tracing::instrument(level = "trace", skip(writer))]
-pub(crate) async fn serialize_into_writer<T: Serialize + std::fmt::Debug, W: AsyncWrite + Unpin>(
+pub(crate) async fn serialize_into_writer<T, W>(
     item: &T,
     writer: &mut W,
     buf: &mut Vec<u8>,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    T: Serialize + std::fmt::Debug,
+    W: AsyncWrite + Unpin,
+{
     let msg = loop {
-        // tracing::trace!("Trying to serialize a message to the buffer");
         match postcard::to_slice_cobs(item, buf) {
             Ok(msg) => break msg,
             Err(postcard::Error::SerializeBufferFull) => {
-                // tracing::trace!("Buffer got full, resizing the buffer and trying again");
                 buf.resize(buf.len() + 512, 0);
             }
             Err(err) => Err(err)?,
         }
     };
-    // tracing::trace!("Success! Now I'll try to write this message into the buffer");
     writer.write_all(msg).await?;
     buf.clear();
     Ok(())
 }
 
+/// Deserializes an object that implements [`serde::Deserialize`] from an async bufreader.
+///
+/// Returns `None` if the reader doesn't provide any data.
 #[tracing::instrument(level = "trace", skip(reader))]
-pub(crate) async fn deserialize_from_reader<
-    T: DeserializeOwned + std::fmt::Debug,
-    R: AsyncBufRead + Sized + Unpin,
->(
+pub(crate) async fn deserialize_from_reader<T, R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
-) -> Result<Option<T>, Error> {
-    // tracing::trace!("Trying to read a message from the buffer");
+) -> Result<Option<T>, Error>
+where
+    T: DeserializeOwned + std::fmt::Debug,
+    R: AsyncBufRead + Sized + Unpin,
+{
     if 0 == reader.read_until(0, buf).await? {
-        // tracing::trace!("No bytes read! Must be EOF");
         return Ok(None);
     }
-    // tracing::trace!("Success! buf: {buf:?} - Now attempting to deserialize the message");
     let recv: T = postcard::from_bytes_cobs(buf)?;
     buf.clear();
     Ok(Some(recv))
 }
 
+/// A custom certificate that accepts any and all certificates it sees.
+///
+/// Do not use in production environments.
 #[derive(Debug)]
 pub struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
@@ -137,6 +145,9 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
+/// Convenience function for making self-signed certificates.
+///
+/// Probably don't use in production environments?
 pub fn make_self_signed() -> (
     quinn::rustls::ServerConfig,
     rustls::pki_types::CertificateDer<'static>,
