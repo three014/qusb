@@ -1,10 +1,14 @@
 use std::{
     collections::VecDeque,
+    ops::ControlFlow,
     sync::{Arc, Mutex},
 };
 
 use tokio::sync::{mpsc, oneshot};
-use vhci::{DataRate, Port, Urb, UrbHandle, Vhci, Work};
+use vhci::{
+    utils::{ClosedBoundedI16, TimeoutMillis},
+    DataRate, Port, Urb, UrbHandle, Vhci, Work,
+};
 
 use crate::utils::{OpenBoundedU8, SimpleMap};
 
@@ -111,7 +115,7 @@ impl Mailer {
 #[derive(Debug, Clone)]
 pub struct Controller {
     handle: Arc<Mutex<Option<std::thread::JoinHandle<std::io::Result<()>>>>>,
-    register_tx: mpsc::Sender<Ctrl<Register, mpsc::Receiver<Work>>>,
+    register_tx: mpsc::Sender<Ctrl<Register, (Port, mpsc::Receiver<Work>)>>,
     fetch_data_tx: mpsc::Sender<Ctrl<Urb, Urb>>,
     disconnect_tx: mpsc::Sender<Ctrl<Port, ()>>,
 }
@@ -191,7 +195,7 @@ impl Controller {
         &mut self,
         port: RegisterPort,
         data_rate: DataRate,
-    ) -> std::io::Result<mpsc::Receiver<Work>> {
+    ) -> std::io::Result<(Port, mpsc::Receiver<Work>)> {
         let (rx, register) = Ctrl::new(Register { port, data_rate });
 
         self.register_tx.send(register).await.unwrap();
@@ -220,6 +224,147 @@ impl Controller {
                 Ok(Err(_err)) => todo!("Figure out what kind of I/O errors we can get"),
                 Err(_err) => todo!("Figure out what might make the thread panic"),
             }
+        }
+    }
+}
+
+fn register<'a>(ctx: task::Context<'a>) -> ControlFlow<(), (task::Context<'a>, bool)> {
+    let register = match ctx.register_rx.try_recv() {
+        Ok(register) => Some(register),
+        Err(mpsc::error::TryRecvError::Empty) => None,
+        Err(mpsc::error::TryRecvError::Disconnected) => ControlFlow::Break(())?,
+    };
+
+    let result = if let Some(Ctrl {
+        data: Register {
+            port: RegisterPort::Any,
+            data_rate,
+        },
+        tx,
+    }) = register
+    {
+        Some((ctx.vhci.port_connect_any(data_rate), tx))
+    } else if let Some(Ctrl {
+        data:
+            Register {
+                port: RegisterPort::Port(port),
+                data_rate,
+            },
+        tx,
+    }) = register
+    {
+        Some((ctx.vhci.port_connect(port, data_rate).map(|_| port), tx))
+    } else {
+        None
+    };
+
+    match result {
+        Some((Ok(port), oneshot_tx)) => {
+            let (mpsc_tx, mpsc_rx) = mpsc::channel::<Work>(32);
+            ctx.mailer.insert_tx(port, mpsc_tx);
+            oneshot_tx
+                .send(Ok((port, mpsc_rx)))
+                .expect("if recv is dropped then that thread must've panicked");
+            ControlFlow::Continue((ctx, true))
+        }
+        Some((Err(err), oneshot_tx)) => {
+            let _ = oneshot_tx.send(Err(err));
+            ControlFlow::Continue((ctx, true))
+        }
+        None => ControlFlow::Continue((ctx, false)),
+    }
+}
+
+fn fetch_data<'a>(ctx: task::Context<'a>) -> ControlFlow<(), (task::Context<'a>, bool)> {
+    let fetch_data = match ctx.fetch_data_rx.try_recv() {
+        Ok(fetch_data) => Some(fetch_data),
+        Err(mpsc::error::TryRecvError::Empty) => None,
+        Err(mpsc::error::TryRecvError::Disconnected) => ControlFlow::Break(())?,
+    };
+
+    if let Some(Ctrl { data: mut urb, tx }) = fetch_data {
+        let result = ctx.vhci.fetch_data(&mut urb).map(|_| urb);
+        tx.send(result)
+            .expect("if recv is dropped then that thread must've panicked");
+        ControlFlow::Continue((ctx, true))
+    } else {
+        ControlFlow::Continue((ctx, false))
+    }
+}
+
+fn disconnect<'a>(ctx: task::Context<'a>) -> ControlFlow<(), (task::Context<'a>, bool)> {
+    let disconnect = match ctx.disconnect_rx.try_recv() {
+        Ok(disconnect) => Some(disconnect),
+        Err(mpsc::error::TryRecvError::Empty) => None,
+        Err(mpsc::error::TryRecvError::Disconnected) => ControlFlow::Break(())?,
+    };
+
+    if let Some(Ctrl { data: ref port, tx }) = disconnect {
+        let result = ctx.vhci.port_disconnect(*port);
+        tx.send(result)
+            .expect("if recv is dropped then that thread has panicked");
+        ctx.mailer.remove_tx(port);
+        ControlFlow::Continue((ctx, true))
+    } else {
+        ControlFlow::Continue((ctx, false))
+    }
+}
+
+fn mail_outgoing_work<'a>(ctx: task::Context<'a>) -> ControlFlow<(), (task::Context<'a>, bool)> {
+    if ctx.outgoing.is_empty() {
+        return ControlFlow::Continue((ctx, false));
+    }
+
+    let next = ctx.outgoing.pop_front().and_then(|work| match work {
+        Work::CancelUrb(ref urb_handle) => ctx
+            .mailer
+            .get_tx_from_handle(*urb_handle)
+            .map(|tx| (work, tx)),
+        Work::ProcessUrb(ref urb) => match urb {
+            vhci::Urb::Ctrl(urb_control) => {
+                let port = Port::new((urb_control.w_index & 0x00ff) as u8 + 1).unwrap();
+                ctx.mailer.link_handle_to_port(urb.handle(), port);
+                ctx.mailer.get_tx_from_port(port).map(|tx| (work, tx))
+            }
+            _ => ctx
+                .mailer
+                .get_tx_from_handle(urb.handle())
+                .map(|tx| (work, tx)),
+        },
+        Work::PortStat(ref stat) => ctx.mailer.get_tx_from_port(stat.index).map(|tx| (work, tx)),
+    });
+
+    if let Some((work, tx)) = next {
+        if tx.blocking_send(work).is_err() {
+            todo!("Remove tx from mailer since there's no one listening")
+        }
+        ControlFlow::Continue((ctx, true))
+    } else {
+        // Even though we didn't actually mail anything, we still removed
+        // a work item from the queue, so that still counts as progress.
+        ControlFlow::Continue((ctx, true))
+    }
+}
+
+fn recv_work<'a>(ctx: task::Context<'a>) -> ControlFlow<(), (task::Context<'a>, bool)> {
+    let timeout = TimeoutMillis::Time(ClosedBoundedI16::new(1).unwrap());
+    match ctx.vhci.fetch_work_timeout(timeout) {
+        Ok(work) => {
+            ctx.outgoing.push_back(work);
+            ControlFlow::Continue((ctx, true))
+        }
+        Err(err)
+            if err.kind() == std::io::ErrorKind::TimedOut
+                || err.kind() == std::io::ErrorKind::Interrupted
+                || err.raw_os_error().unwrap() == vhci::libc::ENODATA =>
+        {
+            ControlFlow::Continue((ctx, false))
+        }
+        Err(_err) => {
+            todo!("Figure out what kinda errors we can get here");
+            // UPDATE: I'm pretty sure the only other errors we can get
+            //         here are EINVAL errors, which shouldn't be possible
+            //         anymore since we validate input already.
         }
     }
 }
@@ -269,12 +414,12 @@ mod tests {
     async fn can_listen_for_work() {
         let mut controller = Controller::start(OpenBoundedU8::new(8).unwrap()).unwrap();
 
-        let mut a = controller
+        let (port_a, mut a) = controller
             .register(RegisterPort::Port(Port::new(4).unwrap()), DataRate::Full)
             .await
             .unwrap();
 
-        let mut b = controller
+        let (port_b, mut b) = controller
             .register(RegisterPort::Port(Port::new(2).unwrap()), DataRate::Full)
             .await
             .unwrap();
@@ -297,8 +442,8 @@ mod tests {
             }
         }
 
-        controller.disconnect(Port::new(4).unwrap()).await.unwrap();
-        controller.disconnect(Port::new(2).unwrap()).await.unwrap();
+        controller.disconnect(port_a).await.unwrap();
+        controller.disconnect(port_b).await.unwrap();
 
         controller.shutdown();
     }
