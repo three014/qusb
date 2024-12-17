@@ -3,7 +3,7 @@ use nohash_hasher::BuildNoHashHasher;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-pub use vhci::utils::{ClosedBoundedI16, OpenBoundedU8, TimeoutMillis};
+pub use vhci::utils::{BoundedI16, BoundedU8, TimeoutMillis};
 
 use crate::Error;
 
@@ -14,8 +14,7 @@ pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 ///
 /// Credit goes to [Blat Blatnik](https://blog.bearcats.nl/accurate-sleep-function/)
 /// for the implementation.
-pub(crate) fn precise_sleep(mut seconds: f64) {
-    let clock = quanta::Clock::new();
+pub(crate) fn precise_sleep(clock: &quanta::Clock, mut seconds: f64) {
     let mut estimate = 5e-3;
     let mut mean = 5e-3;
     let mut m2 = 0.0;

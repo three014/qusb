@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use usb_ids::UsbIds;
-use utils::OpenBoundedU8;
+use utils::BoundedU8;
 
 pub use quinn::rustls;
 
@@ -299,7 +299,7 @@ pub fn peer(
     .unwrap();
     endpoint.set_default_client_config(client_tls);
 
-    let dev = dev::Controller::start(OpenBoundedU8::new(4).unwrap()).unwrap();
+    let dev = dev::Controller::start(BoundedU8::new(4).unwrap()).unwrap();
 
     (
         Client {
