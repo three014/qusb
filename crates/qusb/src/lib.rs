@@ -5,15 +5,17 @@ use std::{
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     ops::Deref,
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 use usb_ids::UsbIds;
 use utils::BoundedU8;
 
 pub use quinn::rustls;
+pub use rcgen;
 
 mod dev;
+mod pipe;
 mod state;
 mod stream;
 mod usb_ids;
@@ -41,11 +43,15 @@ pub fn usb_ids() -> &'static UsbIds {
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
+    iso: Arc<Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>>,
 }
 
 impl Session {
     fn new(conn: quinn::Connection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            iso: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn remote_address(&self) -> SocketAddr {
@@ -54,13 +60,25 @@ impl Session {
 
     #[tracing::instrument(skip_all, level = "trace")]
     pub async fn open_stream(&self) -> Result<State<state::ClientReq>, Error> {
+        let mut slot = self.iso.lock().unwrap();
+        assert!(slot.is_none());
+
+        
+        let handle = tokio::spawn(async move {
+            
+            Ok(())
+        });
+        *slot = Some(handle);
+        drop(slot);
+
         let (tx, rx) = self
             .conn
             .open_bi()
             .await
             .map_err(|err| Error::from(std::io::Error::from(err)))?;
         let idle = State::new_client(tx, rx);
-        Ok(idle.verify_version().await?)
+        let state = idle.verify_version().await?;
+        Ok(state)
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
@@ -89,7 +107,7 @@ impl Session {
     }
 
     pub async fn borrow_device(&mut self, id: proto::UsbDeviceId) -> Result<(), Error> {
-        use ::vhci::*;
+        use vhci::*;
         let client = self.open_stream().await?.borrow_device(id).await?;
 
         let mut addr = 0xff;
@@ -306,9 +324,6 @@ pub fn peer(
             endpoint: endpoint.clone(),
             dev: dev.clone(),
         },
-        Server {
-            endpoint,
-            dev,
-        },
+        Server { endpoint, dev },
     )
 }

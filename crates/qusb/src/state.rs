@@ -10,10 +10,10 @@ pub struct ServerGetReq;
 pub struct ServerDecideResp(proto::Request);
 pub struct ServerListDevices;
 
-pub struct State<T> {
-    _s: T,
-    tx: crate::stream::Sender2<quinn::SendStream>,
-    rx: crate::stream::Receiver2<BufReader<quinn::RecvStream>>,
+pub struct State<S> {
+    _s: S,
+    tx: crate::stream::Sender<quinn::SendStream>,
+    rx: crate::stream::Receiver<BufReader<quinn::RecvStream>>,
 }
 
 impl State<ClientIdle> {
@@ -22,8 +22,8 @@ impl State<ClientIdle> {
         tracing::trace!("New client-side stream ready to go!");
         Self {
             _s: ClientIdle,
-            tx: crate::stream::Sender2::new(tx),
-            rx: crate::stream::Receiver2::new(BufReader::with_capacity(1024, rx)),
+            tx: crate::stream::Sender::new(tx),
+            rx: crate::stream::Receiver::new(BufReader::with_capacity(1024, rx)),
         }
     }
 
@@ -106,6 +106,7 @@ impl State<ClientBorrowDev> {
     pub fn dev(&self) -> &proto::UsbDeviceInfo {
         &self._s.0
     }
+
 }
 
 impl State<ServerListening> {
@@ -114,8 +115,8 @@ impl State<ServerListening> {
         tracing::trace!("New server-side stream ready to go!");
         Self {
             _s: ServerListening,
-            tx: crate::stream::Sender2::new(tx),
-            rx: crate::stream::Receiver2::new(BufReader::with_capacity(1024, rx)),
+            tx: crate::stream::Sender::new(tx),
+            rx: crate::stream::Receiver::new(BufReader::with_capacity(1024, rx)),
         }
     }
 

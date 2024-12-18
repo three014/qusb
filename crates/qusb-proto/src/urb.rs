@@ -1,5 +1,3 @@
-use std::ops::Index;
-
 use bytes::Buf;
 use zerocopy::{
     network_endian::{I32, U32},

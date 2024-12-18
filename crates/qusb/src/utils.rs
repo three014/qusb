@@ -2,12 +2,28 @@ use crate::rustls;
 use nohash_hasher::BuildNoHashHasher;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt},
+    sync::oneshot,
+};
 pub use vhci::utils::{BoundedI16, BoundedU8, TimeoutMillis};
 
 use crate::Error;
 
 pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
+
+pub struct Ctrl<S, R = ()> {
+    pub data: S,
+    pub(crate) tx: oneshot::Sender<std::io::Result<R>>,
+}
+
+impl<S, R> Ctrl<S, R> {
+    pub(crate) fn new(data: S) -> (oneshot::Receiver<std::io::Result<R>>, Ctrl<S, R>) {
+        let (tx, rx) = oneshot::channel();
+        let ctrl = Self { data, tx };
+        (rx, ctrl)
+    }
+}
 
 /// A synchronous sleep function that uses
 /// spinlocking for small sleep durations.

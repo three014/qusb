@@ -1,19 +1,17 @@
-use std::marker::PhantomData;
-
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::{
     utils::{deserialize_from_reader, serialize_into_writer},
     Error,
 };
 
-pub struct Sender2<W: AsyncWrite> {
+pub struct Sender<W: AsyncWrite> {
     tx: W,
     buf: Vec<u8>,
 }
 
-impl<W: AsyncWrite> Sender2<W> {
+impl<W: AsyncWrite> Sender<W> {
     pub(crate) fn new(tx: W) -> Self {
         Self {
             tx,
@@ -26,19 +24,19 @@ impl<W: AsyncWrite> Sender2<W> {
     }
 }
 
-impl<W: AsyncWrite + Unpin> Sender2<W> {
+impl<W: AsyncWrite + Unpin> Sender<W> {
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn send<T: Serialize + std::fmt::Debug>(&mut self, item: &T) -> Result<(), Error> {
         serialize_into_writer::<T, _>(item, &mut self.tx, &mut self.buf).await
     }
 }
 
-pub struct Receiver2<R: AsyncBufRead> {
+pub struct Receiver<R: AsyncBufRead> {
     rx: R,
     buf: Vec<u8>,
 }
 
-impl<R: AsyncBufRead> Receiver2<R> {
+impl<R: AsyncBufRead> Receiver<R> {
     pub(crate) fn new(rx: R) -> Self {
         Self {
             rx,
@@ -51,7 +49,7 @@ impl<R: AsyncBufRead> Receiver2<R> {
     }
 }
 
-impl<R: AsyncBufRead + Unpin> Receiver2<R> {
+impl<R: AsyncBufRead + Unpin> Receiver<R> {
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn recv<T: DeserializeOwned + std::fmt::Debug>(
         &mut self,
@@ -59,103 +57,3 @@ impl<R: AsyncBufRead + Unpin> Receiver2<R> {
         deserialize_from_reader(&mut self.rx, &mut self.buf).await
     }
 }
-
-#[tracing::instrument(level = "trace")]
-pub(crate) fn new<T, R>(
-    tx: quinn::SendStream,
-    rx: quinn::RecvStream,
-) -> (
-    Sender<T, quinn::SendStream>,
-    Receiver<R, BufReader<quinn::RecvStream>>,
-)
-where
-    T: Serialize + std::fmt::Debug,
-    R: DeserializeOwned + std::fmt::Debug,
-{
-    (Sender::new(tx), Receiver::new(BufReader::new(rx)))
-}
-
-#[derive(Debug)]
-pub struct Sender<T: Serialize + std::fmt::Debug, W: AsyncWrite + std::fmt::Debug> {
-    phantom: PhantomData<T>,
-    tx: W,
-    buf: Vec<u8>,
-}
-
-impl<T: Serialize + std::fmt::Debug, W: AsyncWrite + std::fmt::Debug> Sender<T, W> {
-    pub fn new(tx: W) -> Self {
-        Self {
-            phantom: PhantomData,
-            tx,
-            buf: Vec::new(),
-        }
-    }
-
-    #[tracing::instrument(level = "trace")]
-    pub fn convert<U: Serialize + std::fmt::Debug>(mut self) -> Sender<U, W> {
-        self.buf.clear();
-        Sender {
-            phantom: PhantomData,
-            tx: self.tx,
-            buf: self.buf,
-        }
-    }
-
-    pub fn into_writer(self) -> W {
-        self.tx
-    }
-}
-
-impl<T: Serialize + std::fmt::Debug, W: AsyncWrite + Unpin + std::fmt::Debug> Sender<T, W> {
-    #[tracing::instrument(level = "trace")]
-    pub async fn send(&mut self, obj: &T) -> Result<(), Error> {
-        let min_reserve = 128_usize.saturating_sub(self.buf.len());
-        self.buf.reserve(min_reserve);
-        serialize_into_writer::<T, _>(obj, &mut self.tx, &mut self.buf).await
-    }
-}
-
-#[derive(Debug)]
-pub struct Receiver<T: DeserializeOwned + std::fmt::Debug, R: AsyncBufRead + std::fmt::Debug> {
-    phantom: PhantomData<T>,
-    rx: R,
-    buf: Vec<u8>,
-}
-
-impl<T: DeserializeOwned + std::fmt::Debug, R: AsyncBufRead + std::fmt::Debug> Receiver<T, R> {
-    pub fn new(rx: R) -> Self {
-        Self {
-            phantom: PhantomData,
-            rx,
-            buf: Vec::new(),
-        }
-    }
-
-    #[tracing::instrument(level = "trace")]
-    pub fn convert<U: DeserializeOwned + std::fmt::Debug>(mut self) -> Receiver<U, R> {
-        self.buf.clear();
-        Receiver {
-            phantom: PhantomData,
-            rx: self.rx,
-            buf: self.buf,
-        }
-    }
-
-    pub fn into_reader(self) -> R {
-        self.rx
-    }
-}
-
-impl<T, R> Receiver<T, R>
-where
-    T: DeserializeOwned + std::fmt::Debug,
-    R: AsyncBufRead + Unpin + std::fmt::Debug,
-{
-    #[tracing::instrument(skip(self), level = "trace")]
-    pub async fn recv(&mut self) -> Result<Option<T>, Error> {
-        let min_reserve = 128_usize.saturating_sub(self.buf.len());
-        self.buf.reserve(min_reserve);
-        deserialize_from_reader(&mut self.rx, &mut self.buf).await
-    }
-}
-

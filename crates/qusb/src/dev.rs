@@ -11,20 +11,7 @@ use vhci::{
     DataRate, Port, PortChange, PortFlag, PortStat, PortStatus, Urb, UrbControl, UrbHandle, Work,
 };
 
-use crate::utils::SimpleMap;
-
-pub struct Ctrl<S, R = ()> {
-    data: S,
-    tx: oneshot::Sender<std::io::Result<R>>,
-}
-
-impl<S, R> Ctrl<S, R> {
-    pub fn new(data: S) -> (oneshot::Receiver<std::io::Result<R>>, Ctrl<S, R>) {
-        let (tx, rx) = oneshot::channel();
-        let ctrl = Self { data, tx };
-        (rx, ctrl)
-    }
-}
+use crate::utils::{Ctrl, SimpleMap};
 
 pub enum RegisterPort {
     Any,
@@ -176,6 +163,18 @@ impl Operator {
         let (mut port_connect_tx, port_connect_rx) = mpsc::channel(vhci.free_ports() as usize);
         let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx, port_connect_rx));
 
+        struct Context {
+            vhci: vhci::Controller,
+            mailer: Mailer,
+            port_connect_tx: mpsc::Sender<Ctrl<(), UrbControl>>,
+        }
+
+        let mut ctx = Context {
+            vhci,
+            mailer,
+            port_connect_tx
+        };
+
         loop {
             match tokio::select! {
                 req = register_rx.recv() => {
@@ -187,7 +186,7 @@ impl Operator {
                             },
                             tx
                         }) = req {
-                            (vhci.port_connect_any(data_rate), tx)
+                            (ctx.vhci.port_connect_any(data_rate), tx)
                         } else if let Some(Ctrl {
                             data: Register {
                                 port: RegisterPort::Port(port),
@@ -195,9 +194,9 @@ impl Operator {
                             },
                             tx
                         }) = req {
-                            (vhci.port_connect(port, data_rate).map(|_| port), tx)
+                            (ctx.vhci.port_connect(port, data_rate).map(|_| port), tx)
                         } else {
-                            return ControlFlow::Break((vhci, mailer, port_connect_tx));
+                            return ControlFlow::Break(ctx);
                         };
 
 
@@ -206,15 +205,15 @@ impl Operator {
 
                                 // Get the ctrl URB from recv_work
                                 let (ctrl_rx, get_urb) = Ctrl::<_, UrbControl>::new(());
-                                if port_connect_tx.blocking_send(get_urb).is_err() {
-                                    return ControlFlow::Break((vhci, mailer, port_connect_tx));
+                                if ctx.port_connect_tx.blocking_send(get_urb).is_err() {
+                                    return ControlFlow::Break(ctx);
                                 }
 
                                 let (work_tx, work_rx) = mpsc::channel(32);
-                                mailer.insert_tx(port, work_tx);
+                                ctx.mailer.insert_tx(port, work_tx);
                                 if tx.send(Ok((port, work_rx, ctrl_rx))).is_err() {
-                                    mailer.remove_tx_from_port(&port);
-                                    if let Err(_err) = vhci.port_disconnect(port) {
+                                    ctx.mailer.remove_tx_from_port(&port);
+                                    if let Err(_err) = ctx.vhci.port_disconnect(port) {
                                         // return ControlFlow::Break((vhci, mailer));
                                         //
                                         // TODO: Figure out what errors we should stop the
@@ -228,7 +227,7 @@ impl Operator {
 
                         }
 
-                        ControlFlow::Continue((vhci, mailer, port_connect_tx))
+                        ControlFlow::Continue(ctx)
                     }).await.unwrap()
                 }
                 req = disconnect_rx.recv() => {
@@ -237,15 +236,15 @@ impl Operator {
                             data: port,
                             tx
                         }) = req {
-                            mailer.remove_tx_from_port(&port);
-                            (vhci.port_disconnect(port), tx)
+                            ctx.mailer.remove_tx_from_port(&port);
+                            (ctx.vhci.port_disconnect(port), tx)
                         } else {
-                            return ControlFlow::Break((vhci, mailer, port_connect_tx));
+                            return ControlFlow::Break(ctx);
                         };
 
                         let _ = tx.send(result);
 
-                        ControlFlow::Continue((vhci, mailer, port_connect_tx))
+                        ControlFlow::Continue(ctx)
                     }).await.unwrap()
                 }
                 work = work_rx.recv() => {
@@ -255,32 +254,30 @@ impl Operator {
 
                     trace!("{work:?}");
 
-                    let next = mailer.get_tx_from_work(&work).map(|tx| (work, tx));
+                    let next = ctx.mailer.get_tx_from_work(&work).map(|tx| (work, tx));
                     if let Some((work, tx)) = next {
                         if tx.send(work).await.is_err() {
-                            mailer.remove_tx(&tx);
+                            ctx.mailer.remove_tx(&tx);
                         }
-                        ControlFlow::Continue((vhci, mailer, port_connect_tx))
+                        ControlFlow::Continue(ctx)
                     } else {
                         // Even though we didn't actually mail anything, we removed
                         // a work item from the queue, so that still counts as progress.
-                        ControlFlow::Continue((vhci, mailer, port_connect_tx))
+                        ControlFlow::Continue(ctx)
                     }
                 }
             } {
-                ControlFlow::Continue((ctrl, mail, port)) => {
-                    vhci = ctrl;
-                    mailer = mail;
-                    port_connect_tx = port;
+                ControlFlow::Continue(context) => {
+                    ctx = context;
                 }
-                ControlFlow::Break((ctrl, mail, port)) => {
-                    vhci = ctrl;
-                    mailer = mail;
-                    port_connect_tx = port;
+                ControlFlow::Break(context) => {
+                    ctx = context;
                     break;
                 }
             }
         }
+
+        let Context { mut vhci, mailer, port_connect_tx } = ctx;
 
         trace!("disconnecting leftover devices and closing work_rx");
         for port in mailer.port_to_work.into_keys() {
