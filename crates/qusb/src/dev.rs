@@ -1,28 +1,52 @@
 use std::{
     future::Future,
-    ops::ControlFlow,
-    sync::{Arc, Mutex},
+    ops::ControlFlow, sync::{Arc, Mutex},
 };
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::trace;
 use vhci::{
-    utils::{BoundedI16, BoundedU8, TimeoutMillis},
-    DataRate, Port, PortChange, PortFlag, PortStat, PortStatus, Urb, UrbControl, UrbHandle, Work,
+    utils::{BoundedI16, BoundedU8, TimeoutMillis}, DataRate, Port, PortChange, PortFlag, PortStat, PortStatus, Urb, UrbControl, UrbHandle, Work
 };
 
 use crate::utils::{Ctrl, SimpleMap};
 
+/// Specifies which port to plug virtual USB device into.
 pub enum RegisterPort {
     Any,
     Port(Port),
 }
 
+/// Request struct to register a new 
+/// virtual USB device with the VHCI. 
 pub struct Register {
     port: RegisterPort,
     data_rate: DataRate,
 }
 
+/// A multi-key map with no hashing for sending [`vhci::Work`] items to 
+/// the respective [`Receiver`].
+/// 
+/// Maps a [`vhci::Port`] and/or [`vhci::UrbHandle`] to a [`Sender`]. 
+/// Allows for multiple URB handles to point to the same sender.
+///
+/// # Using nohash_hasher
+/// 
+/// We can utilize [`nohash_hasher`] for performance because we know that:
+/// 1. The { `Port`:`Sender` } map will contain no duplicate keys
+///    due to only one device being plugged into one port at any time,
+/// 2. The { `UrbHandle`:`Sender` } map will also contain no duplicate
+///    keys due to URBs needing a unique identifier.
+///
+/// # Time complexity
+///
+/// Inserting a new { `Port`:`Sender` } -> O(1)
+/// Linking a handle to a port/sender -> O(1)
+/// Accessing a `Sender` from either a port or handle -> O(1)
+/// Removing a { `Port`:`Sender` } -> 2 * O(N) + 2 * O(M)
+///
+/// [`Sender`]: tokio::sync::mpsc::Sender 
+/// [`Receiver`]: tokio::sync::mpsc::Receiver
 #[derive(Debug, Default)]
 struct Mailer {
     port_to_work: SimpleMap<Port, usize>,
@@ -31,6 +55,15 @@ struct Mailer {
 }
 
 impl Mailer {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            port_to_work: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
+            handle_to_work: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
+            work_line: Vec::with_capacity(cap)
+        }
+    }
+    
+    /// Inserts a `Sender` using a `Port` as the key.
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn insert_tx(&mut self, port: Port, tx: mpsc::Sender<Work>) {
         self.work_line.push(tx);
@@ -38,11 +71,33 @@ impl Mailer {
         self.port_to_work.insert(port, index);
     }
 
-    /// Returns `false` if:
+    /// Links a [`UrbHandle`] to a [`Port`] so that they both point 
+    /// to the same [`Sender`].
+    /// 
+    /// The function returns `false` if:
     /// - `handle` was already mapped to `port`
     /// - `port` doesn't exist in mapping
     ///
-    /// Returns `true` otherwise.
+    /// Returns `true` if the linking was successful.
+    ///
+    /// # Examples
+    ///
+    /// This example does not compile IRL because [`Mailer`] is a crate data
+    /// structure only and because [`UrbHandle`]'s inner field is not publicly
+    /// accessible, but otherwise works:
+    ///
+    /// ```compile_fail
+    /// use tokio::sync::mpsc;
+    ///
+    /// let mut mailer = Mailer::default();
+    /// let port = vhci::Port::new(1).unwrap();
+    /// let handle = vhci::UrbHandle(0x4000);
+    /// let (tx, rx) = mpsc::channel(8);
+    /// mailer.insert_tx(port, tx);
+    /// assert_eq!(mailer.link_handle_to_work(handle, port), true);
+    /// ```
+    ///
+    /// [`Sender`]: tokio::sync::mpsc::Sender
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn link_handle_to_port(&mut self, handle: UrbHandle, port: Port) -> bool {
         if self.handle_to_work.contains_key(&handle) {
@@ -57,25 +112,31 @@ impl Mailer {
         }
     }
 
+    /// Unlinks a [`UrbHandle`] from a { `Port`:`Sender` } mapping.
+    ///
+    /// Returns `true` if the handle was previously linked to the port,
+    /// `false` otherwise.
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn unlink_handle_from_port(&mut self, handle: &UrbHandle) -> bool {
         self.handle_to_work.remove(handle).is_some()
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn remove_tx_from_port(&mut self, port: &Port) {
+    pub fn remove_by_port(&mut self, port: &Port) {
         if let Some(index) = self.port_to_work.get(port).copied() {
-            self.remove(index);
+            self.remove_by_index(index);
         }
     }
 
-    pub fn remove_tx(&mut self, tx: &mpsc::Sender<Work>) {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub fn remove_by_tx(&mut self, tx: &mpsc::Sender<Work>) {
         if let Some(index) = self.work_line.iter().position(|cur| tx.same_channel(cur)) {
-            self.remove(index);
+            self.remove_by_index(index);
         }
     }
 
-    fn remove(&mut self, tx_index: usize) {
+    #[tracing::instrument(level = "trace", skip_all)]
+    fn remove_by_index(&mut self, tx_index: usize) {
         self.port_to_work.retain(|_, &mut value| tx_index != value);
         self.handle_to_work
             .retain(|_, &mut value| tx_index != value);
@@ -212,7 +273,7 @@ impl Operator {
                                 let (work_tx, work_rx) = mpsc::channel(32);
                                 ctx.mailer.insert_tx(port, work_tx);
                                 if tx.send(Ok((port, work_rx, ctrl_rx))).is_err() {
-                                    ctx.mailer.remove_tx_from_port(&port);
+                                    ctx.mailer.remove_by_port(&port);
                                     if let Err(_err) = ctx.vhci.port_disconnect(port) {
                                         // return ControlFlow::Break((vhci, mailer));
                                         //
@@ -236,7 +297,7 @@ impl Operator {
                             data: port,
                             tx
                         }) = req {
-                            ctx.mailer.remove_tx_from_port(&port);
+                            ctx.mailer.remove_by_port(&port);
                             (ctx.vhci.port_disconnect(port), tx)
                         } else {
                             return ControlFlow::Break(ctx);
@@ -257,7 +318,7 @@ impl Operator {
                     let next = ctx.mailer.get_tx_from_work(&work).map(|tx| (work, tx));
                     if let Some((work, tx)) = next {
                         if tx.send(work).await.is_err() {
-                            ctx.mailer.remove_tx(&tx);
+                            ctx.mailer.remove_by_tx(&tx);
                         }
                         ControlFlow::Continue(ctx)
                     } else {
@@ -513,7 +574,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(20);
         mailer.insert_tx(Port::new(1).unwrap(), tx);
-        mailer.remove_tx_from_port(&Port::new(1).unwrap());
+        mailer.remove_by_port(&Port::new(1).unwrap());
 
         assert!(mailer.port_to_work.is_empty());
         assert!(mailer.work_line.is_empty());
@@ -529,7 +590,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(20);
         mailer.insert_tx(Port::new(5).unwrap(), tx);
 
-        mailer.remove_tx_from_port(&Port::new(1).unwrap());
+        mailer.remove_by_port(&Port::new(1).unwrap());
         let index = mailer.port_to_work.get(&Port::new(5).unwrap()).unwrap();
         assert_eq!(*index, 0);
     }
