@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use lstr;
+pub use zerocopy;
 
 pub mod urb;
 

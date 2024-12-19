@@ -1,5 +1,8 @@
-use crate::Error;
-use tokio::io::BufReader;
+use std::convert::Infallible;
+
+use crate::{utils::Ctrl, Error};
+use tokio::{io::BufReader, sync::mpsc};
+use tokio_util::bytes::Bytes;
 
 pub struct ClientIdle;
 pub struct ClientReq;
@@ -9,6 +12,37 @@ pub struct ServerListening;
 pub struct ServerGetReq;
 pub struct ServerDecideResp(proto::Request);
 pub struct ServerListDevices;
+
+pub struct ClientIdle2 {
+    reg_tx: mpsc::Sender<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
+    dereg_tx: mpsc::Sender<Ctrl<quinn::StreamId, (), Infallible>>,
+}
+
+pub struct State2<
+    S,
+    W = crate::stream::Sender<quinn::SendStream>,
+    R = crate::stream::Receiver<BufReader<quinn::RecvStream>>,
+> {
+    _s: S,
+    tx: W,
+    rx: R,
+}
+
+impl State2<ClientIdle2> {
+    pub fn new_client(
+        tx: quinn::SendStream,
+        rx: quinn::RecvStream,
+        reg_tx: mpsc::Sender<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
+        dereg_tx: mpsc::Sender<Ctrl<quinn::StreamId, (), Infallible>>,
+    ) -> Self {
+        Self {
+            _s: ClientIdle2 { reg_tx, dereg_tx },
+            tx: crate::stream::Sender::new(tx),
+            rx: crate::stream::Receiver::new(BufReader::with_capacity(1024, rx)),
+        }
+    }
+
+}
 
 pub struct State<S> {
     _s: S,
@@ -106,7 +140,6 @@ impl State<ClientBorrowDev> {
     pub fn dev(&self) -> &proto::UsbDeviceInfo {
         &self._s.0
     }
-
 }
 
 impl State<ServerListening> {

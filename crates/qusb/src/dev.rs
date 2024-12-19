@@ -1,12 +1,14 @@
 use std::{
     future::Future,
-    ops::ControlFlow, sync::{Arc, Mutex},
+    ops::ControlFlow,
+    sync::{Arc, Mutex},
 };
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::trace;
 use vhci::{
-    utils::{BoundedI16, BoundedU8, TimeoutMillis}, DataRate, Port, PortChange, PortFlag, PortStat, PortStatus, Urb, UrbControl, UrbHandle, Work
+    utils::{BoundedI16, BoundedU8, TimeoutMillis},
+    DataRate, Port, PortChange, PortFlag, PortStat, PortStatus, Urb, UrbControl, UrbHandle, Work,
 };
 
 use crate::utils::{Ctrl, SimpleMap};
@@ -17,21 +19,21 @@ pub enum RegisterPort {
     Port(Port),
 }
 
-/// Request struct to register a new 
-/// virtual USB device with the VHCI. 
+/// Request struct to register a new
+/// virtual USB device with the VHCI.
 pub struct Register {
     port: RegisterPort,
     data_rate: DataRate,
 }
 
-/// A multi-key map with no hashing for sending [`vhci::Work`] items to 
+/// A multi-key map with no hashing for sending [`vhci::Work`] items to
 /// the respective [`Receiver`].
-/// 
-/// Maps a [`vhci::Port`] and/or [`vhci::UrbHandle`] to a [`Sender`]. 
+///
+/// Maps a [`vhci::Port`] and/or [`vhci::UrbHandle`] to a [`Sender`].
 /// Allows for multiple URB handles to point to the same sender.
 ///
 /// # Using nohash_hasher
-/// 
+///
 /// We can utilize [`nohash_hasher`] for performance because we know that:
 /// 1. The { `Port`:`Sender` } map will contain no duplicate keys
 ///    due to only one device being plugged into one port at any time,
@@ -45,7 +47,7 @@ pub struct Register {
 /// Accessing a `Sender` from either a port or handle -> O(1)
 /// Removing a { `Port`:`Sender` } -> 2 * O(N) + 2 * O(M)
 ///
-/// [`Sender`]: tokio::sync::mpsc::Sender 
+/// [`Sender`]: tokio::sync::mpsc::Sender
 /// [`Receiver`]: tokio::sync::mpsc::Receiver
 #[derive(Debug, Default)]
 struct Mailer {
@@ -59,10 +61,10 @@ impl Mailer {
         Self {
             port_to_work: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
             handle_to_work: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
-            work_line: Vec::with_capacity(cap)
+            work_line: Vec::with_capacity(cap),
         }
     }
-    
+
     /// Inserts a `Sender` using a `Port` as the key.
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn insert_tx(&mut self, port: Port, tx: mpsc::Sender<Work>) {
@@ -71,9 +73,9 @@ impl Mailer {
         self.port_to_work.insert(port, index);
     }
 
-    /// Links a [`UrbHandle`] to a [`Port`] so that they both point 
+    /// Links a [`UrbHandle`] to a [`Port`] so that they both point
     /// to the same [`Sender`].
-    /// 
+    ///
     /// The function returns `false` if:
     /// - `handle` was already mapped to `port`
     /// - `port` doesn't exist in mapping
@@ -195,7 +197,7 @@ impl Mailer {
     }
 }
 
-struct Operator {
+struct Demuxer {
     register_rx: mpsc::Receiver<
         Ctrl<
             Register,
@@ -210,7 +212,7 @@ struct Operator {
     vhci: vhci::Controller,
 }
 
-impl Operator {
+impl Demuxer {
     async fn run(self) -> std::io::Result<()> {
         let Self {
             mut register_rx,
@@ -218,10 +220,10 @@ impl Operator {
             mut vhci,
         } = self;
 
-        let mut mailer = Mailer::default();
+        let mailer = Mailer::default();
         let (work_tx, mut work_rx) = mpsc::channel(64);
         let work_receiver = vhci.work_receiver().unwrap();
-        let (mut port_connect_tx, port_connect_rx) = mpsc::channel(vhci.free_ports() as usize);
+        let (port_connect_tx, port_connect_rx) = mpsc::channel(vhci.free_ports() as usize);
         let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx, port_connect_rx));
 
         struct Context {
@@ -233,7 +235,7 @@ impl Operator {
         let mut ctx = Context {
             vhci,
             mailer,
-            port_connect_tx
+            port_connect_tx,
         };
 
         loop {
@@ -338,7 +340,11 @@ impl Operator {
             }
         }
 
-        let Context { mut vhci, mailer, port_connect_tx } = ctx;
+        let Context {
+            mut vhci,
+            mailer,
+            port_connect_tx,
+        } = ctx;
 
         trace!("disconnecting leftover devices and closing work_rx");
         for port in mailer.port_to_work.into_keys() {
@@ -381,7 +387,7 @@ impl Controller {
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
         let handle = Arc::new(Mutex::new(Some(tokio::spawn(
-            Operator {
+            Demuxer {
                 register_rx,
                 disconnect_rx,
                 vhci,
@@ -420,7 +426,7 @@ impl Controller {
             flags: PortFlag::empty(),
         };
 
-        trace!("registered port 2, now listening for work");
+        trace!("registered {port:?}, now listening for work");
         loop {
             tokio::select! {
                 work = work_rx.recv() => {

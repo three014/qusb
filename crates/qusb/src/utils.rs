@@ -1,7 +1,7 @@
 use crate::rustls;
 use nohash_hasher::BuildNoHashHasher;
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, hash::Hash, sync::Arc};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt},
     sync::oneshot,
@@ -12,9 +12,29 @@ use crate::Error;
 
 pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 
-pub struct Ctrl<S, R = ()> {
+pub struct NoHash<T>(pub T);
+impl<T: Clone> Clone for NoHash<T> {
+    fn clone(&self) -> Self {
+        NoHash(self.0.clone())
+    }
+}
+impl<T: Copy> Copy for NoHash<T> {}
+impl<T: Hash> Hash for NoHash<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+impl<T: Eq> Eq for NoHash<T> {}
+impl<T: PartialEq> PartialEq for NoHash<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+impl nohash_hasher::IsEnabled for NoHash<quinn::StreamId> {}
+
+pub struct Ctrl<S, R = (), E = std::io::Error> {
     pub data: S,
-    pub(crate) tx: oneshot::Sender<std::io::Result<R>>,
+    pub(crate) tx: oneshot::Sender<Result<R, E>>,
 }
 
 impl<S, R> Ctrl<S, R> {

@@ -1,33 +1,99 @@
-use tokio::sync::mpsc;
-use tokio_util::bytes::Bytes;
+use std::convert::Infallible;
 
-use crate::utils::Ctrl;
+use proto::zerocopy::{self, FromBytes};
+use tokio::sync::mpsc;
+use tokio_util::bytes::{Buf, Bytes};
+
+use crate::utils::{Ctrl, NoHash, SimpleMap};
+
+#[derive(Debug)]
+pub struct IsoHandle {
+    pub handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    pub register_tx: mpsc::Sender<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
+    pub disconnect_tx: mpsc::Sender<Ctrl<quinn::StreamId, (), Infallible>>,
+}
 
 pub struct Sender {
     tx: quinn::SendStream,
     iso_tx: quinn::Connection,
 }
 
-impl Sender {
-    fn foo(&self) {
-        self.tx.id();
-    }
-}
-
 pub struct Receiver {
     rx: quinn::RecvStream,
-    iso_rx: mpsc::Receiver<Bytes>
+    iso_rx: mpsc::Receiver<Bytes>,
 }
 
-pub struct Operator {
-    register_rx: mpsc::Receiver<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>>>,
-    disconnect_rx: mpsc::Receiver<Ctrl<quinn::StreamId>>,
-    conn: quinn::Connection,
+pub struct IsoDemuxer {
+    pub register_rx: mpsc::Receiver<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
+    pub disconnect_rx: mpsc::Receiver<Ctrl<quinn::StreamId, (), Infallible>>,
+    pub conn: quinn::Connection,
 }
 
-impl Operator {
-    pub(crate) async fn run(self) -> std::io::Result<()> {
-        let Self { register_rx, disconnect_rx, conn } = self;
-        todo!()
+impl IsoDemuxer {
+    pub async fn run(self) -> std::io::Result<()> {
+        let Self {
+            mut register_rx,
+            mut disconnect_rx,
+            conn,
+        } = self;
+
+        let mut mailer = SimpleMap::<NoHash<quinn::StreamId>, mpsc::Sender<Bytes>>::default();
+
+        enum Select {
+            Register(Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>),
+            Datagram(Bytes),
+            Disconnect(Ctrl<quinn::StreamId, (), Infallible>),
+        }
+
+        loop {
+            let select = tokio::select! {
+                req = register_rx.recv() => {
+                    if let Some(register) = req {
+                        Select::Register(register)
+                    } else {
+                        break;
+                    }
+                }
+                datagram = conn.read_datagram() => {
+                    match datagram {
+                        Ok(bytes) => Select::Datagram(bytes),
+                        Err(err) => return Err(std::io::Error::from(err)),
+                    }
+                }
+                req = disconnect_rx.recv() => {
+                    if let Some(disconnect) = req {
+                        Select::Disconnect(disconnect)
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            match select {
+                Select::Register(Ctrl { data: id, tx }) => {
+                    let (iso_tx, iso_rx) = mpsc::channel(32);
+                    mailer.insert(NoHash(id), iso_tx);
+                    if tx.send(Ok(iso_rx)).is_err() {
+                        mailer.remove(&NoHash(id));
+                    }
+                }
+                Select::Datagram(mut bytes) => {
+                    if let Ok((id, _)) = zerocopy::network_endian::U64::read_from_prefix(&bytes) {
+                        bytes.advance(std::mem::size_of_val(&id));
+                        let id = NoHash(quinn::StreamId(id.get()));
+                        if let Some(tx) = mailer.get(&id) {
+                            if tx.send(bytes).await.is_err() {
+                                mailer.remove(&id);
+                            }
+                        }
+                    }
+                }
+                Select::Disconnect(Ctrl { data: id, tx }) => {
+                    mailer.remove(&NoHash(id));
+                    let _ = tx.send(Ok(()));
+                }
+            }
+        }
+        Ok(())
     }
 }

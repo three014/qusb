@@ -1,3 +1,4 @@
+use pipe::{IsoDemuxer, IsoHandle};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use state::State;
 use std::{
@@ -8,6 +9,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
+use tokio::sync::mpsc;
 use usb_ids::UsbIds;
 use utils::BoundedU8;
 
@@ -43,7 +45,7 @@ pub fn usb_ids() -> &'static UsbIds {
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
-    iso: Arc<Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>>,
+    iso: Arc<Mutex<Option<IsoHandle>>>,
 }
 
 impl Session {
@@ -58,18 +60,34 @@ impl Session {
         self.conn.remote_address()
     }
 
-    #[tracing::instrument(skip_all, level = "trace")]
+    // #[tracing::instrument(skip_all, level = "trace")]
     pub async fn open_stream(&self) -> Result<State<state::ClientReq>, Error> {
         let mut slot = self.iso.lock().unwrap();
-        assert!(slot.is_none());
+        if slot
+            .as_ref()
+            .is_none_or(|&IsoHandle { ref handle, .. }| handle.is_finished())
+        {
+            let (register_tx, register_rx) = mpsc::channel(8);
+            let (disconnect_tx, disconnect_rx) = mpsc::channel(8);
+            let conn = self.conn.clone();
+            let handle = tokio::spawn(async move {
+                IsoDemuxer {
+                    register_rx,
+                    disconnect_rx,
+                    conn,
+                }
+                .run()
+                .await
+            });
 
-        
-        let handle = tokio::spawn(async move {
-            
-            Ok(())
-        });
-        *slot = Some(handle);
-        drop(slot);
+            *slot = Some(IsoHandle {
+                handle,
+                register_tx,
+                disconnect_tx,
+            })
+        }
+
+        // TODO: Move state stuff out of this crate into proto crate
 
         let (tx, rx) = self
             .conn
