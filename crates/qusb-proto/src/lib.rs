@@ -1,137 +1,36 @@
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use thiserror::Error;
+use zerocopy::KnownLayout;
 
 pub use lstr;
 pub use zerocopy;
 
 pub mod urb;
 pub mod state {
-    use std::{
-        marker::{PhantomData, Unpin},
-        ops::Deref,
+    use std::io;
+
+    
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use zerocopy::{network_endian::U32, IntoBytes};
+
+    use crate::{
+        data::{IterDst, IterDstMut, Ring},
+        msg,
     };
-
-    use bytes::{Buf, Bytes, BytesMut};
-    use thiserror::Error;
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use zerocopy::{
-        Immutable, KnownLayout, TryFromBytes,
-    };
-
-    #[derive(Debug, Error)]
-    pub enum Error {
-        #[error("encounted invalid data when reading from buffer")]
-        InvalidData,
-        #[error("{0}")]
-        IoError(#[from] std::io::Error),
-    }
-
-    pub struct Data<T> {
-        buf: BytesMut,
-        _p: PhantomData<T>,
-    }
-
-    impl<T> Data<T>
-    where
-        T: TryFromBytes + Immutable + KnownLayout,
-    {
-        fn get(&self) -> &T {
-            T::try_ref_from_bytes(&self.buf).unwrap()
-        }
-
-        fn get_mut(&mut self) -> &mut T {
-            T::try_mut_from_bytes(&mut self.buf).unwrap()
-        }
-
-        fn new(buf: BytesMut) -> Self {
-            Self {
-                buf,
-                _p: PhantomData,
-            }
-        }
-    }
-
-    pub struct Ring {
-        buf: BytesMut,
-    }
-
-    impl Ring {
-        fn peek<T>(&self) -> Result<&T, Error>
-        where
-            T: TryFromBytes + KnownLayout + Immutable,
-        {
-            let size_of = std::mem::size_of::<T>();
-            if self.buf.len() < size_of {
-                return Err(Error::InvalidData);
-            }
-            T::try_ref_from_bytes(&self.buf[..size_of]).map_err(|_| Error::InvalidData)
-        }
-
-        fn peek_mut<T>(&mut self) -> Result<&mut T, Error>
-        where
-            T: TryFromBytes + KnownLayout + Immutable,
-        {
-            let size_of = std::mem::size_of::<T>();
-            if self.buf.len() < size_of {
-                return Err(Error::InvalidData);
-            }
-            T::try_mut_from_bytes(&mut self.buf[..size_of]).map_err(|_| Error::InvalidData)
-        }
-
-        fn read<T>(&mut self) -> Result<T, Error>
-        where
-            T: TryFromBytes + KnownLayout + Immutable,
-        {
-            let size_of = std::mem::size_of::<T>();
-            if self.buf.len() < size_of {
-                return Err(Error::InvalidData);
-            }
-            let item =
-                T::try_read_from_bytes(&self.buf[..size_of]).map_err(|_| Error::InvalidData)?;
-            self.buf.advance(size_of);
-            Ok(item)
-        }
-
-        // fn peek_item_dst<T>(&self, dst_elems: usize) -> Result<&T, TryCastError<&[u8], T>>
-        // where
-        //     T: TryFromBytes + KnownLayout<PointerMetadata = usize> + Immutable,
-        // {
-        //     T::try_ref_from_prefix_with_elems(&self.buf, dst_elems).map(|(item, _)| item)
-        // }
-
-        fn consume<T>(&mut self, item: &T)
-        where
-            T: TryFromBytes + KnownLayout + Immutable,
-        {
-            self.buf.advance(std::mem::size_of_val(item));
-        }
-
-        fn get<T>(&mut self) -> Result<Data<T>, Error>
-        where
-            T: TryFromBytes + KnownLayout + Immutable,
-        {
-            let size_of = std::mem::size_of::<T>();
-            if self.buf.len() < size_of {
-                return Err(Error::InvalidData);
-            }
-            let buf = self.buf.split_to(size_of);
-            Ok(Data::new(buf))
-        }
-
-        async fn read_into<R>(&mut self, mut rx: R) -> std::io::Result<usize>
-        where
-            R: AsyncRead + Unpin,
-        {
-            rx.read_buf(&mut self.buf).await
-        }
-
-        fn try_reclaim(&mut self, additional: usize) -> bool {
-            self.buf.try_reclaim(additional)
-        }
-    }
 
     pub struct ClientIdle;
+    pub struct ClientListDevices(Ring);
+
+    impl ClientListDevices {
+        pub fn iter(&self) -> IterDst<'_, msg::UsbDeviceInfo> {
+            self.0.iter_dst()
+        }
+
+        pub fn iter_mut(&mut self) -> IterDstMut<'_, msg::UsbDeviceInfo> {
+            self.0.iter_mut_dst()
+        }
+    }
 
     pub struct State<S, W, R> {
         buf: Ring,
@@ -140,8 +39,45 @@ pub mod state {
         inner: S,
     }
 
-    impl<W, R> State<ClientIdle, W, R> where R: AsyncRead {
-        
+    impl<W, R> State<ClientIdle, W, R>
+    where
+        R: AsyncRead,
+        W: AsyncWrite,
+    {
+        pub async fn list_devices(mut self) -> io::Result<ClientListDevices> {
+            let version = crate::QUSB_VER;
+            let req = msg::Request::ListDevices;
+            let mut tx = std::pin::pin!(self.tx);
+            let mut rx = std::pin::pin!(self.rx);
+
+            tx.write_all(version.as_bytes()).await?;
+            tx.write_all(req.as_bytes()).await?;
+            drop(tx);
+
+            while 0 == self.buf.read_into_from_reader(&mut rx).await? {}
+            let status = self.buf.read()?;
+            self.buf.consume(&[0u8, 0u8, 0u8]);
+            match status {
+                msg::Status::Success => {}
+                msg::Status::Failed => todo!(),
+                msg::Status::DevBusy => todo!(),
+                msg::Status::DevErr => todo!(),
+                msg::Status::NoDev => todo!(),
+                msg::Status::Unexpected => return Err(io::Error::from(io::ErrorKind::InvalidData)),
+                msg::Status::VersionMismatch => {
+                    let their_version = self.buf.read::<msg::Version>()?;
+                    return Err(std::io::Error::other(format!(
+                        "{} (theirs: {}, ours: {})",
+                        msg::Status::VersionMismatch,
+                        their_version,
+                        crate::QUSB_VER
+                    )));
+                }
+            }
+
+            let _num_devs = self.buf.read::<U32>()?;
+            Ok(ClientListDevices(self.buf))
+        }
     }
 }
 
@@ -184,37 +120,41 @@ pub mod msg {
     //!
     //! Response::ListDevices:
     //!
-    //! | Offset                             | Length   | Value      | Description                                                   |
-    //! |------------------------------------|----------|------------|---------------------------------------------------------------|
-    //! | 0                                  | 1        | 0x00       | Status: 0 for OK                                              |
-    //! | 1                                  | 3        | 0x000000   | zeroed bytes for padding                                      |
-    //! | 4                                  | 4        | N          | Number of USB devices from peer; 0 means none.                |
-    //! | 8                                  |          |            | From now on the N devices are described, if any.              |
-    //! |                                    | 8        | P          | len(path): The length of the next field in bytes.             |
-    //! | 0x10                               | P <= 256 |            | path: Path of the device on the peer.                         |
-    //! | 0x10 + P                           | 8        | I          | len(busid): The length of the next field in bytes.            |
-    //! | 0x18 + P                           | I <= 32  |            | busid: Bus ID of the USB device.                              |
-    //! | 0x18 + P + I                       | 4        |            | busnum                                                        |
-    //! | 0x1C + P + I                       | 4        |            | devnum                                                        |
-    //! | 0x20 + P + I                       | 4        |            | speed                                                         |
-    //! | 0x24 + P + I                       | 2        |            | idVendor                                                      |
-    //! | 0x26 + P + I                       | 2        |            | idProduct                                                     |
-    //! | 0x28 + P + I                       | 2        |            | bcdDevice                                                     |
-    //! | 0x2A + P + I                       | 1        |            | bDeviceClass                                                  |
-    //! | 0x2B + P + I                       | 1        |            | bDeviceSubClass                                               |
-    //! | 0x2C + P + I                       | 1        |            | bDeviceProtocol                                               |
-    //! | 0x2D + P + I                       | 1        |            | bConfigurationValue                                           |
-    //! | 0x2E + P + I                       | 1        |            | bNumConfigurations                                            |
-    //! | 0x2F + P + I                       | 1        | T          | bNumInterfaces                                                |
-    //! | 0x30 + P + I                       |          | m_0        | From now on each interface is described T times:              |
-    //! |                                    | 1        |            | bInterfaceClass                                               |
-    //! | 0x31 + P + I                       | 1        |            | bInterfaceSubClass                                            |
-    //! | 0x32 + P + I                       | 1        |            | bInterfaceProtocol                                            |
-    //! | 0x8 + i*(P + I + 0x28) + m_(i-1)*3 | 1        |            | The second USB device starts at i=1 with the len(path) field. |
- 
+    //! | Offset                    | Length   | Value      | Description                                                   |
+    //! |---------------------------|----------|------------|---------------------------------------------------------------|
+    //! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
+    //! | 1                         | 3        | 0x000000   | zeroed bytes for padding                                      |
+    //! | 4                         | 4        | N          | Number of USB devices from peer; 0 means none.                |
+    //! | 8                         |          |            | From now on the N devices are described, if any.              |
+    //! |                           | 2        | P          | len(path): The length of the next field in bytes.             |
+    //! | 0xA                       | 256      |            | path: Path of the device on the peer.                         |
+    //! | 0x10A                     | 2        | I          | len(busid): The length of the next field in bytes.            |
+    //! | 0x10C                     | 32       |            | busid: Bus ID of the USB device.                              |
+    //! | 0x12C                     | 4        |            | busnum                                                        |
+    //! | 0x130                     | 4        |            | devnum                                                        |
+    //! | 0x134                     | 4        |            | speed                                                         |
+    //! | 0x138                     | 2        |            | idVendor                                                      |
+    //! | 0x13A                     | 2        |            | idProduct                                                     |
+    //! | 0x13C                     | 2        |            | bcdDevice                                                     |
+    //! | 0x13E                     | 1        |            | bDeviceClass                                                  |
+    //! | 0x13F                     | 1        |            | bDeviceSubClass                                               |
+    //! | 0x140                     | 1        |            | bDeviceProtocol                                               |
+    //! | 0x141                     | 1        |            | bConfigurationValue                                           |
+    //! | 0x142                     | 1        |            | bNumConfigurations                                            |
+    //! | 0x143                     | 1        | T          | bNumInterfaces                                                |
+    //! | 0x144                     |          | m_0        | From now on each interface is described T times:              |
+    //! |                           | 1        |            | bInterfaceClass                                               |
+    //! | 0x145                     | 1        |            | bInterfaceSubClass                                            |
+    //! | 0x146                     | 1        |            | bInterfaceProtocol                                            |
+    //! | 0x8 + i*0x13C + m_(i-1)*4 |          |            | The second USB device starts at i=1 with the len(path) field. |
+
     use thiserror::Error;
-    use zerocopy::network_endian::U16;
-    use zerocopy_derive::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
+    use zerocopy::
+        network_endian::{U16, U32}
+    ;
+    use zerocopy_derive::*;
+
+    use crate::GetSliceLen;
 
     #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
     #[repr(C)]
@@ -264,10 +204,322 @@ pub mod msg {
         pub bus_number: u8,
         pub device_addr: u8,
     }
+
+    #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+    #[repr(C)]
+    pub struct UsbInterfaceInfo {
+        pub b_interface_class: u8,
+        pub b_interface_subclass: u8,
+        pub b_interface_protocol: u8,
+    }
+
+    #[derive(Debug, FromBytes, KnownLayout, Immutable, Unaligned)]
+    #[repr(C)]
+    pub struct UsbDeviceInfo {
+        pub path_len: U16,
+        pub path: [u8; 256],
+        pub bus_id_len: U16,
+        pub bus_id: [u8; 32],
+        pub busnum: U32,
+        pub devnum: U32,
+        pub speed: U32,
+        pub id_vendor: U16,
+        pub id_product: U16,
+        pub bcd_device: U16,
+        pub b_device_class: u8,
+        pub b_device_subclass: u8,
+        pub b_device_protocol: u8,
+        pub b_configuration_value: u8,
+        pub b_num_configurations: u8,
+        pub b_num_interfaces: u8,
+        pub interfaces: [UsbInterfaceInfo],
+    }
+
+    impl GetSliceLen for UsbDeviceInfo {
+        fn get_slice_len(buf: &[u8]) -> Option<usize> {
+            let size_of_base = 316;
+            if buf.len() < size_of_base {
+                None
+            } else {
+                let start = size_of_base - std::mem::size_of::<U16>();
+                let chunk = *buf[start..].first_chunk()?;
+                Some(U16::from_bytes(chunk).get() as usize)
+            }
+        }
+    }
 }
+
+pub mod data {
+    use std::{io, marker::PhantomData};
+
+    use bytes::Buf;
+
+    use bytes::BytesMut;
+    use tokio::io::AsyncRead;
+    use tokio::io::AsyncReadExt;
+
+    use zerocopy::ConvertError;
+    use zerocopy::{Immutable, KnownLayout, TryFromBytes};
+
+    use crate::GetSliceLen;
+
+    fn invalid<A, S, V>(_x: ConvertError<A, S, V>) -> io::Error {
+        io::Error::from(io::ErrorKind::InvalidData)
+    }
+
+    pub struct IterDstMut<'a, T: ?Sized + 'a> {
+        buf: &'a mut [u8],
+        _p: PhantomData<&'a mut T>,
+    }
+
+    impl<'a, T> Iterator for IterDstMut<'a, T>
+    where
+        T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+    {
+        type Item = &'a mut T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let slice = std::mem::take(&mut self.buf);
+            let len = T::get_slice_len(slice)?;
+            let (item, remaining) = T::try_mut_from_prefix_with_elems(slice, len).ok()?;
+            self.buf = remaining;
+            Some(item)
+        }
+    }
+
+    pub struct IterDst<'a, T: ?Sized + 'a> {
+        buf: &'a [u8],
+        _p: PhantomData<&'a T>,
+    }
+
+    impl<'a, T> Iterator for IterDst<'a, T>
+    where
+        T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+    {
+        type Item = &'a T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let len = T::get_slice_len(self.buf)?;
+            let (item, remaining) = T::try_ref_from_prefix_with_elems(self.buf, len).ok()?;
+            self.buf = remaining;
+            Some(item)
+        }
+    }
+
+    pub struct Data<T: ?Sized> {
+        buf: BytesMut,
+        _p: PhantomData<T>,
+    }
+
+    impl<T> Data<T>
+    where
+        T: TryFromBytes + Immutable + KnownLayout + ?Sized,
+    {
+        pub fn get(&self) -> &T {
+            T::try_ref_from_bytes(&self.buf).unwrap()
+        }
+
+        pub fn get_mut(&mut self) -> &mut T {
+            T::try_mut_from_bytes(&mut self.buf).unwrap()
+        }
+
+        fn new(buf: BytesMut) -> Self {
+            Self {
+                buf,
+                _p: PhantomData,
+            }
+        }
+    }
+
+    pub struct Ring {
+        buf: BytesMut,
+    }
+
+    impl Ring {
+        pub fn peek<T>(&self) -> io::Result<&T>
+        where
+            T: TryFromBytes + KnownLayout + Immutable,
+        {
+            let size_of = std::mem::size_of::<T>();
+            if self.buf.len() < size_of {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            T::try_ref_from_bytes(&self.buf[..size_of]).map_err(invalid)
+        }
+
+        pub fn peek_dst<T>(&self) -> io::Result<&T>
+        where
+            T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+        {
+            let len = T::get_slice_len(&self.buf)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            T::try_ref_from_prefix_with_elems(&self.buf, len)
+                .map_err(invalid)
+                .map(|(item, _)| item)
+        }
+
+        pub fn peek_mut<T>(&mut self) -> io::Result<&mut T>
+        where
+            T: TryFromBytes + KnownLayout + Immutable,
+        {
+            let size_of = std::mem::size_of::<T>();
+            if self.buf.len() < size_of {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            T::try_mut_from_bytes(&mut self.buf[..size_of]).map_err(invalid)
+        }
+
+        pub fn peek_mut_dst<T>(&mut self) -> io::Result<&mut T>
+        where
+            T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+        {
+            let len = T::get_slice_len(&self.buf)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            T::try_mut_from_prefix_with_elems(&mut self.buf, len)
+                .map_err(invalid)
+                .map(|(item, _)| item)
+        }
+
+        pub fn read<T>(&mut self) -> io::Result<T>
+        where
+            T: TryFromBytes + KnownLayout + Immutable,
+        {
+            let size_of = std::mem::size_of::<T>();
+            if self.buf.len() < size_of {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let item = T::try_read_from_bytes(&self.buf[..size_of]).map_err(invalid)?;
+            self.buf.advance(size_of);
+            Ok(item)
+        }
+
+        pub fn consume<T>(&mut self, item: &T)
+        where
+            T: TryFromBytes + KnownLayout + Immutable + ?Sized,
+        {
+            self.buf.advance(std::mem::size_of_val(item));
+        }
+
+        pub fn claim<T>(&mut self) -> std::io::Result<Data<T>>
+        where
+            T: TryFromBytes + KnownLayout + Immutable,
+        {
+            let size_of = std::mem::size_of::<T>();
+            if self.buf.len() < size_of {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let buf = self.buf.split_to(size_of);
+            Ok(Data::new(buf))
+        }
+
+        pub fn claim_dst<T>(&mut self) -> io::Result<Data<T>>
+        where
+            T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+        {
+            let item: &T = self.peek_dst()?;
+            let size_of = std::mem::size_of_val(item);
+            let buf = self.buf.split_to(size_of);
+            Ok(Data::new(buf))
+        }
+
+        pub fn iter<'a, T>(&'a self) -> impl Iterator<Item = &'a T>
+        where
+            T: TryFromBytes + KnownLayout + Immutable + 'a,
+        {
+            self.buf
+                .chunks_exact(std::mem::size_of::<T>())
+                .map_while(|chunk| T::try_ref_from_bytes(chunk).ok())
+        }
+
+        pub fn iter_dst<'a, T>(&'a self) -> IterDst<'a, T>
+        where
+            T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+        {
+            IterDst {
+                buf: &self.buf,
+                _p: PhantomData,
+            }
+        }
+
+        pub fn iter_mut<'a, T>(&'a mut self) -> impl Iterator<Item = &'a mut T>
+        where
+            T: TryFromBytes + KnownLayout + Immutable + 'a,
+        {
+            self.buf
+                .chunks_exact_mut(std::mem::size_of::<T>())
+                .map_while(|chunk| T::try_mut_from_bytes(chunk).ok())
+        }
+
+        pub fn iter_mut_dst<'a, T>(&'a mut self) -> IterDstMut<'a, T>
+        where
+            T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+        {
+            IterDstMut {
+                buf: &mut self.buf,
+                _p: PhantomData,
+            }
+        }
+
+        pub async fn read_into_from_reader<R>(&mut self, mut rx: R) -> io::Result<usize>
+        where
+            R: AsyncRead + Unpin,
+        {
+            rx.read_buf(&mut self.buf).await
+        }
+
+        pub fn try_consolidate(&mut self) {
+            let size = self.buf.capacity() - self.buf.len();
+            let _ = self.buf.try_reclaim(size);
+        }
+    }
+}
+
+pub const QUSB_VER: msg::Version = msg::Version {
+    major: 0,
+    minor: 1,
+    patch: zerocopy::network_endian::U16::ZERO,
+};
 
 pub const BUS_ID_SIZE: usize = 32;
 pub const VERSION: Version = Version(0x0200);
+
+/// You received a DST from the internet in the
+/// form of bytes, and you want to find out the
+/// number of elements in the trailing slice.
+/// What to do? Implement [`GetSliceLen`]!
+///
+/// `GetSliceLen` allows a DST to search a buffer of
+/// bytes for the value that corresponds to
+/// the number of elements in the DST.
+///
+/// The returned value will still be fed through
+/// [`zerocopy::TryFromBytes`], so it's not like
+/// this will cause UB if the value is incorrect.
+/// More likely, if the value is incorrect, then
+/// the whole buffer is messed-up anyway.
+///
+/// Just, please don't try to do your own `unsafe`
+/// stuff based on this value.
+pub trait GetSliceLen
+where
+    Self: KnownLayout<PointerMetadata = usize>,
+{
+    /// If `buf` was some DST `T`, then this
+    /// function returns the number of elements
+    /// in the slice at the end of the DST instance.
+    ///
+    /// The implementer should return `None` if the
+    /// buffer was shorter than std::mem::size_of::<T>()
+    /// or if they have reason to believe their value
+    /// is incorrect.
+    ///
+    /// # Assumptions
+    ///
+    /// - The bytes of `buf` are in network endian
+    /// - `buf` may not be exactly the length of
+    ///   the DST and its trailing slice.
+    fn get_slice_len(buf: &[u8]) -> Option<usize>;
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Version(u16);
