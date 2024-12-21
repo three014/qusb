@@ -1,35 +1,45 @@
 use std::convert::Infallible;
 
-use proto::zerocopy::{self, FromBytes};
+use bytes::{Buf, Bytes};
 use tokio::sync::mpsc;
-use tokio_util::bytes::{Buf, Bytes};
+use zerocopy::{self, FromBytes};
 
 use crate::utils::{Ctrl, NoHash, SimpleMap};
 
 #[derive(Debug)]
-pub struct IsoHandle {
+pub struct Handle {
     pub handle: tokio::task::JoinHandle<std::io::Result<()>>,
     pub register_tx: mpsc::Sender<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
     pub disconnect_tx: mpsc::Sender<Ctrl<quinn::StreamId, (), Infallible>>,
+    pub conn: quinn::Connection,
+}
+
+impl Handle {
+    pub fn make_channel(&self, id: quinn::StreamId) -> Option<(Sender, Receiver)> {
+        let (rx, ctrl) = Ctrl::new(id);
+        self.register_tx.blocking_send(ctrl).ok()?;
+        let iso_rx = rx.blocking_recv().ok()?.unwrap();
+        let iso_tx = self.conn.clone();
+
+        Some((Sender { iso_tx }, Receiver { iso_rx }))
+    }
 }
 
 pub struct Sender {
-    tx: quinn::SendStream,
     iso_tx: quinn::Connection,
 }
 
 pub struct Receiver {
-    rx: quinn::RecvStream,
     iso_rx: mpsc::Receiver<Bytes>,
 }
 
-pub struct IsoDemuxer {
+pub struct Demuxer {
     pub register_rx: mpsc::Receiver<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
     pub disconnect_rx: mpsc::Receiver<Ctrl<quinn::StreamId, (), Infallible>>,
     pub conn: quinn::Connection,
 }
 
-impl IsoDemuxer {
+impl Demuxer {
     pub async fn run(self) -> std::io::Result<()> {
         let Self {
             mut register_rx,

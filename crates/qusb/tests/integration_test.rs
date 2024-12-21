@@ -42,7 +42,7 @@ async fn list_devices_works() {
         let session = client.connect(addr, "localhost").await.unwrap();
         tracing::info!("Connected to {}", session.remote_address());
 
-        let _devs = session.list_devices().await.unwrap();
+        let _devs = session.req_list_devices().await.unwrap();
     }
 
     handle.shutdown().await.unwrap().unwrap();

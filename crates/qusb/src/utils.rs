@@ -1,14 +1,7 @@
 use crate::rustls;
 use nohash_hasher::BuildNoHashHasher;
-use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, hash::Hash, sync::Arc};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt},
-    sync::oneshot,
-};
-pub use vhci::utils::{BoundedI16, BoundedU8, TimeoutMillis};
-
-use crate::Error;
+use tokio::sync::oneshot;
 
 pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 
@@ -37,91 +30,91 @@ pub struct Ctrl<S, R = (), E = std::io::Error> {
     pub(crate) tx: oneshot::Sender<Result<R, E>>,
 }
 
-impl<S, R> Ctrl<S, R> {
-    pub(crate) fn new(data: S) -> (oneshot::Receiver<std::io::Result<R>>, Ctrl<S, R>) {
+impl<S, R, E> Ctrl<S, R, E> {
+    pub(crate) fn new(data: S) -> (oneshot::Receiver<Result<R, E>>, Ctrl<S, R, E>) {
         let (tx, rx) = oneshot::channel();
         let ctrl = Self { data, tx };
         (rx, ctrl)
     }
 }
 
-/// A synchronous sleep function that uses
-/// spinlocking for small sleep durations.
-///
-/// Credit goes to [Blat Blatnik](https://blog.bearcats.nl/accurate-sleep-function/)
-/// for the implementation.
-pub(crate) fn precise_sleep(clock: &quanta::Clock, mut seconds: f64) {
-    let mut estimate = 5e-3;
-    let mut mean = 5e-3;
-    let mut m2 = 0.0;
-    let mut count = 1;
+// /// A synchronous sleep function that uses
+// /// spinlocking for small sleep durations.
+// ///
+// /// Credit goes to [Blat Blatnik](https://blog.bearcats.nl/accurate-sleep-function/)
+// /// for the implementation.
+// pub(crate) fn precise_sleep(clock: &quanta::Clock, mut seconds: f64) {
+//     let mut estimate = 5e-3;
+//     let mut mean = 5e-3;
+//     let mut m2 = 0.0;
+//     let mut count = 1;
 
-    while seconds > estimate {
-        let start = clock.now();
-        std::thread::sleep(std::time::Duration::from_millis(1));
+//     while seconds > estimate {
+//         let start = clock.now();
+//         std::thread::sleep(std::time::Duration::from_millis(1));
 
-        let observed = start.elapsed().as_secs_f64();
-        seconds -= observed;
+//         let observed = start.elapsed().as_secs_f64();
+//         seconds -= observed;
 
-        count += 1;
-        let delta = observed - mean;
-        mean += delta / count as f64;
-        m2 += delta * (observed - mean);
-        let stddev = (m2 / (count - 1) as f64).sqrt();
-        estimate = mean + stddev;
-    }
+//         count += 1;
+//         let delta = observed - mean;
+//         mean += delta / count as f64;
+//         m2 += delta * (observed - mean);
+//         let stddev = (m2 / (count - 1) as f64).sqrt();
+//         estimate = mean + stddev;
+//     }
 
-    // spin lock
-    let start = clock.now();
-    while start.elapsed().as_secs_f64() < seconds {}
-}
+//     // spin lock
+//     let start = clock.now();
+//     while start.elapsed().as_secs_f64() < seconds {}
+// }
 
-/// Serializes an object that implements [`serde::Serialize`] into an async writer.
-/// Uses a user-provided buffer to prevent unneeded allocations, but does reallocate
-/// the buffer if not big enough to hold the serialized data.
-#[tracing::instrument(level = "trace", skip(writer))]
-pub(crate) async fn serialize_into_writer<T, W>(
-    item: &T,
-    writer: &mut W,
-    buf: &mut Vec<u8>,
-) -> Result<(), Error>
-where
-    T: Serialize + std::fmt::Debug,
-    W: AsyncWrite + Unpin,
-{
-    let msg = loop {
-        match postcard::to_slice_cobs(item, buf) {
-            Ok(msg) => break msg,
-            Err(postcard::Error::SerializeBufferFull) => {
-                buf.resize(buf.len() + 512, 0);
-            }
-            Err(err) => Err(err)?,
-        }
-    };
-    writer.write_all(msg).await?;
-    buf.clear();
-    Ok(())
-}
+// /// Serializes an object that implements [`serde::Serialize`] into an async writer.
+// /// Uses a user-provided buffer to prevent unneeded allocations, but does reallocate
+// /// the buffer if not big enough to hold the serialized data.
+// #[tracing::instrument(level = "trace", skip(writer))]
+// pub(crate) async fn serialize_into_writer<T, W>(
+//     item: &T,
+//     writer: &mut W,
+//     buf: &mut Vec<u8>,
+// ) -> Result<(), Error>
+// where
+//     T: Serialize + std::fmt::Debug,
+//     W: AsyncWrite + Unpin,
+// {
+//     let msg = loop {
+//         match postcard::to_slice_cobs(item, buf) {
+//             Ok(msg) => break msg,
+//             Err(postcard::Error::SerializeBufferFull) => {
+//                 buf.resize(buf.len() + 512, 0);
+//             }
+//             Err(err) => Err(err)?,
+//         }
+//     };
+//     writer.write_all(msg).await?;
+//     buf.clear();
+//     Ok(())
+// }
 
-/// Deserializes an object that implements [`serde::Deserialize`] from an async bufreader.
-///
-/// Returns `None` if the reader doesn't provide any data.
-#[tracing::instrument(level = "trace", skip(reader))]
-pub(crate) async fn deserialize_from_reader<T, R>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-) -> Result<Option<T>, Error>
-where
-    T: DeserializeOwned + std::fmt::Debug,
-    R: AsyncBufRead + Sized + Unpin,
-{
-    if 0 == reader.read_until(0, buf).await? {
-        return Ok(None);
-    }
-    let recv: T = postcard::from_bytes_cobs(buf)?;
-    buf.clear();
-    Ok(Some(recv))
-}
+// /// Deserializes an object that implements [`serde::Deserialize`] from an async bufreader.
+// ///
+// /// Returns `None` if the reader doesn't provide any data.
+// #[tracing::instrument(level = "trace", skip(reader))]
+// pub(crate) async fn deserialize_from_reader<T, R>(
+//     reader: &mut R,
+//     buf: &mut Vec<u8>,
+// ) -> Result<Option<T>, Error>
+// where
+//     T: DeserializeOwned + std::fmt::Debug,
+//     R: AsyncBufRead + Sized + Unpin,
+// {
+//     if 0 == reader.read_until(0, buf).await? {
+//         return Ok(None);
+//     }
+//     let recv: T = postcard::from_bytes_cobs(buf)?;
+//     buf.clear();
+//     Ok(Some(recv))
+// }
 
 /// A custom certificate that accepts any and all certificates it sees.
 ///

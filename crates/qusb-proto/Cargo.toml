@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0.215", features = ["derive"] }
 thiserror = "2.0.3"
 lstr = { package = "limited_str", git = "https://github.com/three014/limited_str.git", features = ["serde"] }
 zerocopy = { version = "0.8.13", features = ["std"] }

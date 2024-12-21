@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bitflags = "2.6.0"
+# bitflags = "2.6.0"
 quinn = { version = "0.11.6", features = ["runtime-tokio"] }
 rcgen = "0.13.1"
 thiserror = "2.0.3"
 tokio = { version = "1.41.1", features = ["io-util", "sync", "macros", "rt", "rt-multi-thread"] }
 proto = { package = "qusb-proto", path = "../qusb-proto" }
-postcard = { version = "1.0.10" }
+# postcard = { version = "1.0.10" }
 nohash-hasher = "0.2.0"
 rand = "0.8.5"
 # evmap = "10.0.2"
-serde = "1.0.215"
+# serde = "1.0.215"
 # bytes = "1.9.0"
 tracing = "0.1.40"
 tokio-util = "0.7.12"
@@ -22,8 +22,10 @@ nusb = "0.1.12"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 vhci = { package = "usb_vhci", git = "https://github.com/three014/usb_vhci" }
-heapless = "0.8.0"
-quanta = "0.12.4"
+# heapless = "0.8.0"
+# quanta = "0.12.4"
+bytes = "1.9.0"
+zerocopy = "0.8.13"
 
 [dev-dependencies]
 tracing-test = "0.2.5"

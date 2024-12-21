@@ -1,86 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::ops::Deref;
-use thiserror::Error;
 use zerocopy::KnownLayout;
 
 pub use lstr;
 pub use zerocopy;
 
 pub mod urb;
-pub mod state {
-    use std::io;
-
-    
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-    use zerocopy::{network_endian::U32, IntoBytes};
-
-    use crate::{
-        data::{IterDst, IterDstMut, Ring},
-        msg,
-    };
-
-    pub struct ClientIdle;
-    pub struct ClientListDevices(Ring);
-
-    impl ClientListDevices {
-        pub fn iter(&self) -> IterDst<'_, msg::UsbDeviceInfo> {
-            self.0.iter_dst()
-        }
-
-        pub fn iter_mut(&mut self) -> IterDstMut<'_, msg::UsbDeviceInfo> {
-            self.0.iter_mut_dst()
-        }
-    }
-
-    pub struct State<S, W, R> {
-        buf: Ring,
-        rx: R,
-        tx: W,
-        inner: S,
-    }
-
-    impl<W, R> State<ClientIdle, W, R>
-    where
-        R: AsyncRead,
-        W: AsyncWrite,
-    {
-        pub async fn list_devices(mut self) -> io::Result<ClientListDevices> {
-            let version = crate::QUSB_VER;
-            let req = msg::Request::ListDevices;
-            let mut tx = std::pin::pin!(self.tx);
-            let mut rx = std::pin::pin!(self.rx);
-
-            tx.write_all(version.as_bytes()).await?;
-            tx.write_all(req.as_bytes()).await?;
-            drop(tx);
-
-            while 0 == self.buf.read_into_from_reader(&mut rx).await? {}
-            let status = self.buf.read()?;
-            self.buf.consume(&[0u8, 0u8, 0u8]);
-            match status {
-                msg::Status::Success => {}
-                msg::Status::Failed => todo!(),
-                msg::Status::DevBusy => todo!(),
-                msg::Status::DevErr => todo!(),
-                msg::Status::NoDev => todo!(),
-                msg::Status::Unexpected => return Err(io::Error::from(io::ErrorKind::InvalidData)),
-                msg::Status::VersionMismatch => {
-                    let their_version = self.buf.read::<msg::Version>()?;
-                    return Err(std::io::Error::other(format!(
-                        "{} (theirs: {}, ours: {})",
-                        msg::Status::VersionMismatch,
-                        their_version,
-                        crate::QUSB_VER
-                    )));
-                }
-            }
-
-            let _num_devs = self.buf.read::<U32>()?;
-            Ok(ClientListDevices(self.buf))
-        }
-    }
-}
-
 pub mod msg {
     //! # The structure of a message in Qusb
     //!
@@ -124,37 +47,53 @@ pub mod msg {
     //! |---------------------------|----------|------------|---------------------------------------------------------------|
     //! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
     //! | 1                         | 3        | 0x000000   | zeroed bytes for padding                                      |
-    //! | 4                         | 4        | N          | Number of USB devices from peer; 0 means none.                |
-    //! | 8                         |          |            | From now on the N devices are described, if any.              |
+    //! | 4                         |          |            | From now on the devices are described, if any.                |
     //! |                           | 2        | P          | len(path): The length of the next field in bytes.             |
-    //! | 0xA                       | 256      |            | path: Path of the device on the peer.                         |
-    //! | 0x10A                     | 2        | I          | len(busid): The length of the next field in bytes.            |
-    //! | 0x10C                     | 32       |            | busid: Bus ID of the USB device.                              |
-    //! | 0x12C                     | 4        |            | busnum                                                        |
-    //! | 0x130                     | 4        |            | devnum                                                        |
-    //! | 0x134                     | 4        |            | speed                                                         |
-    //! | 0x138                     | 2        |            | idVendor                                                      |
-    //! | 0x13A                     | 2        |            | idProduct                                                     |
-    //! | 0x13C                     | 2        |            | bcdDevice                                                     |
-    //! | 0x13E                     | 1        |            | bDeviceClass                                                  |
-    //! | 0x13F                     | 1        |            | bDeviceSubClass                                               |
-    //! | 0x140                     | 1        |            | bDeviceProtocol                                               |
-    //! | 0x141                     | 1        |            | bConfigurationValue                                           |
-    //! | 0x142                     | 1        |            | bNumConfigurations                                            |
-    //! | 0x143                     | 1        | T          | bNumInterfaces                                                |
-    //! | 0x144                     |          | m_0        | From now on each interface is described T times:              |
+    //! | 0x6                       | 256      |            | path: Path of the device on the peer.                         |
+    //! | 0x106                     | 2        | I          | len(busid): The length of the next field in bytes.            |
+    //! | 0x108                     | 32       |            | busid: Bus ID of the USB device.                              |
+    //! | 0x128                     | 4        |            | busnum                                                        |
+    //! | 0x12C                     | 4        |            | devnum                                                        |
+    //! | 0x130                     | 4        |            | speed                                                         |
+    //! | 0x134                     | 2        |            | idVendor                                                      |
+    //! | 0x136                     | 2        |            | idProduct                                                     |
+    //! | 0x138                     | 2        |            | bcdDevice                                                     |
+    //! | 0x13A                     | 1        |            | bDeviceClass                                                  |
+    //! | 0x13B                     | 1        |            | bDeviceSubClass                                               |
+    //! | 0x13C                     | 1        |            | bDeviceProtocol                                               |
+    //! | 0x13D                     | 1        |            | bConfigurationValue                                           |
+    //! | 0x13E                     | 1        |            | bNumConfigurations                                            |
+    //! | 0x13F                     | 1        | T          | bNumInterfaces                                                |
+    //! | 0x140                     |          | m_0        | From now on each interface is described T times:              |
     //! |                           | 1        |            | bInterfaceClass                                               |
-    //! | 0x145                     | 1        |            | bInterfaceSubClass                                            |
-    //! | 0x146                     | 1        |            | bInterfaceProtocol                                            |
-    //! | 0x8 + i*0x13C + m_(i-1)*4 |          |            | The second USB device starts at i=1 with the len(path) field. |
+    //! | 0x141                     | 1        |            | bInterfaceSubClass                                            |
+    //! | 0x142                     | 1        |            | bInterfaceProtocol                                            |
+    //! | 0x4 + i*0x13C + m_(i-1)*4 |          |            | The second USB device starts at i=1 with the len(path) field. |
+    //!
+    //! Non-zero status response:
+    //!
+    //! | Offset                    | Length   | Value      | Description                                                   |
+    //! |---------------------------|----------|------------|---------------------------------------------------------------|
+    //! | 0                         | 1        | 0x00       | Status: Nonzero status                                        |
+    //! | 1                         | 1        |            | Major number (only if status == VersionMismatch)              |
+    //! | 2                         | 1        |            | Minor number (only if status == VersionMismatch)              |
+    //! | 3                         | 3        |            | Patch number (only if status == VersionMismatch)              |
+    //!
+    //! Response::BorrowDevice:
+    //!
+    //! | Offset                    | Length   | Value      | Description                                                   |
+    //! |---------------------------|----------|------------|---------------------------------------------------------------|
+    //! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
+    //!
+    //!
 
     use thiserror::Error;
-    use zerocopy::
-        network_endian::{U16, U32}
-    ;
+    use zerocopy::network_endian::{U16, U32};
     use zerocopy_derive::*;
 
     use crate::GetSliceLen;
+
+    pub mod urb {}
 
     #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
     #[repr(C)]
@@ -247,6 +186,24 @@ pub mod msg {
             }
         }
     }
+
+    pub trait SendUsbDeviceInfo {
+        fn path(&self) -> &lstr::LimitedStr<256>;
+        fn bus_id(&self) -> &lstr::LimitedStr<32>;
+        fn busnum(&self) -> U32;
+        fn devnum(&self) -> U32;
+        fn speed(&self) -> U32;
+        fn id_vendor(&self) -> U16;
+        fn id_product(&self) -> U16;
+        fn bcd_device(&self) -> U16;
+        fn b_device_class(&self) -> u8;
+        fn b_device_subclass(&self) -> u8;
+        fn b_device_protocol(&self) -> u8;
+        fn b_configuration_value(&self) -> u8;
+        fn b_num_configurations(&self) -> u8;
+        fn b_num_interfaces(&self) -> u8;
+        fn interfaces(&self) -> impl ExactSizeIterator<Item = UsbInterfaceInfo>;
+    }
 }
 
 pub mod data {
@@ -267,12 +224,12 @@ pub mod data {
         io::Error::from(io::ErrorKind::InvalidData)
     }
 
-    pub struct IterDstMut<'a, T: ?Sized + 'a> {
+    pub struct IterMutDst<'a, T: ?Sized + 'a> {
         buf: &'a mut [u8],
         _p: PhantomData<&'a mut T>,
     }
 
-    impl<'a, T> Iterator for IterDstMut<'a, T>
+    impl<'a, T> Iterator for IterMutDst<'a, T>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
@@ -336,6 +293,12 @@ pub mod data {
     }
 
     impl Ring {
+        pub fn with_capacity(cap: usize) -> Self {
+            Self {
+                buf: BytesMut::with_capacity(cap),
+            }
+        }
+
         pub fn peek<T>(&self) -> io::Result<&T>
         where
             T: TryFromBytes + KnownLayout + Immutable,
@@ -450,11 +413,11 @@ pub mod data {
                 .map_while(|chunk| T::try_mut_from_bytes(chunk).ok())
         }
 
-        pub fn iter_mut_dst<'a, T>(&'a mut self) -> IterDstMut<'a, T>
+        pub fn iter_mut_dst<'a, T>(&'a mut self) -> IterMutDst<'a, T>
         where
             T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
         {
-            IterDstMut {
+            IterMutDst {
                 buf: &mut self.buf,
                 _p: PhantomData,
             }
@@ -481,7 +444,6 @@ pub const QUSB_VER: msg::Version = msg::Version {
 };
 
 pub const BUS_ID_SIZE: usize = 32;
-pub const VERSION: Version = Version(0x0200);
 
 /// You received a DST from the internet in the
 /// form of bytes, and you want to find out the
@@ -519,81 +481,6 @@ where
     /// - `buf` may not be exactly the length of
     ///   the DST and its trailing slice.
     fn get_slice_len(buf: &[u8]) -> Option<usize>;
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Version(u16);
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#06x}", self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum Request {
-    ListUsbDevices,
-    Borrow(UsbDeviceId),
-}
-
-pub type Response<T> = Result<T, Error>;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct UsbDeviceId {
-    pub bus_number: u8,
-    pub device_addr: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-#[repr(transparent)]
-pub struct BusId<'a>(pub std::borrow::Cow<'a, lstr::LimitedStr<32>>);
-
-impl Deref for BusId<'_> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.deref()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsbDeviceInfo<'a> {
-    pub id: UsbDeviceId,
-    pub bus_id: BusId<'a>,
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub class: u8,
-    pub subclass: u8,
-    pub protocol: u8,
-    pub interfaces: Vec<InterfaceInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InterfaceInfo {
-    pub interface_number: u8,
-    pub class: u8,
-    pub subclass: u8,
-    pub protocol: u8,
-}
-
-#[derive(Debug, Error, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Error {
-    #[error("request failed")]
-    Failed = 1,
-    #[error("device busy (exported)")]
-    DevBusy,
-    #[error("device in error state")]
-    DevErr,
-    #[error("device not found")]
-    NoDev,
-    #[error("unexpected request")]
-    UnexpectedReq,
-    #[error("unexpected request")]
-    UnexpectedResp,
-    #[error("unexpected version - client: {client}, server: {server}")]
-    VersionMismatch { client: Version, server: Version },
 }
 
 /*
