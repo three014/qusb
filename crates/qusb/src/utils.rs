@@ -1,6 +1,6 @@
 use crate::rustls;
 use nohash_hasher::BuildNoHashHasher;
-use std::{collections::HashMap, hash::Hash, sync::Arc};
+use std::{collections::HashMap, future::Future, hash::Hash, io, sync::Arc};
 use tokio::sync::oneshot;
 
 pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
@@ -35,6 +35,18 @@ impl<S, R, E> Ctrl<S, R, E> {
         let (tx, rx) = oneshot::channel();
         let ctrl = Self { data, tx };
         (rx, ctrl)
+    }
+}
+
+pub trait CloseStream {
+    fn close(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+impl CloseStream for quinn::SendStream {
+    async fn close(&mut self) -> io::Result<()> {
+        self.finish().map_err(io::Error::from)?;
+        self.stopped().await.map_err(io::Error::from)?;
+        Ok(())
     }
 }
 

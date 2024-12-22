@@ -45,30 +45,29 @@ pub mod msg {
     //!
     //! | Offset                    | Length   | Value      | Description                                                   |
     //! |---------------------------|----------|------------|---------------------------------------------------------------|
-    //! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
-    //! | 1                         | 3        | 0x000000   | zeroed bytes for padding                                      |
-    //! | 4                         |          |            | From now on the devices are described, if any.                |
+    //! |                           | 1        | 0x00       | Status: 0 for OK                                              |
+    //! |                           | 3        | 0x000000   | zeroed bytes for padding                                      |
+    //! |                           |          |            | From now on the devices are described, if any.                |
     //! |                           | 2        | P          | len(path): The length of the next field in bytes.             |
-    //! | 0x6                       | 256      |            | path: Path of the device on the peer.                         |
-    //! | 0x106                     | 2        | I          | len(busid): The length of the next field in bytes.            |
-    //! | 0x108                     | 32       |            | busid: Bus ID of the USB device.                              |
-    //! | 0x128                     | 4        |            | busnum                                                        |
-    //! | 0x12C                     | 4        |            | devnum                                                        |
-    //! | 0x130                     | 4        |            | speed                                                         |
-    //! | 0x134                     | 2        |            | idVendor                                                      |
-    //! | 0x136                     | 2        |            | idProduct                                                     |
-    //! | 0x138                     | 2        |            | bcdDevice                                                     |
-    //! | 0x13A                     | 1        |            | bDeviceClass                                                  |
-    //! | 0x13B                     | 1        |            | bDeviceSubClass                                               |
-    //! | 0x13C                     | 1        |            | bDeviceProtocol                                               |
-    //! | 0x13D                     | 1        |            | bConfigurationValue                                           |
-    //! | 0x13E                     | 1        |            | bNumConfigurations                                            |
-    //! | 0x13F                     | 1        | T          | bNumInterfaces                                                |
-    //! | 0x140                     |          | m_0        | From now on each interface is described T times:              |
+    //! |                           | 256      |            | path: Path of the device on the peer.                         |
+    //! |                           | 1        | I          | len(busid): The length of the next field in bytes.            |
+    //! |                           | 32       |            | busid: Bus ID of the USB device.                              |
+    //! |                           | 1        |            | busnum                                                        |
+    //! |                           | 1        |            | devnum                                                        |
+    //! |                           | 4        |            | speed                                                         |
+    //! |                           | 2        |            | idVendor                                                      |
+    //! |                           | 2        |            | idProduct                                                     |
+    //! |                           | 2        |            | bcdDevice                                                     |
+    //! |                           | 1        |            | bDeviceClass                                                  |
+    //! |                           | 1        |            | bDeviceSubClass                                               |
+    //! |                           | 1        |            | bDeviceProtocol                                               |
+    //! |                           | 1        | T          | bNumInterfaces                                                |
+    //! |                           |          | m_0        | From now on each interface is described T times:              |
+    //! |                           | 1        |            | bInterfaceNumber
     //! |                           | 1        |            | bInterfaceClass                                               |
-    //! | 0x141                     | 1        |            | bInterfaceSubClass                                            |
-    //! | 0x142                     | 1        |            | bInterfaceProtocol                                            |
-    //! | 0x4 + i*0x13C + m_(i-1)*4 |          |            | The second USB device starts at i=1 with the len(path) field. |
+    //! |                           | 1        |            | bInterfaceSubClass                                            |
+    //! |                           | 1        |            | bInterfaceProtocol                                            |
+    //! |                           |          |            | The second USB device starts at i=1 with the len(path) field. |
     //!
     //! Non-zero status response:
     //!
@@ -93,7 +92,27 @@ pub mod msg {
 
     use crate::GetSliceLen;
 
-    pub mod urb {}
+    pub mod tx {
+        use zerocopy::network_endian::{U16, U32};
+
+        use super::UsbInterfaceInfo;
+
+        pub trait UsbDeviceInfo {
+            fn path(&self) -> &lstr::LimitedStr<256>;
+            fn bus_id(&self) -> &lstr::LimitedStr<32>;
+            fn busnum(&self) -> u8;
+            fn devnum(&self) -> u8;
+            fn speed(&self) -> U32;
+            fn id_vendor(&self) -> U16;
+            fn id_product(&self) -> U16;
+            fn bcd_device(&self) -> U16;
+            fn b_device_class(&self) -> u8;
+            fn b_device_subclass(&self) -> u8;
+            fn b_device_protocol(&self) -> u8;
+            fn b_num_interfaces(&self) -> u8;
+            fn interfaces(&self) -> &[UsbInterfaceInfo];
+        }
+    }
 
     #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
     #[repr(C)]
@@ -147,6 +166,7 @@ pub mod msg {
     #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
     #[repr(C)]
     pub struct UsbInterfaceInfo {
+        pub b_interface_number: u8,
         pub b_interface_class: u8,
         pub b_interface_subclass: u8,
         pub b_interface_protocol: u8,
@@ -157,10 +177,10 @@ pub mod msg {
     pub struct UsbDeviceInfo {
         pub path_len: U16,
         pub path: [u8; 256],
-        pub bus_id_len: U16,
+        pub bus_id_len: u8,
         pub bus_id: [u8; 32],
-        pub busnum: U32,
-        pub devnum: U32,
+        pub busnum: u8,
+        pub devnum: u8,
         pub speed: U32,
         pub id_vendor: U16,
         pub id_product: U16,
@@ -168,41 +188,23 @@ pub mod msg {
         pub b_device_class: u8,
         pub b_device_subclass: u8,
         pub b_device_protocol: u8,
-        pub b_configuration_value: u8,
-        pub b_num_configurations: u8,
-        pub b_num_interfaces: u8,
+        // pub b_configuration_value: u8, // TODO: Can't access without opening device on Linux
+        // pub b_num_configurations: u8, // TODO: Can't access...
+        pub b_num_interfaces: u8, // TODO: nusb returns a plain iterator that doesn't know its length
         pub interfaces: [UsbInterfaceInfo],
     }
 
     impl GetSliceLen for UsbDeviceInfo {
         fn get_slice_len(buf: &[u8]) -> Option<usize> {
-            let size_of_base = 316;
+            let size_of_base = 307;
             if buf.len() < size_of_base {
                 None
             } else {
-                let start = size_of_base - std::mem::size_of::<U16>();
-                let chunk = *buf[start..].first_chunk()?;
-                Some(U16::from_bytes(chunk).get() as usize)
+                let start = size_of_base - std::mem::size_of::<u8>();
+                let len = buf[start];
+                Some(len as usize)
             }
         }
-    }
-
-    pub trait SendUsbDeviceInfo {
-        fn path(&self) -> &lstr::LimitedStr<256>;
-        fn bus_id(&self) -> &lstr::LimitedStr<32>;
-        fn busnum(&self) -> U32;
-        fn devnum(&self) -> U32;
-        fn speed(&self) -> U32;
-        fn id_vendor(&self) -> U16;
-        fn id_product(&self) -> U16;
-        fn bcd_device(&self) -> U16;
-        fn b_device_class(&self) -> u8;
-        fn b_device_subclass(&self) -> u8;
-        fn b_device_protocol(&self) -> u8;
-        fn b_configuration_value(&self) -> u8;
-        fn b_num_configurations(&self) -> u8;
-        fn b_num_interfaces(&self) -> u8;
-        fn interfaces(&self) -> impl ExactSizeIterator<Item = UsbInterfaceInfo>;
     }
 }
 
@@ -257,7 +259,9 @@ pub mod data {
 
         fn next(&mut self) -> Option<Self::Item> {
             let len = T::get_slice_len(self.buf)?;
-            let (item, remaining) = T::try_ref_from_prefix_with_elems(self.buf, len).ok()?;
+            let (item, remaining) = T::try_ref_from_prefix_with_elems(self.buf, len)
+                // .inspect_err(|err| println!("{err}"))
+                .ok()?;
             self.buf = remaining;
             Some(item)
         }
@@ -288,6 +292,7 @@ pub mod data {
         }
     }
 
+    #[derive(Debug)]
     pub struct Ring {
         buf: BytesMut,
     }
@@ -433,6 +438,10 @@ pub mod data {
         pub fn try_consolidate(&mut self) {
             let size = self.buf.capacity() - self.buf.len();
             let _ = self.buf.try_reclaim(size);
+        }
+
+        pub fn len(&self) -> usize {
+            self.buf.len()
         }
     }
 }

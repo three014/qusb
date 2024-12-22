@@ -611,14 +611,13 @@ mod tests {
 
     #[tokio::test]
     #[tracing_test::traced_test]
+    #[should_panic(reason = "urb ctrl not complete")]
     async fn can_listen_for_work() {
         let mut controller = Controller::start(BoundedU8::new(8).unwrap()).unwrap();
 
         let (port, work_rx) = controller
             .register(RegisterPort::Any, DataRate::Full, |urb, ctrl| async move {
                 todo!("Figure out the fastest way to get the USB data from the other host");
-
-                Ok(())
             })
             .await
             .unwrap();

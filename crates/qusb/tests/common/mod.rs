@@ -1,4 +1,5 @@
 use quinn::rustls;
+use vhci::utils::BoundedU8;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -20,5 +21,6 @@ pub fn setup(addr: SocketAddr) -> (qusb::Client, qusb::Server) {
         client,
         Some(addr),
         quinn::TransportConfig::default(),
+        BoundedU8::new(4).unwrap()
     )
 }

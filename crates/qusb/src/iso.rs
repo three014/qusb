@@ -49,7 +49,7 @@ impl Demuxer {
 
         let mut mailer = SimpleMap::<NoHash<quinn::StreamId>, mpsc::Sender<Bytes>>::default();
 
-        enum Select {
+        enum Event {
             Register(Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>),
             Datagram(Bytes),
             Disconnect(Ctrl<quinn::StreamId, (), Infallible>),
@@ -59,20 +59,20 @@ impl Demuxer {
             let select = tokio::select! {
                 req = register_rx.recv() => {
                     if let Some(register) = req {
-                        Select::Register(register)
+                        Event::Register(register)
                     } else {
                         break;
                     }
                 }
                 datagram = conn.read_datagram() => {
                     match datagram {
-                        Ok(bytes) => Select::Datagram(bytes),
+                        Ok(bytes) => Event::Datagram(bytes),
                         Err(err) => return Err(std::io::Error::from(err)),
                     }
                 }
                 req = disconnect_rx.recv() => {
                     if let Some(disconnect) = req {
-                        Select::Disconnect(disconnect)
+                        Event::Disconnect(disconnect)
                     } else {
                         break;
                     }
@@ -80,14 +80,14 @@ impl Demuxer {
             };
 
             match select {
-                Select::Register(Ctrl { data: id, tx }) => {
+                Event::Register(Ctrl { data: id, tx }) => {
                     let (iso_tx, iso_rx) = mpsc::channel(32);
                     mailer.insert(NoHash(id), iso_tx);
                     if tx.send(Ok(iso_rx)).is_err() {
                         mailer.remove(&NoHash(id));
                     }
                 }
-                Select::Datagram(mut bytes) => {
+                Event::Datagram(mut bytes) => {
                     if let Ok((id, _)) = zerocopy::network_endian::U64::read_from_prefix(&bytes) {
                         bytes.advance(std::mem::size_of_val(&id));
                         let id = NoHash(quinn::StreamId(id.get()));
@@ -98,7 +98,7 @@ impl Demuxer {
                         }
                     }
                 }
-                Select::Disconnect(Ctrl { data: id, tx }) => {
+                Event::Disconnect(Ctrl { data: id, tx }) => {
                     mailer.remove(&NoHash(id));
                     let _ = tx.send(Ok(()));
                 }

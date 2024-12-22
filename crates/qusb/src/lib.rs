@@ -1,11 +1,12 @@
 use iso::{Demuxer, Handle};
+use proto::lstr;
 use proto::zerocopy::IntoBytes;
 use proto::{
     data::{IterDst, IterMutDst, Ring},
     msg,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use state2::{ClientReq, ServerLendDevice, ServerListDevices, ServerResp};
+use state::{ClientBorrowDevice, ClientReq, ServerLendDevice, ServerListDevices, ServerResp};
 use std::{
     future::Future,
     io,
@@ -17,25 +18,23 @@ use std::{
 };
 use tokio::sync::mpsc;
 use usb_ids::UsbIds;
+use utils::CloseStream;
 use vhci::utils::BoundedU8;
+use zerocopy::network_endian::{U16, U32};
 
 pub use quinn::rustls;
 pub use rcgen;
 
 mod dev;
 mod iso;
-mod state2 {
+mod state {
     use std::{future::Future, io};
 
     use proto::{data::Ring, msg};
     use tokio::io::{AsyncRead, AsyncWrite};
     use zerocopy::{network_endian::U16, IntoBytes};
 
-    use crate::{
-        dev,
-        iso,
-        Error,
-    };
+    use crate::{dev, iso, utils, Error};
 
     pub enum ClientReq {
         ListDevices,
@@ -76,9 +75,7 @@ mod state2 {
         W: AsyncWrite,
         R: AsyncRead,
     {
-        pub async fn run(self) {
-
-        }
+        pub async fn run(self) {}
     }
 
     pub enum ServerResp<W, R> {
@@ -127,25 +124,25 @@ mod state2 {
 
     impl<W> ServerListDevices<W>
     where
-        W: AsyncWrite,
+        W: AsyncWrite + utils::CloseStream + Unpin,
     {
-        pub async fn resp_list_devices<'a, F, Fut, I, T>(mut self, iter: F) -> Result<(), Error>
+        pub async fn resp_list_devices<'a, I, T>(
+            self,
+            iter: impl Fn() -> io::Result<I>,
+        ) -> Result<(), Error>
         where
-            W: AsyncWrite + Unpin,
-            F: FnOnce() -> Fut,
-            Fut: Future<Output = io::Result<I>>,
-            I: Iterator<Item = &'a T>,
-            T: msg::SendUsbDeviceInfo + 'a,
+            I: Iterator<Item = T>,
+            T: msg::tx::UsbDeviceInfo,
         {
             use tokio::io::AsyncWriteExt;
-            let tx = &mut self.tx;
+            let mut tx = self.tx;
 
-            let devices = match iter().await {
+            let devices = match iter() {
                 Ok(devices) => {
-                    tx.write(msg::Status::Success.as_bytes()).await?;
-                    tx.write(&[0, 0, 0]).await?;
+                    tx.write_all(msg::Status::Success.as_bytes()).await?;
+                    tx.write_all(&[0, 0, 0]).await?;
                     devices
-                },
+                }
                 Err(err) => {
                     tx.write_all(msg::Status::Failed.as_bytes()).await?;
                     return Err(err.into());
@@ -154,16 +151,26 @@ mod state2 {
 
             for usb in devices {
                 let path_len = U16::new(usb.path().len() as u16);
-                let bus_id_len = U16::new(usb.bus_id().len() as u16);
+                let bus_id_len = usb.bus_id().len() as u8;
                 let scratch = [0; 256];
                 let b_scratch = [0; 32];
+
+                assert_eq!(
+                    path_len.get() as usize + (&scratch[path_len.get() as usize..]).len(),
+                    256
+                );
+
+                assert_eq!(
+                    bus_id_len as usize + (&b_scratch[bus_id_len as usize..]).len(),
+                    32
+                );
 
                 tx.write_all(path_len.as_bytes()).await?;
                 tx.write_all(usb.path().as_bytes()).await?;
                 tx.write_all(&scratch[path_len.get() as usize..]).await?;
                 tx.write_all(bus_id_len.as_bytes()).await?;
                 tx.write_all(usb.bus_id().as_bytes()).await?;
-                tx.write_all(&b_scratch[bus_id_len.get() as usize..])
+                tx.write_all(&b_scratch[bus_id_len as usize..])
                     .await?;
                 tx.write_all(usb.busnum().as_bytes()).await?;
                 tx.write_all(usb.devnum().as_bytes()).await?;
@@ -174,8 +181,6 @@ mod state2 {
                 tx.write_all(usb.b_device_class().as_bytes()).await?;
                 tx.write_all(usb.b_device_subclass().as_bytes()).await?;
                 tx.write_all(usb.b_device_protocol().as_bytes()).await?;
-                tx.write_all(usb.b_configuration_value().as_bytes()).await?;
-                tx.write_all(usb.b_num_configurations().as_bytes()).await?;
                 tx.write_all(usb.b_num_interfaces().as_bytes()).await?;
 
                 for int in usb.interfaces() {
@@ -183,7 +188,7 @@ mod state2 {
                 }
             }
 
-            Ok(())
+            tx.close().await.map_err(Error::from)
         }
     }
 }
@@ -239,6 +244,7 @@ impl From<quinn::ClosedStream> for Error {
     }
 }
 
+#[derive(Debug)]
 pub struct UsbDevices(Ring);
 
 impl UsbDevices {
@@ -277,13 +283,15 @@ fn init_iso(conn: quinn::Connection) -> Handle {
 pub struct Session {
     conn: quinn::Connection,
     iso: Arc<Mutex<Option<Handle>>>,
+    dev: dev::Controller,
 }
 
 impl Session {
-    fn new(conn: quinn::Connection) -> Self {
+    fn new(conn: quinn::Connection, dev: dev::Controller) -> Self {
         Self {
             conn,
             iso: Arc::new(Mutex::new(None)),
+            dev,
         }
     }
 
@@ -291,6 +299,7 @@ impl Session {
         self.conn.remote_address()
     }
 
+    #[tracing::instrument(skip_all, level = "trace")]
     pub async fn accept_stream(
         &self,
     ) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>, Error> {
@@ -304,8 +313,7 @@ impl Session {
             tx.write_all(msg::Status::VersionMismatch.as_bytes())
                 .await?;
             tx.write_all(proto::QUSB_VER.as_bytes()).await?;
-            tx.finish()?;
-            tx.stopped().await?;
+            tx.close().await?;
             return Err(Error::VersionMismatch(version));
         }
 
@@ -330,13 +338,16 @@ impl Session {
                     Some((iso_tx, iso_rx)) => ServerResp::BorrowDevice(ServerLendDevice::new(
                         tx, rx, buf, iso_tx, iso_rx, device,
                     )),
+                    // One way this can happen is if the demuxer wasn't finished
+                    // when we checked, but then finished right after.
+                    // TODO: Have this process run in a short loop so we can try to
+                    // initialize the demuxer again.
                     None => return Err(Error::Io(io::ErrorKind::BrokenPipe.into())),
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {
                 tx.write_all(msg::Status::Unexpected.as_bytes()).await?;
-                tx.finish()?;
-                tx.stopped().await?;
+                tx.close().await?;
                 return Err(err.into());
             }
             Err(err) => return Err(err.into()),
@@ -345,33 +356,34 @@ impl Session {
         Ok(req)
     }
 
-    // // #[tracing::instrument(skip_all, level = "trace")]
-    // pub async fn open_stream(&self) -> Result<State<state::ClientReq>, Error> {
-    //     let (tx, rx) = self.conn.open_bi().await?;
-
-    //     let iso_handle = self
-    //         .iso
-    //         .lock()
-    //         .unwrap()
-    //         .get_or_insert_with(|| init_iso(self.conn.clone()));
-
-    //     let idle = State::new_client(tx, rx);
-    //     let state = idle.verify_version().await?;
-    //     Ok(state)
-    // }
-
+    #[tracing::instrument(skip_all, level = "trace")]
     pub async fn req_list_devices(&self) -> Result<UsbDevices, Error> {
-        let (mut tx, mut rx) = self.conn.open_bi().await?;
+        let (mut tx, mut rx) = self
+            .conn
+            .open_bi()
+            .await
+            .inspect_err(|err| tracing::error!("{err}"))?;
+        tracing::trace!("Established stream with stream id {:?}", tx.id());
         let mut buf = Ring::with_capacity(1024);
 
         let version = proto::QUSB_VER;
         let req = msg::Request::ListDevices;
 
-        tx.write_all(version.as_bytes()).await?;
-        tx.write_all(req.as_bytes()).await?;
+        tx.write_all(version.as_bytes())
+            .await
+            .inspect_err(|err| tracing::error!("{err}"))?;
+        tx.write_all(req.as_bytes())
+            .await
+            .inspect_err(|err| tracing::error!("{err}"))?;
         drop(tx);
 
-        while 0 == buf.read_into_from_reader(&mut rx).await? {}
+        while 0
+            == buf
+                .read_into_from_reader(&mut rx)
+                .await
+                .inspect_err(|err| tracing::error!("{err}"))?
+        {}
+        tracing::trace!("Finished reading from remote stream");
         let status = buf.read()?;
         match status {
             msg::Status::Success => {
@@ -393,8 +405,65 @@ impl Session {
         Ok(UsbDevices(buf))
     }
 
-    pub async fn borrow_device(&self, id: msg::UsbDeviceId) -> Result<(), Error> {
-        todo!()
+    pub async fn borrow_device(
+        &self,
+        id: msg::UsbDeviceId,
+    ) -> Result<ClientBorrowDevice<quinn::SendStream, quinn::RecvStream>, Error> {
+        let (mut tx, mut rx) = self.conn.open_bi().await?;
+        let mut buf = Ring::with_capacity(1024);
+
+        let version = proto::QUSB_VER;
+        let req = msg::Request::BorrowDevice;
+
+        tx.write_all(version.as_bytes()).await?;
+        tx.write_all(req.as_bytes()).await?;
+        tx.write_all(id.as_bytes()).await?;
+
+        while buf.len() < std::mem::size_of::<msg::Status>() {
+            buf.read_into_from_reader(&mut rx).await?;
+        }
+
+        let status = buf.read()?;
+        match status {
+            msg::Status::Success => {}
+            msg::Status::Failed => return Err(Error::ReqFailed),
+            msg::Status::DevBusy => todo!(),
+            msg::Status::DevErr => todo!(),
+            msg::Status::NoDev => {
+                return Err(Error::DevNotFound(id));
+            }
+            msg::Status::Unexpected => {
+                return Err(io::Error::from(io::ErrorKind::InvalidData).into())
+            }
+            msg::Status::VersionMismatch => {
+                let their_version = buf.read::<msg::Version>()?;
+                return Err(Error::VersionMismatch(their_version));
+            }
+        }
+
+        let mut slot = self.iso.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_none_or(|&Handle { ref handle, .. }| handle.is_finished())
+        {
+            *slot = None;
+        }
+
+        let client = match slot
+            .get_or_insert_with(|| init_iso(self.conn.clone()))
+            .make_channel(tx.id())
+        {
+            Some((iso_tx, iso_rx)) => {
+                ClientBorrowDevice::new(tx, rx, buf, iso_tx, iso_rx, self.dev.clone())
+            }
+            // One way this can happen is if the demuxer wasn't finished
+            // when we checked, but then finished right after.
+            // TODO: Have this process run in a short loop so we can try to
+            // initialize the demuxer again.
+            None => return Err(Error::Io(io::ErrorKind::BrokenPipe.into())),
+        };
+
+        Ok(client)
     }
 }
 
@@ -408,7 +477,73 @@ impl Client {
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Result<Session, Error> {
         let conn = self.endpoint.connect(peer_addr, peer_name).unwrap().await?;
-        Ok(Session::new(conn))
+        Ok(Session::new(conn, self.dev.clone()))
+    }
+}
+
+#[derive(Debug)]
+pub struct UsbDeviceWrapper(nusb::DeviceInfo, Box<[msg::UsbInterfaceInfo]>);
+
+impl msg::tx::UsbDeviceInfo for UsbDeviceWrapper {
+    fn path(&self) -> &lstr::LimitedStr<256> {
+        self.0
+            .sysfs_path()
+            .to_str()
+            .and_then(|s| lstr::LimitedStr::from_str(s))
+            .unwrap()
+    }
+
+    fn bus_id(&self) -> &lstr::LimitedStr<32> {
+        self.0
+            .sysfs_path()
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(|s| lstr::LimitedStr::from_str(s))
+            .unwrap()
+    }
+
+    fn busnum(&self) -> u8 {
+        self.0.bus_number()
+    }
+
+    fn devnum(&self) -> u8 {
+        self.0.device_address()
+    }
+
+    fn speed(&self) -> U32 {
+        U32::new(self.0.speed().unwrap() as u32)
+    }
+
+    fn id_vendor(&self) -> U16 {
+        U16::new(self.0.vendor_id())
+    }
+
+    fn id_product(&self) -> U16 {
+        U16::new(self.0.product_id())
+    }
+
+    fn bcd_device(&self) -> U16 {
+        U16::new(self.0.device_version())
+    }
+
+    fn b_device_class(&self) -> u8 {
+        self.0.class()
+    }
+
+    fn b_device_subclass(&self) -> u8 {
+        self.0.subclass()
+    }
+
+    fn b_device_protocol(&self) -> u8 {
+        self.0.protocol()
+    }
+
+    fn b_num_interfaces(&self) -> u8 {
+        self.1.len() as u8
+    }
+
+    fn interfaces(&self) -> &[msg::UsbInterfaceInfo] {
+        &self.1
     }
 }
 
@@ -419,15 +554,8 @@ pub struct Server {
 }
 
 impl Server {
-    // #[tracing::instrument(skip_all, level = "debug")]
-    pub fn serve<F, Fut>(self, session_handler: F) -> ServerHandle
-    where
-        F: FnOnce(quinn::SendStream, quinn::RecvStream, tokio_util::sync::CancellationToken) -> Fut
-            + Clone
-            + Send
-            + 'static,
-        Fut: Future<Output = Result<(), Error>> + Send,
-    {
+    #[tracing::instrument(skip_all, level = "trace")]
+    pub fn serve(self) -> ServerHandle {
         let cancel_for_handle = tokio_util::sync::CancellationToken::new();
         let cancel_for_serve = cancel_for_handle.clone();
         let handle = tokio::spawn(async move {
@@ -444,37 +572,74 @@ impl Server {
                 set.join_next_with_id().await
             }
 
-            loop {
-                tokio::select! {
-                    incoming = self.endpoint.accept() => {
-                        if let Some(incoming) = incoming {
-                            let cancel_for_session = cancel_for_serve.clone();
-                            let handle = session_handler.clone();
-                            tracing::debug!("Incoming connection from {}", incoming.remote_address());
-                            set.spawn(async move {
-                                let conn = incoming.await?;
-                                tracing::trace!("Established new session with {} - RTT {:?}", conn.remote_address(), conn.rtt());
-                                let session = Session::new(conn);
-                                // handle(session, cancel_for_session).await
+            enum Event {
+                Incoming(Option<quinn::Incoming>),
+                Cancel,
+                MaybeCompletedTask(
+                    Option<Result<(tokio::task::Id, Result<(), Error>), tokio::task::JoinError>>,
+                ),
+            }
 
-                                todo!()
-                            });
-                        } else {
-                            break;
-                        }
+            loop {
+                let event = tokio::select! {
+                    incoming = self.endpoint.accept() => {
+                        Event::Incoming(incoming)
                     },
                     _ = cancel_for_serve.cancelled() => {
-                        break;
+                        Event::Cancel
                     },
-
                     maybe_complete = check_for_completed_task(&mut set) => {
-                        match maybe_complete {
-                            Some(Ok((id, Ok(_)))) => tracing::info!("Session {id} completed successfully"),
-                            Some(Ok((id, Err(cause)))) => tracing::warn! { %cause, "Session {id} failed" },
-                            Some(Err(_)) => todo!(),
-                            _ => (),
-                        }
+                        Event::MaybeCompletedTask(maybe_complete)
                     }
+                };
+
+                match event {
+                    Event::Incoming(Some(incoming)) => {
+                        // let cancel_for_session = cancel_for_serve.clone();
+                        let vhci = self.dev.clone();
+                        tracing::debug!("Incoming connection from {}", incoming.remote_address());
+                        set.spawn(async move {
+                            let conn = incoming.await?;
+                            tracing::trace!(
+                                "Established new session with {} - RTT {:?}",
+                                conn.remote_address(),
+                                conn.rtt()
+                            );
+                            let session = Session::new(conn, vhci);
+                            match session.accept_stream().await? {
+                                ServerResp::ListDevices(state) => {
+                                    state
+                                        .resp_list_devices(|| {
+                                            Ok(nusb::list_devices()?.map(|dev| {
+                                                let interfaces = dev
+                                                    .interfaces()
+                                                    .map(|int| msg::UsbInterfaceInfo {
+                                                        b_interface_number: int.interface_number(),
+                                                        b_interface_class: int.class(),
+                                                        b_interface_subclass: int.subclass(),
+                                                        b_interface_protocol: int.protocol(),
+                                                    })
+                                                    .collect();
+                                                UsbDeviceWrapper(dev, interfaces)
+                                            }))
+                                        })
+                                        .await
+                                }
+                                ServerResp::BorrowDevice(state) => todo!(),
+                            }
+                        });
+                    }
+                    Event::Incoming(None) | Event::Cancel => break,
+                    Event::MaybeCompletedTask(task) => match task {
+                        Some(Ok((id, Ok(_)))) => {
+                            tracing::info!("Session {id} completed successfully")
+                        }
+                        Some(Ok((id, Err(cause)))) => {
+                            tracing::warn! { %cause, "Session {id} failed" }
+                        }
+                        Some(Err(_)) => todo!(),
+                        _ => (),
+                    },
                 }
             }
 
