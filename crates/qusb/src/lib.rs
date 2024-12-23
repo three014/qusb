@@ -170,8 +170,7 @@ mod state {
                 tx.write_all(&scratch[path_len.get() as usize..]).await?;
                 tx.write_all(bus_id_len.as_bytes()).await?;
                 tx.write_all(usb.bus_id().as_bytes()).await?;
-                tx.write_all(&b_scratch[bus_id_len as usize..])
-                    .await?;
+                tx.write_all(&b_scratch[bus_id_len as usize..]).await?;
                 tx.write_all(usb.busnum().as_bytes()).await?;
                 tx.write_all(usb.devnum().as_bytes()).await?;
                 tx.write_all(usb.speed().as_bytes()).await?;
@@ -547,6 +546,48 @@ impl msg::tx::UsbDeviceInfo for UsbDeviceWrapper {
     }
 }
 
+struct ReqHandler {
+    vhci: dev::Controller,
+    incoming: quinn::Incoming,
+}
+
+impl ReqHandler {
+    const fn new(vhci: dev::Controller, incoming: quinn::Incoming) -> Self {
+        Self { vhci, incoming }
+    }
+
+    async fn run(self) -> Result<(), Error> {
+        let conn = self.incoming.await?;
+        tracing::trace!(
+            "Established new session with {} - RTT {:?}",
+            conn.remote_address(),
+            conn.rtt()
+        );
+        let session = Session::new(conn, self.vhci);
+        match session.accept_stream().await? {
+            ServerResp::ListDevices(state) => {
+                state
+                    .resp_list_devices(|| {
+                        Ok(nusb::list_devices()?.map(|dev| {
+                            let interfaces = dev
+                                .interfaces()
+                                .map(|int| msg::UsbInterfaceInfo {
+                                    b_interface_number: int.interface_number(),
+                                    b_interface_class: int.class(),
+                                    b_interface_subclass: int.subclass(),
+                                    b_interface_protocol: int.protocol(),
+                                })
+                                .collect();
+                            UsbDeviceWrapper(dev, interfaces)
+                        }))
+                    })
+                    .await
+            }
+            ServerResp::BorrowDevice(state) => todo!(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -595,51 +636,18 @@ impl Server {
 
                 match event {
                     Event::Incoming(Some(incoming)) => {
-                        // let cancel_for_session = cancel_for_serve.clone();
-                        let vhci = self.dev.clone();
                         tracing::debug!("Incoming connection from {}", incoming.remote_address());
-                        set.spawn(async move {
-                            let conn = incoming.await?;
-                            tracing::trace!(
-                                "Established new session with {} - RTT {:?}",
-                                conn.remote_address(),
-                                conn.rtt()
-                            );
-                            let session = Session::new(conn, vhci);
-                            match session.accept_stream().await? {
-                                ServerResp::ListDevices(state) => {
-                                    state
-                                        .resp_list_devices(|| {
-                                            Ok(nusb::list_devices()?.map(|dev| {
-                                                let interfaces = dev
-                                                    .interfaces()
-                                                    .map(|int| msg::UsbInterfaceInfo {
-                                                        b_interface_number: int.interface_number(),
-                                                        b_interface_class: int.class(),
-                                                        b_interface_subclass: int.subclass(),
-                                                        b_interface_protocol: int.protocol(),
-                                                    })
-                                                    .collect();
-                                                UsbDeviceWrapper(dev, interfaces)
-                                            }))
-                                        })
-                                        .await
-                                }
-                                ServerResp::BorrowDevice(state) => todo!(),
-                            }
-                        });
+                        set.spawn(ReqHandler::new(self.dev.clone(), incoming).run());
                     }
                     Event::Incoming(None) | Event::Cancel => break,
-                    Event::MaybeCompletedTask(task) => match task {
-                        Some(Ok((id, Ok(_)))) => {
-                            tracing::info!("Session {id} completed successfully")
-                        }
-                        Some(Ok((id, Err(cause)))) => {
-                            tracing::warn! { %cause, "Session {id} failed" }
-                        }
-                        Some(Err(_)) => todo!(),
-                        _ => (),
-                    },
+                    Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
+                        tracing::info!("session {id} completed successfully")
+                    }
+                    Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
+                        tracing::warn! { %cause, "session {id} failed" }
+                    }
+                    Event::MaybeCompletedTask(Some(Err(_err))) => todo!(),
+                    _ => (),
                 }
             }
 

@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    io,
     ops::ControlFlow,
     sync::{Arc, Mutex},
 };
@@ -204,7 +205,7 @@ struct Demuxer {
             (
                 Port,
                 mpsc::Receiver<Work>,
-                oneshot::Receiver<std::io::Result<UrbControl>>,
+                oneshot::Receiver<io::Result<UrbControl>>,
             ),
         >,
     >,
@@ -213,7 +214,28 @@ struct Demuxer {
 }
 
 impl Demuxer {
-    async fn run(self) -> std::io::Result<()> {
+    fn new(
+        register_rx: mpsc::Receiver<
+            Ctrl<
+                Register,
+                (
+                    Port,
+                    mpsc::Receiver<Work>,
+                    oneshot::Receiver<io::Result<UrbControl>>,
+                ),
+            >,
+        >,
+        disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
+        vhci: vhci::Controller,
+    ) -> Self {
+        Self {
+            register_rx,
+            disconnect_rx,
+            vhci,
+        }
+    }
+
+    async fn run(self) -> io::Result<()> {
         let Self {
             mut register_rx,
             mut disconnect_rx,
@@ -232,111 +254,146 @@ impl Demuxer {
             port_connect_tx: mpsc::Sender<Ctrl<(), UrbControl>>,
         }
 
-        let mut ctx = Context {
+        enum Event {
+            Register(
+                Option<
+                    Ctrl<
+                        Register,
+                        (
+                            Port,
+                            mpsc::Receiver<Work>,
+                            oneshot::Receiver<io::Result<UrbControl>>,
+                        ),
+                    >,
+                >,
+            ),
+            Disconnect(Option<Ctrl<Port>>),
+            Work(Work),
+        }
+
+        struct Ctx<T> {
+            ctx: Box<Context>,
+            cont: T,
+        }
+
+        enum Continuation {
+            Register(
+                (
+                    io::Result<Port>,
+                    oneshot::Sender<
+                        io::Result<(
+                            Port,
+                            mpsc::Receiver<Work>,
+                            oneshot::Receiver<io::Result<UrbControl>>,
+                        )>,
+                    >,
+                ),
+            ),
+            Other,
+            Disconnect((io::Result<()>, oneshot::Sender<Result<(), io::Error>>)),
+        }
+
+        let mut ctx = Box::new(Context {
             vhci,
             mailer,
             port_connect_tx,
-        };
+        });
 
         loop {
-            match tokio::select! {
+            let event = tokio::select! {
                 req = register_rx.recv() => {
-                    tokio::task::spawn_blocking(move || {
-                        let maybe_connected = if let Some(Ctrl {
-                            data: Register {
-                                port: RegisterPort::Any,
-                                data_rate
-                            },
-                            tx
-                        }) = req {
-                            (ctx.vhci.port_connect_any(data_rate), tx)
-                        } else if let Some(Ctrl {
-                            data: Register {
-                                port: RegisterPort::Port(port),
-                                data_rate,
-                            },
-                            tx
-                        }) = req {
-                            (ctx.vhci.port_connect(port, data_rate).map(|_| port), tx)
-                        } else {
-                            return ControlFlow::Break(ctx);
-                        };
-
-
-                        match maybe_connected {
-                            (Ok(port), tx) => {
-
-                                // Get the ctrl URB from recv_work
-                                let (ctrl_rx, get_urb) = Ctrl::<_, UrbControl>::new(());
-                                if ctx.port_connect_tx.blocking_send(get_urb).is_err() {
-                                    return ControlFlow::Break(ctx);
-                                }
-
-                                let (work_tx, work_rx) = mpsc::channel(32);
-                                ctx.mailer.insert_tx(port, work_tx);
-                                if tx.send(Ok((port, work_rx, ctrl_rx))).is_err() {
-                                    ctx.mailer.remove_by_port(&port);
-                                    if let Err(_err) = ctx.vhci.port_disconnect(port) {
-                                        // return ControlFlow::Break((vhci, mailer));
-                                        //
-                                        // TODO: Figure out what errors we should stop the
-                                        //       vhci over
-                                    }
-                                }
-                            }
-                            (Err(err), tx) => {
-                                let _ = tx.send(Err(err));
-                            }
-
-                        }
-
-                        ControlFlow::Continue(ctx)
-                    }).await.unwrap()
+                    Event::Register(req)
                 }
                 req = disconnect_rx.recv() => {
-                    tokio::task::spawn_blocking(move || {
-                        let (result, tx) = if let Some(Ctrl {
-                            data: port,
-                            tx
-                        }) = req {
-                            ctx.mailer.remove_by_port(&port);
-                            (ctx.vhci.port_disconnect(port), tx)
-                        } else {
-                            return ControlFlow::Break(ctx);
-                        };
-
-                        let _ = tx.send(result);
-
-                        ControlFlow::Continue(ctx)
-                    }).await.unwrap()
+                    Event::Disconnect(req)
                 }
                 work = work_rx.recv() => {
-                    let work = work.expect(
-                        "to get here, the work recv thread panicked or we closed channels in the wrong order"
-                    );
+                    Event::Work(work.expect("we can only get here if we shutdown in the wrong order"))
+                }
+            };
 
-                    trace!("{work:?}");
-
+            let cont = match event {
+                Event::Register(Some(Ctrl {
+                    data:
+                        Register {
+                            port: RegisterPort::Any,
+                            data_rate,
+                        },
+                    tx,
+                })) => tokio::task::spawn_blocking(move || Ctx {
+                    cont: Continuation::Register((ctx.vhci.port_connect_any(data_rate), tx)),
+                    ctx,
+                })
+                .await
+                .unwrap(),
+                Event::Register(Some(Ctrl {
+                    data:
+                        Register {
+                            port: RegisterPort::Port(port),
+                            data_rate,
+                        },
+                    tx,
+                })) => tokio::task::spawn_blocking(move || Ctx {
+                    cont: Continuation::Register((
+                        ctx.vhci.port_connect(port, data_rate).map(|_| port),
+                        tx,
+                    )),
+                    ctx,
+                })
+                .await
+                .unwrap(),
+                Event::Disconnect(Some(Ctrl { data: port, tx })) => {
+                    tokio::task::spawn_blocking(move || {
+                        ctx.mailer.remove_by_port(&port);
+                        Ctx {
+                            cont: Continuation::Disconnect((ctx.vhci.port_disconnect(port), tx)),
+                            ctx,
+                        }
+                    })
+                    .await
+                    .unwrap()
+                }
+                Event::Work(work) => {
                     let next = ctx.mailer.get_tx_from_work(&work).map(|tx| (work, tx));
                     if let Some((work, tx)) = next {
                         if tx.send(work).await.is_err() {
                             ctx.mailer.remove_by_tx(&tx);
                         }
-                        ControlFlow::Continue(ctx)
-                    } else {
-                        // Even though we didn't actually mail anything, we removed
-                        // a work item from the queue, so that still counts as progress.
-                        ControlFlow::Continue(ctx)
+                    }
+                    Ctx {
+                        ctx,
+                        cont: Continuation::Other,
                     }
                 }
-            } {
-                ControlFlow::Continue(context) => {
-                    ctx = context;
+                Event::Register(None) | Event::Disconnect(None) => break,
+            };
+
+            let Ctx { ctx: c, cont } = cont;
+            ctx = c;
+            match cont {
+                Continuation::Register((Ok(port), tx)) => {
+                    let (ctrl_rx, get_urb) = Ctrl::new(());
+                    if ctx.port_connect_tx.send(get_urb).await.is_err() {
+                        break;
+                    }
+
+                    let (work_tx, work_rx) = mpsc::channel(32);
+                    if tx.send(Ok((port, work_rx, ctrl_rx))).is_err() {
+                        ctx.mailer.remove_by_port(&port);
+                        if let Err(_err) = ctx.vhci.port_disconnect(port) {
+                            todo!("find out why this might happen")
+                        }
+                    }
+
+                    // TODO: continue ctrl urb stuff here
                 }
-                ControlFlow::Break(context) => {
-                    ctx = context;
-                    break;
+                Continuation::Register((Err(err), tx)) => {
+                    let _ = tx.send(Err(err));
                 }
+                Continuation::Disconnect((result, tx)) => {
+                    let _ = tx.send(result);
+                }
+                Continuation::Other => (),
             }
         }
 
@@ -344,7 +401,7 @@ impl Demuxer {
             mut vhci,
             mailer,
             port_connect_tx,
-        } = ctx;
+        } = *ctx;
 
         trace!("disconnecting leftover devices and closing work_rx");
         for port in mailer.port_to_work.into_keys() {
@@ -364,14 +421,14 @@ impl Demuxer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    handle: Arc<Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>>,
+    handle: Arc<Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>>,
     register_tx: mpsc::Sender<
         Ctrl<
             Register,
             (
                 Port,
                 mpsc::Receiver<Work>,
-                oneshot::Receiver<std::io::Result<UrbControl>>,
+                oneshot::Receiver<io::Result<UrbControl>>,
             ),
         >,
     >,
@@ -381,18 +438,13 @@ pub struct Controller {
 
 impl Controller {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn start(num_ports: BoundedU8<1, 32>) -> std::io::Result<Self> {
+    pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
         let (register_tx, register_rx) = mpsc::channel(4);
         let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
         let handle = Arc::new(Mutex::new(Some(tokio::spawn(
-            Demuxer {
-                register_rx,
-                disconnect_rx,
-                vhci,
-            }
-            .run(),
+            Demuxer::new(register_rx, disconnect_rx, vhci).run(),
         ))));
 
         Ok(Self {
@@ -409,10 +461,10 @@ impl Controller {
         port: RegisterPort,
         data_rate: DataRate,
         handle_ctrl: F,
-    ) -> std::io::Result<(Port, mpsc::Receiver<Work>)>
+    ) -> io::Result<(Port, mpsc::Receiver<Work>)>
     where
         F: FnOnce(UrbControl, &mut Self) -> Fut,
-        Fut: Future<Output = std::io::Result<()>>,
+        Fut: Future<Output = io::Result<()>>,
     {
         let (rx, register) = Ctrl::new(Register { port, data_rate });
 
@@ -455,7 +507,7 @@ impl Controller {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn fetch_data(&self, urb: &mut Urb) -> std::io::Result<()> {
+    pub async fn fetch_data(&self, urb: &mut Urb) -> io::Result<()> {
         if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
             tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
         {
@@ -466,7 +518,7 @@ impl Controller {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn disconnect(&mut self, port: Port) -> std::io::Result<()> {
+    pub async fn disconnect(&mut self, port: Port) -> io::Result<()> {
         let (rx, disconnect) = Ctrl::new(port);
 
         self.disconnect_tx.send(disconnect).await.unwrap();
@@ -474,7 +526,7 @@ impl Controller {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn reset_done(&self, port: Port, enable: bool) -> std::io::Result<()> {
+    pub async fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
         if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
             tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
         {
@@ -504,7 +556,7 @@ fn recv_work(
     work_rx: vhci::WorkReceiver,
     work_tx: mpsc::Sender<Work>,
     mut port_connect_rx: mpsc::Receiver<Ctrl<(), UrbControl>>,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     if work_tx.is_closed() {
         trace!("done with receiving work for VHCI");
         return Ok(());
@@ -526,8 +578,8 @@ fn recv_work(
             work => work_tx.blocking_send(work).ok(),
         },
         Err(err)
-            if err.kind() == std::io::ErrorKind::TimedOut
-                || err.kind() == std::io::ErrorKind::Interrupted
+            if err.kind() == io::ErrorKind::TimedOut
+                || err.kind() == io::ErrorKind::Interrupted
                 || err
                     .raw_os_error()
                     .is_some_and(|err| err == vhci::libc::ENODATA) =>
