@@ -180,6 +180,8 @@ mod state {
                 tx.write_all(usb.b_device_class().as_bytes()).await?;
                 tx.write_all(usb.b_device_subclass().as_bytes()).await?;
                 tx.write_all(usb.b_device_protocol().as_bytes()).await?;
+                tx.write_all(usb.b_configuration_value().as_bytes()).await?;
+                tx.write_all(usb.b_num_configurations().as_bytes()).await?;
                 tx.write_all(usb.b_num_interfaces().as_bytes()).await?;
 
                 for int in usb.interfaces() {
@@ -481,11 +483,16 @@ impl Client {
 }
 
 #[derive(Debug)]
-pub struct UsbDeviceWrapper(nusb::DeviceInfo, Box<[msg::UsbInterfaceInfo]>);
+pub struct UsbDeviceWrapper {
+    info: nusb::DeviceInfo,
+    interfaces: Box<[msg::UsbInterfaceInfo]>,
+    b_configuration_value: u8,
+    b_num_configurations: u8,
+}
 
 impl msg::tx::UsbDeviceInfo for UsbDeviceWrapper {
     fn path(&self) -> &lstr::LimitedStr<256> {
-        self.0
+        self.info
             .sysfs_path()
             .to_str()
             .and_then(|s| lstr::LimitedStr::from_str(s))
@@ -493,7 +500,7 @@ impl msg::tx::UsbDeviceInfo for UsbDeviceWrapper {
     }
 
     fn bus_id(&self) -> &lstr::LimitedStr<32> {
-        self.0
+        self.info
             .sysfs_path()
             .file_name()
             .and_then(|f| f.to_str())
@@ -502,47 +509,65 @@ impl msg::tx::UsbDeviceInfo for UsbDeviceWrapper {
     }
 
     fn busnum(&self) -> u8 {
-        self.0.bus_number()
+        self.info.bus_number()
     }
 
     fn devnum(&self) -> u8 {
-        self.0.device_address()
+        self.info.device_address()
     }
 
-    fn speed(&self) -> U32 {
-        U32::new(self.0.speed().unwrap() as u32)
+    fn speed(&self) -> msg::Speed {
+        self.info
+            .speed()
+            .map(|speed| match speed {
+                nusb::Speed::Low => msg::Speed::Low,
+                nusb::Speed::Full => msg::Speed::Full,
+                nusb::Speed::High => msg::Speed::High,
+                nusb::Speed::Super => msg::Speed::Super,
+                nusb::Speed::SuperPlus => msg::Speed::SuperPlus,
+                _ => msg::Speed::Unknown,
+            })
+            .unwrap_or_default()
     }
 
     fn id_vendor(&self) -> U16 {
-        U16::new(self.0.vendor_id())
+        U16::new(self.info.vendor_id())
     }
 
     fn id_product(&self) -> U16 {
-        U16::new(self.0.product_id())
+        U16::new(self.info.product_id())
     }
 
     fn bcd_device(&self) -> U16 {
-        U16::new(self.0.device_version())
+        U16::new(self.info.device_version())
     }
 
     fn b_device_class(&self) -> u8 {
-        self.0.class()
+        self.info.class()
     }
 
     fn b_device_subclass(&self) -> u8 {
-        self.0.subclass()
+        self.info.subclass()
     }
 
     fn b_device_protocol(&self) -> u8 {
-        self.0.protocol()
+        self.info.protocol()
     }
 
     fn b_num_interfaces(&self) -> u8 {
-        self.1.len() as u8
+        self.interfaces.len() as u8
     }
 
     fn interfaces(&self) -> &[msg::UsbInterfaceInfo] {
-        &self.1
+        &self.interfaces
+    }
+
+    fn b_configuration_value(&self) -> u8 {
+        self.b_configuration_value
+    }
+
+    fn b_num_configurations(&self) -> u8 {
+        self.b_num_configurations
     }
 }
 
@@ -568,18 +593,36 @@ impl ReqHandler {
             ServerResp::ListDevices(state) => {
                 state
                     .resp_list_devices(|| {
-                        Ok(nusb::list_devices()?.map(|dev| {
-                            let interfaces = dev
-                                .interfaces()
-                                .map(|int| msg::UsbInterfaceInfo {
-                                    b_interface_number: int.interface_number(),
-                                    b_interface_class: int.class(),
-                                    b_interface_subclass: int.subclass(),
-                                    b_interface_protocol: int.protocol(),
+                        Ok(nusb::list_devices()?
+                            .map(|info| -> Option<UsbDeviceWrapper> {
+                                let device = info
+                                    .open()
+                                    .inspect_err(|err| {
+                                        tracing::trace!("skipping usb device due to {err}")
+                                    })
+                                    .ok()?;
+                                let interfaces = info
+                                    .interfaces()
+                                    .map(|int| msg::UsbInterfaceInfo {
+                                        b_interface_number: int.interface_number(),
+                                        b_interface_class: int.class(),
+                                        b_interface_subclass: int.subclass(),
+                                        b_interface_protocol: int.protocol(),
+                                    })
+                                    .collect();
+                                let b_configuration_value = device
+                                    .active_configuration()
+                                    .map(|conf| conf.configuration_value())
+                                    .unwrap_or_default();
+                                let b_num_configurations = device.configurations().count() as u8;
+                                Some(UsbDeviceWrapper {
+                                    info,
+                                    interfaces,
+                                    b_configuration_value,
+                                    b_num_configurations,
                                 })
-                                .collect();
-                            UsbDeviceWrapper(dev, interfaces)
-                        }))
+                            })
+                            .flatten())
                     })
                     .await
             }

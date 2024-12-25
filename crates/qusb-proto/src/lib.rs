@@ -61,6 +61,8 @@ pub mod msg {
     //! |                           | 1        |            | bDeviceClass                                                  |
     //! |                           | 1        |            | bDeviceSubClass                                               |
     //! |                           | 1        |            | bDeviceProtocol                                               |
+    //! |                           | 1        |            | bConfigurationValue                                           |
+    //! |                           | 1        |            | bNumConfigurations                                            |
     //! |                           | 1        | T          | bNumInterfaces                                                |
     //! |                           |          | m_0        | From now on each interface is described T times:              |
     //! |                           | 1        |            | bInterfaceNumber
@@ -87,28 +89,33 @@ pub mod msg {
     //!
 
     use thiserror::Error;
-    use zerocopy::network_endian::{U16, U32};
+    use zerocopy::{
+        network_endian::{U16, U32, U64},
+        Unalign,
+    };
     use zerocopy_derive::*;
 
     use crate::GetSliceLen;
 
     pub mod tx {
-        use zerocopy::network_endian::{U16, U32};
+        use zerocopy::network_endian::U16;
 
-        use super::UsbInterfaceInfo;
+        use super::{Speed, UsbInterfaceInfo};
 
         pub trait UsbDeviceInfo {
             fn path(&self) -> &lstr::LimitedStr<256>;
             fn bus_id(&self) -> &lstr::LimitedStr<32>;
             fn busnum(&self) -> u8;
             fn devnum(&self) -> u8;
-            fn speed(&self) -> U32;
+            fn speed(&self) -> Speed;
             fn id_vendor(&self) -> U16;
             fn id_product(&self) -> U16;
             fn bcd_device(&self) -> U16;
             fn b_device_class(&self) -> u8;
             fn b_device_subclass(&self) -> u8;
             fn b_device_protocol(&self) -> u8;
+            fn b_configuration_value(&self) -> u8;
+            fn b_num_configurations(&self) -> u8;
             fn b_num_interfaces(&self) -> u8;
             fn interfaces(&self) -> &[UsbInterfaceInfo];
         }
@@ -136,7 +143,17 @@ pub mod msg {
     }
 
     #[derive(
-        Debug, Error, Clone, Copy, IntoBytes, FromZeros, KnownLayout, Immutable, Unaligned,
+        Debug,
+        Error,
+        Clone,
+        Copy,
+        IntoBytes,
+        FromZeros,
+        KnownLayout,
+        Immutable,
+        Unaligned,
+        PartialEq,
+        Eq,
     )]
     #[repr(u8)]
     pub enum Status {
@@ -156,14 +173,18 @@ pub mod msg {
         VersionMismatch,
     }
 
-    #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+    #[derive(
+        Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, PartialEq, Eq,
+    )]
     #[repr(C)]
     pub struct UsbDeviceId {
         pub bus_number: u8,
         pub device_addr: u8,
     }
 
-    #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    )]
     #[repr(C)]
     pub struct UsbInterfaceInfo {
         pub b_interface_number: u8,
@@ -172,7 +193,32 @@ pub mod msg {
         pub b_interface_protocol: u8,
     }
 
-    #[derive(Debug, FromBytes, KnownLayout, Immutable, Unaligned)]
+    
+    /// USB connection speed
+    #[derive(Default, Debug, Copy, Clone, Eq, PartialOrd, Ord, PartialEq, Hash, FromZeros, IntoBytes, KnownLayout, Immutable, Unaligned)]
+    #[non_exhaustive]
+    #[repr(u8)]
+    pub enum Speed {
+        #[default]
+        Unknown = 0,
+        
+        /// Low speed (1.5 Mbit)
+        Low = 1,
+
+        /// Full speed (12 Mbit)
+        Full,
+
+        /// High speed (480 Mbit)
+        High,
+
+        /// Super speed (5000 Mbit)
+        Super,
+
+        /// Super speed (10000 Mbit)
+        SuperPlus,
+    }
+
+    #[derive(Debug, TryFromBytes, KnownLayout, Immutable, Unaligned)]
     #[repr(C)]
     pub struct UsbDeviceInfo {
         pub path_len: U16,
@@ -181,22 +227,22 @@ pub mod msg {
         pub bus_id: [u8; 32],
         pub busnum: u8,
         pub devnum: u8,
-        pub speed: U32,
+        pub speed: Speed,
         pub id_vendor: U16,
         pub id_product: U16,
         pub bcd_device: U16,
         pub b_device_class: u8,
         pub b_device_subclass: u8,
         pub b_device_protocol: u8,
-        // pub b_configuration_value: u8, // TODO: Can't access without opening device on Linux
-        // pub b_num_configurations: u8, // TODO: Can't access...
-        pub b_num_interfaces: u8, // TODO: nusb returns a plain iterator that doesn't know its length
+        pub b_configuration_value: u8,
+        pub b_num_configurations: u8,
+        pub b_num_interfaces: u8,
         pub interfaces: [UsbInterfaceInfo],
     }
 
     impl GetSliceLen for UsbDeviceInfo {
         fn get_slice_len(buf: &[u8]) -> Option<usize> {
-            let size_of_base = 307;
+            let size_of_base = 306;
             if buf.len() < size_of_base {
                 None
             } else {
@@ -205,6 +251,118 @@ pub mod msg {
                 Some(len as usize)
             }
         }
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Immutable,
+        IntoBytes,
+        TryFromBytes,
+        KnownLayout,
+        Unaligned,
+    )]
+    #[repr(u8)]
+    pub enum Command {
+        CmdSubmit = 1,
+        CmdUnlink = 2,
+        RetSubmit = 3,
+        RetUnlink = 4,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, FromZeros, IntoBytes, Unaligned, KnownLayout, Immutable,
+    )]
+    #[repr(u8)]
+    pub enum Dir {
+        Out = 0,
+        In = 1,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        TryFromBytes,
+        IntoBytes,
+        Unaligned,
+        KnownLayout,
+        Immutable,
+    )]
+    #[repr(C)]
+    pub struct UrbReqHeader {
+        seqnum: U64,
+        command: Command,
+        devid: U32,
+        direction: Dir,
+        endpoint: U32,
+    }
+
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, FromZeros, IntoBytes, Unaligned, KnownLayout, Immutable,
+    )]
+    #[repr(C)]
+    pub struct UrbRespHeader {
+        seqnum: U64,
+        status: Status,
+    }
+
+    pub struct UrbCmdSubmit {
+        header: UrbReqHeader,
+        transfer_flags: U32,
+        transfer_buf_len: U32,
+        start_frame: U32,
+        num_iso_packets: U32,
+        interval: U32,
+        setup: [u8; 8],
+    }
+
+    pub struct TransferBuffer {
+        data: [u8],
+    }
+
+    #[derive(
+        Debug, Default, Clone, Copy, PartialEq, Eq, Immutable, IntoBytes, TryFromBytes, KnownLayout,
+    )]
+    #[repr(i32)]
+    pub enum IsoStatus {
+        #[default]
+        Success = 0x00000000,
+        Pending = 0x10000001,
+        ShortPacket = 0x10000002,
+        Error = 0x7ff00000,
+        Canceled = 0x30000001,
+        TimedOut = 0x30000002,
+        DeviceDisabled = 0x71000001,
+        DeviceDisconnected = 0x71000002,
+        BitStuff = 0x72000001,
+        Crc = 0x72000002,
+        NoResponse = 0x72000003,
+        Babble = 0x72000004,
+        Stall = 0x74000001,
+        BufferOverrun = 0x72100001,
+        BufferUnderrun = 0x72100002,
+        AllIsoPacketsFailed = 0x78000001,
+    }
+
+    #[derive(Default, Clone, Copy, Immutable, IntoBytes, TryFromBytes, KnownLayout, Unaligned)]
+    #[repr(C)]
+    pub struct IsoPacketDescriptor {
+        offset: U32,
+        length: U32,
+        actual_length: U32,
+        status: Unalign<IsoStatus>,
+    }
+
+    #[derive(Immutable, IntoBytes, TryFromBytes, KnownLayout, Unaligned)]
+    #[repr(C)]
+    pub struct IsoPackets {
+        descriptors: [IsoPacketDescriptor],
     }
 }
 
