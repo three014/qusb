@@ -271,9 +271,9 @@ impl Demuxer {
             Work(Work),
         }
 
-        struct Ctx<T> {
+        struct Ctx {
             ctx: Box<Context>,
-            cont: T,
+            cont: Continuation,
         }
 
         enum Continuation {
@@ -290,7 +290,7 @@ impl Demuxer {
                 ),
             ),
             Other,
-            Disconnect((io::Result<()>, oneshot::Sender<Result<(), io::Error>>)),
+            Disconnect((io::Result<()>, oneshot::Sender<io::Result<()>>)),
         }
 
         let mut ctx = Box::new(Context {
@@ -373,11 +373,21 @@ impl Demuxer {
             match cont {
                 Continuation::Register((Ok(port), tx)) => {
                     let (ctrl_rx, get_urb) = Ctrl::new(());
-                    if ctx.port_connect_tx.send(get_urb).await.is_err() {
-                        break;
-                    }
+
+                    // Let the work runner know that a new device
+                    // was plugged in and needs to go through the
+                    // enumeration process.
+                    ctx.port_connect_tx
+                        .send(get_urb)
+                        .await
+                        .expect("work runner shouldn't close until demuxer completes");
 
                     let (work_tx, work_rx) = mpsc::channel(32);
+
+                    // Send these items back to the requester:
+                    // - port: in case the requester didn't specify a port
+                    // - work_rx: gives the requester a pipe to receive port status updates and URBs
+                    // - ctrl_rx: allows the requester to receive the control setup packet.
                     if tx.send(Ok((port, work_rx, ctrl_rx))).is_err() {
                         ctx.mailer.remove_by_port(&port);
                         if let Err(_err) = ctx.vhci.port_disconnect(port) {
@@ -468,6 +478,7 @@ impl Controller {
     {
         let (rx, register) = Ctrl::new(Register { port, data_rate });
 
+        // Let the work runner know that a new port needs enumeration.
         self.register_tx.send(register).await.unwrap();
         let (port, mut work_rx, mut ctrl_rx) = rx.await.unwrap()?;
 
@@ -566,8 +577,13 @@ fn recv_work(
     while let Some(_) = match work_rx.fetch_work_timeout(TIMEOUT) {
         Ok(work) => match work {
             Work::ProcessUrb(Urb::Ctrl(ctrl))
-                if !port_connect_rx.is_empty() && ctrl.epadr.get() == 128 =>
+                if !port_connect_rx.is_empty()
+                    && matches!(ctrl.epadr.direction(), vhci::usbfs::Direction::In)
+                    && ctrl.devadr.is_anycast() =>
             {
+                // FIXME: This is incorrect. A setup packet sent to the default
+                //        pipe must get a response from every USB device that doesn't
+                //        already have an address assigned by the kernel.
                 port_connect_rx
                     .blocking_recv()
                     .unwrap()
@@ -663,12 +679,14 @@ mod tests {
 
     #[tokio::test]
     #[tracing_test::traced_test]
-    #[should_panic(reason = "urb ctrl not complete")]
+    #[should_panic(expected = "urb ctrl not complete")]
     async fn can_listen_for_work() {
         let mut controller = Controller::start(BoundedU8::new(8).unwrap()).unwrap();
 
         let (port, work_rx) = controller
             .register(RegisterPort::Any, DataRate::Full, |urb, ctrl| async move {
+                // STEPS FOR ENUMERATION
+                // 1.
                 todo!("Figure out the fastest way to get the USB data from the other host");
             })
             .await

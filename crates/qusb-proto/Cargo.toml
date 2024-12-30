@@ -5,8 +5,11 @@ edition = "2021"
 
 [dependencies]
 thiserror = "2.0.3"
-lstr = { package = "limited_str", git = "https://github.com/three014/limited_str.git", features = ["serde"] }
-zerocopy = { version = "0.8.13", features = ["std"] }
+lstr = { package = "limited_str", git = "https://github.com/three014/limited_str.git" }
+zerocopy = "0.8.13"
 zerocopy-derive = "0.8.13"
 bytes = "1.9.0"
 tokio = { version = "1.42.0", default-features = false, features = ["io-util"] }
+vhci = { package = "usb_vhci", git = "https://github.com/three014/usb_vhci", default-features = false, features = [
+    "zerocopy",
+] }

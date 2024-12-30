@@ -8,7 +8,13 @@ edition = "2021"
 quinn = { version = "0.11.6", features = ["runtime-tokio"] }
 rcgen = "0.13.1"
 thiserror = "2.0.3"
-tokio = { version = "1.41.1", features = ["io-util", "sync", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.41.1", features = [
+    "io-util",
+    "sync",
+    "macros",
+    "rt",
+    "rt-multi-thread",
+] }
 proto = { package = "qusb-proto", path = "../qusb-proto" }
 # postcard = { version = "1.0.10" }
 nohash-hasher = "0.2.0"
@@ -29,5 +35,3 @@ zerocopy = "0.8.13"
 
 [dev-dependencies]
 tracing-test = { version = "0.2.5" }
-
-
