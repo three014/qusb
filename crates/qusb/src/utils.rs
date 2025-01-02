@@ -1,29 +1,419 @@
 use crate::rustls;
-use nohash_hasher::BuildNoHashHasher;
-use std::{collections::HashMap, future::Future, hash::Hash, io, sync::Arc};
+use nohash_hasher::{BuildNoHashHasher, IsEnabled};
+use std::{
+    borrow::Borrow, collections::HashMap, fmt::Debug, future::Future, hash::Hash, io, sync::Arc,
+};
 use tokio::sync::oneshot;
+
+#[derive(Debug)]
+pub struct ThreeKeyMap<K1, K2, K3, V> {
+    key1_map: SimpleMap<K1, usize>,
+    key2_map: SimpleMap<K2, usize>,
+    key3_map: SimpleMap<K3, usize>,
+    values: Vec<(V, usize)>,
+}
+
+impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            key1_map: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
+            key2_map: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
+            key3_map: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
+            values: Vec::with_capacity(cap),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.key1_map.is_empty()
+            && self.key2_map.is_empty()
+            && self.key3_map.is_empty()
+            && self.values.is_empty()
+    }
+
+    pub fn key1_iter(&self) -> impl Iterator<Item = &K1> {
+        self.key1_map.keys()
+    }
+
+    /// Internal function that removes a value from the map at `index`,
+    /// via a swap remove, then updates the index of all other affected
+    /// key/value pairings.
+    ///
+    /// This operation is O(K1 + K2 + K3), where each K is the number
+    /// of key/value pairings for that key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    fn swap_remove(&mut self, index: usize) -> Option<V> {
+        let swapped_index = self.values.len() - 1;
+        let (value, _) = self.values.swap_remove(index);
+
+        self.key1_map
+            .values_mut()
+            .filter(|&&mut value| swapped_index == value)
+            .for_each(|value| *value = index);
+        self.key2_map
+            .values_mut()
+            .filter(|&&mut value| swapped_index == value)
+            .for_each(|value| *value = index);
+        self.key3_map
+            .values_mut()
+            .filter(|&&mut value| swapped_index == value)
+            .for_each(|value| *value = index);
+
+        Some(value)
+    }
+
+    pub fn link_key1_to_key2<Q>(&mut self, new_k: K1, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K1: Hash + Eq + IsEnabled,
+        K2: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        TwoKeyOperation {
+            map1: &mut self.key1_map,
+            map2: &mut self.key2_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(new_k, existing_k)
+    }
+
+    pub fn link_key1_to_key3<Q>(&mut self, new_k: K1, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K1: Hash + Eq + IsEnabled,
+        K3: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        TwoKeyOperation {
+            map1: &mut self.key1_map,
+            map2: &mut self.key3_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(new_k, existing_k)
+    }
+
+    pub fn link_key2_to_key1<Q>(&mut self, new_k: K2, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K2: Hash + Eq + IsEnabled,
+        K1: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        TwoKeyOperation {
+            map1: &mut self.key2_map,
+            map2: &mut self.key1_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(new_k, existing_k)
+    }
+
+    pub fn link_key2_to_key3<Q>(&mut self, new_k: K2, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K2: Hash + Eq + IsEnabled,
+        K3: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        TwoKeyOperation {
+            map1: &mut self.key2_map,
+            map2: &mut self.key3_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(new_k, existing_k)
+    }
+
+    pub fn link_key3_to_key1<Q>(&mut self, new_k: K3, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K3: Hash + Eq + IsEnabled,
+        K1: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        TwoKeyOperation {
+            map1: &mut self.key3_map,
+            map2: &mut self.key1_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(new_k, existing_k)
+    }
+
+    pub fn link_key3_to_key2<Q>(&mut self, new_k: K3, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K3: Hash + Eq + IsEnabled,
+        K2: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        TwoKeyOperation {
+            map1: &mut self.key3_map,
+            map2: &mut self.key2_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(new_k, existing_k)
+    }
+}
+
+impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V>
+where
+    K1: IsEnabled + Hash + Eq,
+{
+    pub fn insert_by_key1(&mut self, k: K1, v: V) -> Option<V> {
+        OneKeyOperation {
+            map: &mut self.key1_map,
+            values: &mut self.values,
+        }
+        .insert_by_key(k, v)
+    }
+
+    pub fn link_key1_to_key1<Q>(&mut self, k: K1, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K1: Borrow<Q>,
+    {
+        OneKeyOperation {
+            map: &mut self.key1_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(k, existing_k)
+    }
+
+    pub fn remove_by_key1<Q>(&mut self, k: &Q) -> Option<V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K1: Borrow<Q>,
+    {
+        let index = self.key1_map.remove(k)?;
+        let (_, count) = self.values.get_mut(index)?;
+        *count -= 1;
+        (0 == *count).then(|| self.swap_remove(index)).flatten()
+    }
+
+    pub fn get_by_key1<Q>(&self, k: &Q) -> Option<&V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K1: Borrow<Q>,
+    {
+        OneKeyOperationRef {
+            map: &self.key1_map,
+            values: &self.values,
+        }
+        .get_by_key(k)
+    }
+}
+
+impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V>
+where
+    K2: IsEnabled + Hash + Eq,
+{
+    pub fn insert_by_key2(&mut self, k: K2, v: V) -> Option<V> {
+        OneKeyOperation {
+            map: &mut self.key2_map,
+            values: &mut self.values,
+        }
+        .insert_by_key(k, v)
+    }
+
+    pub fn link_key2_to_key2<Q>(&mut self, k: K2, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K2: Borrow<Q>,
+    {
+        OneKeyOperation {
+            map: &mut self.key2_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(k, existing_k)
+    }
+
+    pub fn remove_by_key2<Q>(&mut self, k: &Q) -> Option<V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K2: Borrow<Q>,
+    {
+        OneKeyOperation {
+            map: &mut self.key2_map,
+            values: &mut self.values,
+        }
+        .remove_by_key(k)
+        .filter(|&(count, _)| 0 == count)
+        .and_then(|(_, index)| self.swap_remove(index))
+    }
+
+    pub fn get_by_key2<Q>(&self, k: &Q) -> Option<&V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K2: Borrow<Q>,
+    {
+        OneKeyOperationRef {
+            map: &self.key2_map,
+            values: &self.values,
+        }
+        .get_by_key(k)
+    }
+}
+
+impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V>
+where
+    K3: IsEnabled + Hash + Eq,
+{
+    pub fn insert_by_key3(&mut self, k: K3, v: V) -> Option<V> {
+        OneKeyOperation {
+            map: &mut self.key3_map,
+            values: &mut self.values,
+        }
+        .insert_by_key(k, v)
+    }
+
+    pub fn link_key3_to_key3<Q>(&mut self, k: K3, existing_k: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K3: Borrow<Q>,
+    {
+        OneKeyOperation {
+            map: &mut self.key3_map,
+            values: &mut self.values,
+        }
+        .link_key_to_key(k, existing_k)
+    }
+
+    pub fn remove_by_key3<Q>(&mut self, k: &Q) -> Option<V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K3: Borrow<Q>,
+    {
+        OneKeyOperation {
+            map: &mut self.key3_map,
+            values: &mut self.values,
+        }
+        .remove_by_key(k)
+        .filter(|&(count, _)| 0 == count)
+        .and_then(|(_, index)| self.swap_remove(index))
+    }
+
+    pub fn get_by_key3<Q>(&self, k: &Q) -> Option<&V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K3: Borrow<Q>,
+    {
+        OneKeyOperationRef {
+            map: &self.key3_map,
+            values: &self.values,
+        }
+        .get_by_key(k)
+    }
+}
+
+struct TwoKeyOperation<'a, K1, K2, V> {
+    map1: &'a mut SimpleMap<K1, usize>,
+    map2: &'a mut SimpleMap<K2, usize>,
+    values: &'a mut Vec<(V, usize)>,
+}
+
+impl<K1, K2, V> TwoKeyOperation<'_, K1, K2, V>
+where
+    K1: IsEnabled + Hash + Eq,
+    K2: IsEnabled + Hash + Eq,
+{
+    fn link_key_to_key<Q>(&mut self, new_key: K1, existing_key: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K2: Borrow<Q>,
+    {
+        if self.map1.contains_key(new_key.borrow()) {
+            return false;
+        }
+
+        if let Some(&index) = self.map2.get(existing_key) {
+            self.map1.insert(new_key, index);
+            let (_, count) = &mut self.values[index];
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct OneKeyOperationRef<'a, K, V> {
+    map: &'a SimpleMap<K, usize>,
+    values: &'a Vec<(V, usize)>,
+}
+
+impl<'a, K, V> OneKeyOperationRef<'a, K, V>
+where
+    K: IsEnabled + Hash + Eq,
+{
+    fn get_by_key<Q>(&self, k: &Q) -> Option<&'a V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
+        let index = self.map.get(k)?;
+        self.values.get(*index).map(|(v, _)| v)
+    }
+}
+
+struct OneKeyOperation<'a, K, V> {
+    map: &'a mut SimpleMap<K, usize>,
+    values: &'a mut Vec<(V, usize)>,
+}
+
+impl<K, V> OneKeyOperation<'_, K, V>
+where
+    K: IsEnabled + Hash + Eq,
+{
+    fn link_key_to_key<Q>(&mut self, new_key: K, existing_key: &Q) -> bool
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
+        if self.map.contains_key(new_key.borrow()) {
+            return false;
+        }
+
+        if let Some(&index) = self.map.get(existing_key) {
+            self.map.insert(new_key, index);
+            let (_, count) = &mut self.values[index];
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert_by_key(&mut self, k: K, v: V) -> Option<V> {
+        self.values.push((v, 1));
+        let index = self.values.len() - 1;
+        self.map
+            .insert(k, index)
+            .and_then(|_| self.values.pop())
+            .map(|v| v.0)
+    }
+
+    fn remove_by_key<Q>(&mut self, k: &Q) -> Option<(usize, usize)>
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
+        let index = self.map.remove(k)?;
+        let (_, count) = self.values.get_mut(index)?;
+        *count = count.saturating_sub(1);
+        Some((index, *count))
+    }
+
+    fn get_mut_by_key<Q>(&mut self, k: &Q) -> Option<&mut V>
+    where
+        Q: ?Sized + Hash + Eq,
+        K: Borrow<Q>,
+    {
+        let index = self.map.get_mut(k)?;
+        self.values.get_mut(*index).map(|(v, _)| v)
+    }
+}
 
 pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NoHash<T>(pub T);
-impl<T: Clone> Clone for NoHash<T> {
-    fn clone(&self) -> Self {
-        NoHash(self.0.clone())
-    }
-}
 impl<T: Copy> Copy for NoHash<T> {}
-impl<T: Hash> Hash for NoHash<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-impl<T: Eq> Eq for NoHash<T> {}
-impl<T: PartialEq> PartialEq for NoHash<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.eq(&other.0)
-    }
-}
-impl nohash_hasher::IsEnabled for NoHash<quinn::StreamId> {}
+impl IsEnabled for NoHash<quinn::StreamId> {}
+impl IsEnabled for NoHash<vhci::ioctl::Address> {}
 
 pub struct Ctrl<S, R = (), E = std::io::Error> {
     pub data: S,
@@ -205,4 +595,60 @@ pub fn make_self_signed() -> (
     .with_single_cert(vec![cert_der.clone()], priv_key.into())
     .unwrap();
     (server, cert_der)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+    use vhci::{
+        ioctl::{Address, UrbHandle},
+        Port,
+    };
+
+    use super::*;
+
+    type Mailer = ThreeKeyMap<Port, NoHash<Addr>, UrbHandle, mpsc::Sender<vhci::ioctl::IocWork>>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Addr(Address);
+    impl std::hash::Hash for Addr {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.get().hash(state);
+        }
+    }
+    impl IsEnabled for NoHash<Addr> {}
+
+    #[test]
+    fn remove_last_tx_works() {
+        let mut mailer = Mailer::with_capacity(4);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(20);
+        mailer.insert_by_key1(Port::new(1).unwrap(), tx);
+        mailer.remove_by_key1(&Port::new(1).unwrap());
+
+        assert!(mailer.is_empty());
+    }
+
+    #[test]
+    fn remove_tx_works() {
+        let mut mailer = Mailer::with_capacity(4);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(20);
+        mailer.insert_by_key1(Port::new(1).unwrap(), tx);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(20);
+        mailer.insert_by_key1(Port::new(5).unwrap(), tx);
+
+        mailer.remove_by_key1(&Port::new(1).unwrap());
+        let index = mailer.key1_map.get(&Port::new(5).unwrap()).unwrap();
+        assert_eq!(*index, 0);
+    }
+
+    #[test]
+    fn trait_bounds_for_address() {
+        let mut mailer = Mailer::with_capacity(4);
+
+        let (tx, _rx) = mpsc::channel(4);
+        mailer.insert_by_key2(NoHash(Addr(Address::new(0).unwrap())), tx);
+    }
 }

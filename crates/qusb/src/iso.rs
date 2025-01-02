@@ -1,8 +1,8 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, io};
 
 use bytes::{Buf, Bytes};
 use tokio::sync::mpsc;
-use zerocopy::{self, FromBytes};
+use zerocopy::{self, little_endian::U64, FromBytes};
 
 use crate::utils::{Ctrl, NoHash, SimpleMap};
 
@@ -50,45 +50,34 @@ impl Demuxer {
         let mut mailer = SimpleMap::<NoHash<quinn::StreamId>, mpsc::Sender<Bytes>>::default();
 
         enum Event {
-            Register(Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>),
-            Datagram(Bytes),
-            Disconnect(Ctrl<quinn::StreamId, (), Infallible>),
+            Register(Option<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>),
+            Datagram(Result<Bytes, quinn::ConnectionError>),
+            Disconnect(Option<Ctrl<quinn::StreamId, (), Infallible>>),
         }
 
         loop {
             let select = tokio::select! {
                 req = register_rx.recv() => {
-                    if let Some(register) = req {
-                        Event::Register(register)
-                    } else {
-                        break;
-                    }
+                    Event::Register(req)
                 }
                 datagram = conn.read_datagram() => {
-                    match datagram {
-                        Ok(bytes) => Event::Datagram(bytes),
-                        Err(err) => return Err(std::io::Error::from(err)),
-                    }
+                    Event::Datagram(datagram)
                 }
                 req = disconnect_rx.recv() => {
-                    if let Some(disconnect) = req {
-                        Event::Disconnect(disconnect)
-                    } else {
-                        break;
-                    }
+                    Event::Disconnect(req)
                 }
             };
 
             match select {
-                Event::Register(Ctrl { data: id, tx }) => {
+                Event::Register(Some(Ctrl { data: id, tx })) => {
                     let (iso_tx, iso_rx) = mpsc::channel(32);
                     mailer.insert(NoHash(id), iso_tx);
                     if tx.send(Ok(iso_rx)).is_err() {
                         mailer.remove(&NoHash(id));
                     }
                 }
-                Event::Datagram(mut bytes) => {
-                    if let Ok((id, _)) = zerocopy::network_endian::U64::read_from_prefix(&bytes) {
+                Event::Datagram(Ok(mut bytes)) => {
+                    if let Ok((id, _)) = U64::read_from_prefix(&bytes) {
                         bytes.advance(std::mem::size_of_val(&id));
                         let id = NoHash(quinn::StreamId(id.get()));
                         if let Some(tx) = mailer.get(&id) {
@@ -98,10 +87,12 @@ impl Demuxer {
                         }
                     }
                 }
-                Event::Disconnect(Ctrl { data: id, tx }) => {
+                Event::Disconnect(Some(Ctrl { data: id, tx })) => {
                     mailer.remove(&NoHash(id));
                     let _ = tx.send(Ok(()));
                 }
+                Event::Register(None) | Event::Disconnect(None) => break,
+                Event::Datagram(Err(err)) => return Err(io::Error::from(err)),
             }
         }
         Ok(())

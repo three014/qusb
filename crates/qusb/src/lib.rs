@@ -1,5 +1,4 @@
 use iso::{Demuxer, Handle};
-use proto::lstr;
 use proto::{
     data::{IterDst, IterMutDst, Ring},
     msg,
@@ -19,7 +18,7 @@ use tokio::sync::mpsc;
 use usb_ids::UsbIds;
 use utils::CloseStream;
 use vhci::utils::BoundedU8;
-use zerocopy::network_endian::U16;
+use zerocopy::little_endian::U16;
 use zerocopy::IntoBytes;
 
 pub use quinn::rustls;
@@ -32,9 +31,13 @@ mod state {
 
     use proto::{data::Ring, msg};
     use tokio::io::{AsyncRead, AsyncWrite};
-    use zerocopy::{network_endian::U16, IntoBytes};
+    use vhci::DataRate;
+    use zerocopy::IntoBytes;
 
-    use crate::{dev, iso, utils, Error};
+    use crate::{
+        dev::{self, RegisterPort},
+        iso, utils, Error,
+    };
 
     pub enum ClientReq {
         ListDevices,
@@ -75,7 +78,21 @@ mod state {
         W: AsyncWrite,
         R: AsyncRead,
     {
-        pub async fn run(self) {}
+        pub async fn run(self) {
+            let Self {
+                tx,
+                rx,
+                buf,
+                iso_tx,
+                iso_rx,
+                mut vhci,
+            } = self;
+
+            // Step 1: Connect VHCI port
+            vhci.register(RegisterPort::Any, DataRate::High)
+            .await
+            .unwrap();
+        }
     }
 
     pub enum ServerResp<W, R> {
