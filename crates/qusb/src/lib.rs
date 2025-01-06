@@ -1,7 +1,7 @@
 use iso::{Demuxer, Handle};
 use proto::{
     data::{IterDst, IterMutDst, Ring},
-    msg,
+    msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use state::{ClientBorrowDevice, ClientReq, ServerLendDevice, ServerListDevices, ServerResp};
@@ -15,168 +15,18 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, trace, warn};
 use usb_ids::UsbIds;
 use utils::CloseStream;
-use vhci::utils::BoundedU8;
-use zerocopy::little_endian::U16;
-use zerocopy::IntoBytes;
+use vhci::utils::{BoundedU16, BoundedU8};
+use zerocopy::{FromZeros, IntoBytes};
 
 pub use quinn::rustls;
 pub use rcgen;
 
 mod dev;
 mod iso;
-mod state {
-    use std::io;
-
-    use proto::{data::Ring, msg};
-    use tokio::io::{AsyncRead, AsyncWrite};
-    use vhci::DataRate;
-    use zerocopy::IntoBytes;
-
-    use crate::{
-        dev::{self, RegisterPort},
-        iso, utils, Error,
-    };
-
-    pub enum ClientReq {
-        ListDevices,
-        BorrowDevice(msg::UsbDeviceId),
-    }
-
-    pub struct ClientBorrowDevice<W, R> {
-        tx: W,
-        rx: R,
-        buf: Ring,
-        iso_tx: iso::Sender,
-        iso_rx: iso::Receiver,
-        vhci: dev::Controller,
-    }
-
-    impl<W, R> ClientBorrowDevice<W, R> {
-        pub fn new(
-            tx: W,
-            rx: R,
-            buf: Ring,
-            iso_tx: iso::Sender,
-            iso_rx: iso::Receiver,
-            vhci: dev::Controller,
-        ) -> Self {
-            Self {
-                tx,
-                rx,
-                buf,
-                iso_tx,
-                iso_rx,
-                vhci,
-            }
-        }
-    }
-
-    impl<W, R> ClientBorrowDevice<W, R>
-    where
-        W: AsyncWrite,
-        R: AsyncRead,
-    {
-        pub async fn run(self) {
-            let Self {
-                tx,
-                rx,
-                buf,
-                iso_tx,
-                iso_rx,
-                mut vhci,
-            } = self;
-
-            // Step 1: Connect VHCI port
-            vhci.register(RegisterPort::Any, DataRate::High)
-            .await
-            .unwrap();
-        }
-    }
-
-    pub enum ServerResp<W, R> {
-        ListDevices(ServerListDevices<W>),
-        BorrowDevice(ServerLendDevice<W, R>),
-    }
-
-    pub struct ServerLendDevice<W, R> {
-        tx: W,
-        rx: R,
-        buf: Ring,
-        iso_tx: iso::Sender,
-        iso_rx: iso::Receiver,
-        device_id: msg::UsbDeviceId,
-    }
-
-    impl<W, R> ServerLendDevice<W, R> {
-        pub fn new(
-            tx: W,
-            rx: R,
-            buf: Ring,
-            iso_tx: iso::Sender,
-            iso_rx: iso::Receiver,
-            device_id: msg::UsbDeviceId,
-        ) -> Self {
-            Self {
-                tx,
-                rx,
-                buf,
-                iso_tx,
-                iso_rx,
-                device_id,
-            }
-        }
-    }
-
-    pub struct ServerListDevices<W> {
-        tx: W,
-    }
-
-    impl<W> ServerListDevices<W> {
-        pub fn new(tx: W) -> Self {
-            Self { tx }
-        }
-    }
-
-    impl<W> ServerListDevices<W>
-    where
-        W: AsyncWrite + utils::CloseStream + Unpin,
-    {
-        pub async fn resp_list_devices<'a, I, T>(
-            self,
-            iter: impl Fn() -> io::Result<I>,
-        ) -> Result<(), Error>
-        where
-            I: Iterator<Item = T>,
-            T: msg::SendUsbDeviceInfo,
-        {
-            use tokio::io::AsyncWriteExt;
-            let mut tx = self.tx;
-
-            let devices = match iter() {
-                Ok(devices) => {
-                    tx.write_all(msg::Status::Success.as_bytes()).await?;
-                    tx.write_all(&[0, 0, 0]).await?;
-                    devices
-                }
-                Err(err) => {
-                    tx.write_all(msg::Status::Failed.as_bytes()).await?;
-                    return Err(err.into());
-                }
-            };
-
-            for usb in devices {
-                let main_info = usb.get();
-                assert_eq!(main_info.b_num_interfaces as usize, usb.interfaces().len());
-                tx.write_all(main_info.as_bytes()).await?;
-                tx.write_all(usb.interfaces().as_bytes()).await?;
-            }
-
-            tx.close().await.map_err(Error::from)
-        }
-    }
-}
+mod state;
 mod usb_ids;
 pub mod utils;
 
@@ -229,15 +79,134 @@ impl From<quinn::ClosedStream> for Error {
     }
 }
 
+impl From<RusbError> for Error {
+    fn from(value: RusbError) -> Self {
+        match value.kind {
+            rusb::Error::Io => todo!(),
+            rusb::Error::InvalidParam => Error::Io(io::ErrorKind::InvalidInput.into()),
+            rusb::Error::Access => Error::Io(io::ErrorKind::PermissionDenied.into()),
+            rusb::Error::NoDevice | rusb::Error::NotFound => Error::DevNotFound(value.dev_id),
+            rusb::Error::Busy => Error::Io(io::ErrorKind::ResourceBusy.into()),
+            rusb::Error::Timeout => Error::Io(io::ErrorKind::TimedOut.into()),
+            rusb::Error::Overflow => todo!(),
+            rusb::Error::Pipe => Error::Io(io::ErrorKind::BrokenPipe.into()),
+            rusb::Error::Interrupted => Error::Io(io::ErrorKind::Interrupted.into()),
+            rusb::Error::NoMem => Error::Io(io::ErrorKind::OutOfMemory.into()),
+            rusb::Error::NotSupported => Error::Io(io::ErrorKind::Unsupported.into()),
+            rusb::Error::BadDescriptor => todo!(),
+            rusb::Error::Other => Error::Io(io::ErrorKind::Other.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RusbError {
+    kind: rusb::Error,
+    dev_id: msg::UsbDeviceId,
+}
+
+impl From<RusbError> for msg::Status {
+    fn from(value: RusbError) -> Self {
+        match value.kind {
+            rusb::Error::Io => msg::Status::Failed,
+            rusb::Error::InvalidParam => msg::Status::Unexpected,
+            rusb::Error::Access => msg::Status::Failed,
+            rusb::Error::NoDevice | rusb::Error::NotFound => msg::Status::NoDev,
+            rusb::Error::Busy => msg::Status::DevBusy,
+            rusb::Error::Timeout => msg::Status::Timeout,
+            rusb::Error::BadDescriptor => msg::Status::DevErr,
+            _ => msg::Status::Unexpected,
+        }
+    }
+}
+
+pub struct UrbWithIsoData<'a> {
+    pub handle: vhci::ioctl::UrbHandle,
+    pub header: &'a msg::UrbHeader,
+    pub transfer: &'a mut [u8],
+    pub iso_data: &'a mut [vhci::ioctl::IocIsoPacketData],
+}
+
+impl vhci::Urb for UrbWithIsoData<'_> {
+    fn kind(&self) -> vhci::ioctl::UrbType {
+        self.header.kind
+    }
+
+    fn handle(&self) -> vhci::ioctl::UrbHandle {
+        self.handle
+    }
+
+    fn status(&self) -> vhci::Status {
+        self.header.status
+    }
+
+    fn endpoint(&self) -> vhci::ioctl::Endpoint {
+        self.header.endpoint
+    }
+}
+
+impl vhci::TransferMut for UrbWithIsoData<'_> {
+    fn transfer_mut(&mut self) -> &mut [u8] {
+        &mut self.transfer
+    }
+}
+
+impl vhci::IsoPacketDataMut for UrbWithIsoData<'_> {
+    fn iso_packet_data_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketData] {
+        &mut self.iso_data
+    }
+}
+
+pub struct UrbWithIsoGiveback<'a> {
+    pub handle: vhci::ioctl::UrbHandle,
+    pub header: &'a msg::UrbHeader,
+    pub transfer: &'a mut [u8],
+    pub iso_giveback: &'a mut [vhci::ioctl::IocIsoPacketGiveback],
+}
+
+impl vhci::Urb for UrbWithIsoGiveback<'_> {
+    fn kind(&self) -> vhci::ioctl::UrbType {
+        self.header.kind
+    }
+
+    fn handle(&self) -> vhci::ioctl::UrbHandle {
+        self.handle
+    }
+
+    fn status(&self) -> vhci::Status {
+        self.header.status
+    }
+
+    fn endpoint(&self) -> vhci::ioctl::Endpoint {
+        self.header.endpoint
+    }
+}
+
+impl vhci::TransferMut for UrbWithIsoGiveback<'_> {
+    fn transfer_mut(&mut self) -> &mut [u8] {
+        &mut self.transfer
+    }
+}
+
+impl vhci::IsoPacketGivebackMut for UrbWithIsoGiveback<'_> {
+    fn iso_packet_giveback_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketGiveback] {
+        &mut self.iso_giveback
+    }
+
+    fn error_count(&self) -> u16 {
+        self.header.num_errors
+    }
+}
+
 #[derive(Debug)]
 pub struct UsbDevices(Ring);
 
 impl UsbDevices {
-    pub fn iter(&self) -> IterDst<'_, msg::UsbDeviceInfoRx> {
+    pub fn iter(&self) -> IterDst<'_, msg::UsbDeviceInfo> {
         self.0.iter_dst()
     }
 
-    pub fn iter_mut(&mut self) -> IterMutDst<'_, msg::UsbDeviceInfoRx> {
+    pub fn iter_mut(&mut self) -> IterMutDst<'_, msg::UsbDeviceInfo> {
         self.0.iter_mut_dst()
     }
 }
@@ -291,10 +260,13 @@ impl Session {
         let (mut tx, mut rx) = self.conn.accept_bi().await?;
         let mut buf = Ring::with_capacity(32);
 
-        buf.read_into_from_reader(&mut rx).await?;
-        let version: msg::Version = buf.read()?;
+        const SIZE_OF_REQUEST: usize = size_of::<msg::Version>() + size_of::<msg::Request>();
+        while SIZE_OF_REQUEST > buf.len() {
+            buf.read_into_from_reader(&mut rx).await?;
+        }
 
-        if version.major != proto::QUSB_VER.major || version.minor != proto::QUSB_VER.minor {
+        let version: msg::Version = buf.read()?;
+        if !version.is_compat(&proto::QUSB_VER) {
             tx.write_all(msg::Status::VersionMismatch.as_bytes())
                 .await?;
             tx.write_all(proto::QUSB_VER.as_bytes()).await?;
@@ -347,8 +319,8 @@ impl Session {
             .conn
             .open_bi()
             .await
-            .inspect_err(|err| tracing::error!("{err}"))?;
-        tracing::trace!("established stream with stream id {:?}", tx.id());
+            .inspect_err(|err| error!("{err}"))?;
+        trace!("established stream with stream id {:?}", tx.id());
         let mut buf = Ring::with_capacity(1024);
 
         let version = proto::QUSB_VER;
@@ -356,35 +328,35 @@ impl Session {
 
         tx.write_all(version.as_bytes())
             .await
-            .inspect_err(|err| tracing::error!("{err}"))?;
+            .inspect_err(|err| error!("{err}"))?;
         tx.write_all(req.as_bytes())
             .await
-            .inspect_err(|err| tracing::error!("{err}"))?;
+            .inspect_err(|err| error!("{err}"))?;
         drop(tx);
 
         while 0
             == buf
                 .read_into_from_reader(&mut rx)
                 .await
-                .inspect_err(|err| tracing::error!("{err}"))?
+                .inspect_err(|err| error!("{err}"))?
         {}
-        tracing::trace!("finished reading from remote stream");
+        trace!("finished reading from remote stream");
         let status = buf.read()?;
+        buf.consume(&[0u8; 7]);
         match status {
-            msg::Status::Success => {
-                buf.consume(&[0u8, 0u8, 0u8]);
-            }
+            msg::Status::Success => {}
             msg::Status::Failed => return Err(Error::ReqFailed),
             msg::Status::DevBusy => todo!(),
             msg::Status::DevErr => todo!(),
             msg::Status::NoDev => todo!(),
             msg::Status::Unexpected => {
-                return Err(io::Error::from(io::ErrorKind::InvalidData).into())
+                return Err(Error::ReqFailed);
             }
             msg::Status::VersionMismatch => {
-                let their_version = buf.read::<msg::Version>()?;
-                return Err(Error::VersionMismatch(their_version));
+                return Err(Error::VersionMismatch(version));
             }
+            msg::Status::Timeout => todo!(),
+            msg::Status::Proto => todo!(),
         }
 
         Ok(UsbDevices(buf))
@@ -403,14 +375,16 @@ impl Session {
         tx.write_all(version.as_bytes()).await?;
         tx.write_all(req.as_bytes()).await?;
         tx.write_all(id.as_bytes()).await?;
+        tx.write_all(&[0, 0, 0, 0, 0, 0]).await?;
 
-        while buf.len() < std::mem::size_of::<msg::Status>() {
+        while size_of::<msg::Status>() + 7 > buf.len() {
             buf.read_into_from_reader(&mut rx).await?;
         }
 
         let status = buf.read()?;
+        buf.consume(&[0u8; 7]);
         match status {
-            msg::Status::Success => {}
+            msg::Status::Success => (),
             msg::Status::Failed => return Err(Error::ReqFailed),
             msg::Status::DevBusy => todo!(),
             msg::Status::DevErr => todo!(),
@@ -421,9 +395,14 @@ impl Session {
                 return Err(io::Error::from(io::ErrorKind::InvalidData).into())
             }
             msg::Status::VersionMismatch => {
+                if size_of::<msg::Version>() + 4 > buf.len() {
+                    buf.read_into_from_reader(&mut rx).await?;
+                }
                 let their_version = buf.read::<msg::Version>()?;
                 return Err(Error::VersionMismatch(their_version));
             }
+            msg::Status::Timeout => todo!(),
+            msg::Status::Proto => todo!(),
         }
 
         let mut slot = self.iso.lock().unwrap();
@@ -439,7 +418,7 @@ impl Session {
             .make_channel(tx.id())
         {
             Some((iso_tx, iso_rx)) => {
-                ClientBorrowDevice::new(tx, rx, buf, iso_tx, iso_rx, self.dev.clone())
+                ClientBorrowDevice::new(tx, rx, buf, iso_tx, iso_rx, self.dev.clone(), id)
             }
             // One way this can happen is if the demuxer wasn't finished
             // when we checked, but then finished right after.
@@ -468,17 +447,21 @@ impl Client {
 
 #[derive(Debug)]
 pub struct UsbDeviceWrapper {
-    info: msg::UsbDeviceInfoTx,
+    info: msg::UsbDeviceInfoHeader,
     interfaces: Box<[msg::UsbInterfaceInfo]>,
 }
 
 impl msg::SendUsbDeviceInfo for UsbDeviceWrapper {
-    fn get(&self) -> &msg::UsbDeviceInfoTx {
+    fn get(&self) -> &msg::UsbDeviceInfoHeader {
         &self.info
     }
 
-    fn interfaces(&self) -> &[msg::UsbInterfaceInfo] {
+    fn interfaces_with_padding(&self) -> &[msg::UsbInterfaceInfo] {
         &self.interfaces
+    }
+
+    fn interfaces(&self) -> &[msg::UsbInterfaceInfo] {
+        &self.interfaces[..self.info.b_num_interfaces as usize]
     }
 }
 
@@ -491,9 +474,9 @@ fn get_usb_devices() -> io::Result<
     let iterator = nusb::list_devices()?.filter_map(|info| -> Option<UsbDeviceWrapper> {
         let device = info
             .open()
-            .inspect_err(|err| tracing::trace!("skipping usb device due to {err}"))
+            .inspect_err(|err| trace!("skipping usb device due to {err}"))
             .ok()?;
-        let interfaces: Box<[msg::UsbInterfaceInfo]> = info
+        let mut interfaces: Vec<msg::UsbInterfaceInfo> = info
             .interfaces()
             .map(|iface| msg::UsbInterfaceInfo {
                 b_interface_number: iface.interface_number(),
@@ -503,37 +486,49 @@ fn get_usb_devices() -> io::Result<
             })
             .collect();
         let b_num_interfaces = interfaces.len().try_into().unwrap();
+        if interfaces.len() % 2 == 1 {
+            interfaces.push(msg::UsbInterfaceInfo::new_zeroed());
+        }
+        let interfaces: Box<[msg::UsbInterfaceInfo]> = interfaces.into_boxed_slice();
         let b_configuration_value = device
             .active_configuration()
             .map(|conf| conf.configuration_value())
             .unwrap_or_default();
         let b_num_configurations = device.configurations().count() as u8;
-        let path = info.sysfs_path().as_os_str().as_bytes().try_into().ok()?;
-        let bus_id = info
-            .sysfs_path()
-            .file_name()
-            .map(|name| name.as_bytes().try_into().ok())
-            .flatten()?;
-        let info = msg::UsbDeviceInfoTx {
-            path,
-            path_len: U16::new(path.len().try_into().unwrap()),
-            bus_id,
-            bus_id_len: bus_id.len().try_into().unwrap(),
+        let path = info.sysfs_path().as_os_str().as_bytes();
+        let path_len = path.len();
+        let bus_id = info.sysfs_path().file_name().map(|name| name.as_bytes())?;
+        let bus_id_len = bus_id.len();
+        let info = msg::UsbDeviceInfoHeader {
+            path_len: BoundedU16::<0, { PATH_MAX_LEN + 1 }>::new(u16::try_from(path_len).unwrap())
+                .unwrap_or_default()
+                .get(),
+            path: <[u8; PATH_MAX_LEN as usize]>::try_from(path)
+                .unwrap_or([0; PATH_MAX_LEN as usize]),
+            bus_id_len: BoundedU8::<0, { BUS_ID_MAX_LEN + 1 }>::new(
+                u8::try_from(bus_id_len).unwrap(),
+            )
+            .unwrap_or_default()
+            .get(),
+            bus_id: <[u8; BUS_ID_MAX_LEN as usize]>::try_from(bus_id)
+                .unwrap_or([0; BUS_ID_MAX_LEN as usize]),
             busnum: info.bus_number(),
             devnum: info.device_address(),
             speed: info
                 .speed()
                 .map(|speed| msg::Speed::from_u8(speed as u8))
                 .unwrap_or_default(),
-            id_vendor: U16::new(info.vendor_id()),
-            id_product: U16::new(info.product_id()),
-            bcd_device: U16::new(info.device_version()),
+            id_vendor: info.vendor_id(),
+            id_product: info.product_id(),
+            bcd_device: info.device_version(),
             b_device_class: info.class(),
             b_device_subclass: info.subclass(),
             b_device_protocol: info.protocol(),
             b_configuration_value,
             b_num_configurations,
             b_num_interfaces,
+            padded_num_interfaces: interfaces.len().try_into().unwrap(),
+            _padding: [0; 5],
         };
 
         Some(UsbDeviceWrapper { info, interfaces })
@@ -554,7 +549,7 @@ impl ReqHandler {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn run(self) -> Result<(), Error> {
         let conn = self.incoming.await?;
-        tracing::trace!(
+        trace!(
             "established new session with {} - RTT {:?}",
             conn.remote_address(),
             conn.rtt()
@@ -562,7 +557,7 @@ impl ReqHandler {
         let session = Session::new(conn, self.vhci);
         match session.accept_stream().await? {
             ServerResp::ListDevices(state) => state.resp_list_devices(get_usb_devices).await,
-            ServerResp::BorrowDevice(state) => todo!(),
+            ServerResp::BorrowDevice(state) => state.run().await,
         }
     }
 }
@@ -580,7 +575,7 @@ impl Server {
         let cancel_for_serve = cancel_for_handle.clone();
         let handle = tokio::spawn(async move {
             let mut set = tokio::task::JoinSet::new();
-            tracing::info!("Server ready to accept new connections");
+            info!("Server ready to accept new connections");
 
             async fn check_for_completed_task(
                 set: &mut tokio::task::JoinSet<Result<(), Error>>,
@@ -615,25 +610,25 @@ impl Server {
 
                 match event {
                     Event::Incoming(Some(incoming)) => {
-                        tracing::debug!("Incoming connection from {}", incoming.remote_address());
+                        debug!("Incoming connection from {}", incoming.remote_address());
                         set.spawn(ReqHandler::new(self.dev.clone(), incoming).run());
                     }
-                    Event::Incoming(None) | Event::Cancel => break,
                     Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
-                        tracing::info!("session {id} completed successfully")
+                        info!("session {id} completed successfully")
                     }
                     Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
-                        tracing::warn! { %cause, "session {id} failed" }
+                        warn! { %cause, "session {id} failed" }
                     }
                     Event::MaybeCompletedTask(Some(Err(_err))) => todo!(),
+                    Event::Incoming(None) | Event::Cancel => break,
                     _ => (),
                 }
             }
 
             while let Some(result) = set.join_next_with_id().await {
                 match result {
-                    Ok((id, Ok(_))) => tracing::info!("Session {id} completed successfully"),
-                    Ok((id, Err(cause))) => tracing::warn! { %cause, "Session {id} failed" },
+                    Ok((id, Ok(_))) => info!("Session {id} completed successfully"),
+                    Ok((id, Err(cause))) => warn! { %cause, "Session {id} failed" },
                     Err(_) => todo!(),
                 }
             }
@@ -658,47 +653,6 @@ impl ServerHandle {
         self.handle.await
     }
 }
-
-// pub async fn list_devices(state: State<state::ServerDecideResp>) -> Result<(), Error> {
-//     let mut stream = state.list_devices();
-
-//     for device in nusb::list_devices()? {
-//         let to_send = proto::UsbDeviceInfo {
-//             id: proto::UsbDeviceId {
-//                 bus_number: device.bus_number(),
-//                 device_addr: device.device_address(),
-//             },
-//             bus_id: proto::BusId(std::borrow::Cow::Borrowed(
-//                 device
-//                     .sysfs_path()
-//                     .file_name()
-//                     .unwrap()
-//                     .to_str()
-//                     .unwrap()
-//                     .try_into()
-//                     .unwrap(),
-//             )),
-//             vendor_id: device.vendor_id(),
-//             product_id: device.product_id(),
-//             class: device.class(),
-//             subclass: device.subclass(),
-//             protocol: device.protocol(),
-//             interfaces: device
-//                 .interfaces()
-//                 .map(|int| proto::InterfaceInfo {
-//                     interface_number: int.interface_number(),
-//                     class: int.subclass(),
-//                     subclass: int.subclass(),
-//                     protocol: int.protocol(),
-//                 })
-//                 .collect(),
-//         };
-
-//         stream.send_device_info(&to_send).await?;
-//     }
-
-//     stream.finish().await
-// }
 
 // bitflags! {
 //     struct Features: u8 {

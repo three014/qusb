@@ -29,17 +29,17 @@ pub struct Register {
     data_rate: DataRate,
 }
 
-type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::Sender<vhci::ioctl::IocWork>>;
+type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::Sender<vhci::ioctl::Work>>;
 
 struct Demuxer {
-    register_rx: mpsc::Receiver<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::IocWork>)>>,
+    register_rx: mpsc::Receiver<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
     disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
     vhci: vhci::Controller,
 }
 
 impl Demuxer {
     fn new(
-        register_rx: mpsc::Receiver<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::IocWork>)>>,
+        register_rx: mpsc::Receiver<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
         disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
         vhci: vhci::Controller,
     ) -> Self {
@@ -71,7 +71,7 @@ impl Demuxer {
         }
 
         enum Event {
-            Register(Option<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::IocWork>)>>),
+            Register(Option<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>),
             Disconnect(Option<Ctrl<Port>>),
             Work(vhci::ioctl::IocWork),
         }
@@ -85,7 +85,7 @@ impl Demuxer {
             Register(
                 (
                     io::Result<Port>,
-                    oneshot::Sender<io::Result<(Port, mpsc::Receiver<vhci::ioctl::IocWork>)>>,
+                    oneshot::Sender<io::Result<(Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
                 ),
             ),
             Other,
@@ -171,7 +171,7 @@ impl Demuxer {
                                     && STANDARD_DEVICE_SET_ADDRESS
                                         == (
                                             urb.setup_packet.request_type(),
-                                            urb.setup_packet.request(),
+                                            urb.setup_packet.req(),
                                         ) =>
                             {
                                 let address = Address::new(urb.setup_packet.value() as u8)
@@ -206,7 +206,8 @@ impl Demuxer {
                         }
                     };
                     if let Some(tx) = tx {
-                        if tx.send(work).await.is_err() {
+                        // SAFETY: Work item is still unaltered from the ioctl
+                        if tx.send(unsafe { work.into_inner() }).await.is_err() {
                             // TODO: Remove by which key? By the value itself?
                         }
                     }
@@ -261,7 +262,7 @@ impl Demuxer {
 #[derive(Debug, Clone)]
 pub struct Controller {
     handle: Arc<Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>>,
-    register_tx: mpsc::Sender<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::IocWork>)>>,
+    register_tx: mpsc::Sender<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
     disconnect_tx: mpsc::Sender<Ctrl<Port>>,
     remote: vhci::Remote,
 }
@@ -290,7 +291,7 @@ impl Controller {
         &mut self,
         port: RegisterPort,
         data_rate: DataRate,
-    ) -> io::Result<(Port, mpsc::Receiver<vhci::ioctl::IocWork>)> {
+    ) -> io::Result<(Port, mpsc::Receiver<vhci::ioctl::Work>)> {
         let (rx, register) = Ctrl::new(Register { port, data_rate });
 
         // Let the work runner know that a new port needs enumeration.
@@ -299,7 +300,10 @@ impl Controller {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub fn fetch_data<T: vhci::Urb>(&self, urb: T) -> io::Result<()> {
+    pub fn fetch_data<T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut>(
+        &self,
+        urb: T,
+    ) -> io::Result<()> {
         if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
             tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
         {
@@ -309,7 +313,10 @@ impl Controller {
         }
     }
 
-    pub fn giveback_urb<T: vhci::Urb>(&self, urb: T) -> io::Result<()> {
+    pub fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
+        &self,
+        urb: T,
+    ) -> io::Result<()> {
         if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
             tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
         {
@@ -419,93 +426,89 @@ mod tests {
         while Duration::from_secs(10) > start.elapsed() {
             debug!("==============================================");
             match work_rx.recv().await {
-                // SAFETY: The ioctl struct is unaltered, so the
-                //         typ field should match the union data.
-                Some(work) => match unsafe { work.into_inner() } {
-                    vhci::ioctl::Work::PortStat(next_stat) => {
-                        debug!("got port stat for {:?}", next_stat.index());
-                        debug!("status: {:?}", next_stat.status());
-                        debug!("change: {:?}", next_stat.change());
-                        debug!("index: {:?}", next_stat.index());
-                        debug!("flags: {:?}", next_stat.flags());
-                        if next_stat.change().contains(PortChange::CONNECTION) {
-                            trace!("CONNECTION state changed -> invalidating address");
-                            addr = 0xff;
-                        }
-                        if next_stat.change().contains(PortChange::RESET)
-                            && (!next_stat.status()).contains(PortStatus::RESET)
-                            && next_stat.status().contains(PortStatus::ENABLE)
-                        {
-                            trace!("RESET successful -> use default address");
-                            addr = 0;
-                        }
-                        if prev_stat.status().contains(PortStatus::POWER)
-                            && (!next_stat.status()).contains(PortStatus::POWER)
-                        {
-                            trace!("port is powered off");
-                        }
-                        if (!prev_stat.status()).contains(PortStatus::RESET)
-                            && next_stat
-                                .status()
-                                .contains(PortStatus::RESET | PortStatus::CONNECTION)
-                        {
-                            trace!("port is resetting -> completing reset");
-                            controller.reset_done(next_stat.index(), true).unwrap();
-                        }
-                        if (!prev_stat.flags()).contains(PortFlag::RESUMING)
-                            && next_stat.flags().contains(PortFlag::RESUMING)
-                            && next_stat.status().contains(PortStatus::CONNECTION)
-                        {
-                            trace!("port is resuming -> completing resume");
-                            todo!("do the actual resume thing");
-                        }
-                        prev_stat = next_stat;
+                Some(vhci::ioctl::Work::PortStat(next_stat)) => {
+                    debug!("got port stat for {:?}", next_stat.index());
+                    debug!("status: {:?}", next_stat.status());
+                    debug!("change: {:?}", next_stat.change());
+                    debug!("index: {:?}", next_stat.index());
+                    debug!("flags: {:?}", next_stat.flags());
+                    if next_stat.change().contains(PortChange::CONNECTION) {
+                        trace!("CONNECTION state changed -> invalidating address");
+                        addr = 0xff;
                     }
-                    vhci::ioctl::Work::ProcessUrb((urb, handle)) => {
-                        debug!(
-                            "got process urb for {:?} at {:?}",
-                            urb.address, urb.endpoint
-                        );
-                        if addr != urb.address.get() {
-                            warn!("not for usb device at {port:?}. skipping.");
-                            continue;
-                        }
-
-                        let mut urb = UrbWithData::from_ioctl(urb, handle);
-                        if urb.needs_data_fetch() {
-                            match controller.fetch_data(&mut urb) {
-                                Ok(_) => {}
-                                Err(err)
-                                    if err
-                                        .raw_os_error()
-                                        .is_some_and(|errno| libc::ECANCELED == errno) => {}
-                                Err(err) => Err(err).unwrap(),
-                            }
-                        }
-
-                        let urb_ctrl_req = (
-                            urb.control_packet().request_type(),
-                            urb.control_packet().request(),
-                        );
-                        if vhci::ioctl::UrbType::Ctrl == urb.kind()
-                            && urb.endpoint().is_anycast()
-                            && STANDARD_DEVICE_SET_ADDRESS == urb_ctrl_req
-                        {
-                            if let Some(new_addr) =
-                                Address::new(urb.control_packet().value().try_into().unwrap())
-                            {
-                                urb.set_status(vhci::Status::Success);
-                                addr = new_addr.get();
-                                trace!("SET_ADDRESS (addr={:#x})", addr);
-                            }
-                        }
-
-                        urb.set_status(vhci::Status::Stall);
-                        controller.giveback_urb(urb).unwrap();
-                        break;
+                    if next_stat.change().contains(PortChange::RESET)
+                        && (!next_stat.status()).contains(PortStatus::RESET)
+                        && next_stat.status().contains(PortStatus::ENABLE)
+                    {
+                        trace!("RESET successful -> use default address");
+                        addr = 0;
                     }
-                    vhci::ioctl::Work::CancelUrb(handle) => unreachable!(),
-                },
+                    if prev_stat.status().contains(PortStatus::POWER)
+                        && (!next_stat.status()).contains(PortStatus::POWER)
+                    {
+                        trace!("port is powered off");
+                    }
+                    if (!prev_stat.status()).contains(PortStatus::RESET)
+                        && next_stat
+                            .status()
+                            .contains(PortStatus::RESET | PortStatus::CONNECTION)
+                    {
+                        trace!("port is resetting -> completing reset");
+                        controller.reset_done(next_stat.index(), true).unwrap();
+                    }
+                    if (!prev_stat.flags()).contains(PortFlag::RESUMING)
+                        && next_stat.flags().contains(PortFlag::RESUMING)
+                        && next_stat.status().contains(PortStatus::CONNECTION)
+                    {
+                        trace!("port is resuming -> completing resume");
+                        todo!("do the actual resume thing");
+                    }
+                    prev_stat = next_stat;
+                }
+                Some(vhci::ioctl::Work::ProcessUrb((urb, handle))) => {
+                    debug!(
+                        "got process urb for {:?} at {:?}",
+                        urb.address, urb.endpoint
+                    );
+                    if addr != urb.address.get() {
+                        warn!("not for usb device at {port:?}. skipping.");
+                        continue;
+                    }
+
+                    let mut urb = UrbWithData::from_ioctl(urb, handle);
+                    if urb.needs_data_fetch() {
+                        match controller.fetch_data(&mut urb) {
+                            Ok(_) => {}
+                            Err(err)
+                                if err
+                                    .raw_os_error()
+                                    .is_some_and(|errno| libc::ECANCELED == errno) => {}
+                            Err(err) => Err(err).unwrap(),
+                        }
+                    }
+
+                    let urb_ctrl_req = (
+                        urb.control_packet().request_type(),
+                        urb.control_packet().req(),
+                    );
+                    if vhci::ioctl::UrbType::Ctrl == urb.kind()
+                        && urb.endpoint().is_anycast()
+                        && STANDARD_DEVICE_SET_ADDRESS == urb_ctrl_req
+                    {
+                        if let Some(new_addr) =
+                            Address::new(urb.control_packet().value().try_into().unwrap())
+                        {
+                            urb.set_status(vhci::Status::Success);
+                            addr = new_addr.get();
+                            trace!("SET_ADDRESS (addr={:#x})", addr);
+                        }
+                    }
+
+                    urb.set_status(vhci::Status::Stall);
+                    controller.giveback_urb(urb).unwrap();
+                    break;
+                }
+                Some(vhci::ioctl::Work::CancelUrb(handle)) => unreachable!(),
                 None => break,
             }
         }

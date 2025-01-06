@@ -8,7 +8,7 @@ pub mod urb;
 pub const QUSB_VER: msg::Version = msg::Version {
     major: 0,
     minor: 1,
-    patch: zerocopy::little_endian::U16::ZERO,
+    patch: 0,
 };
 
 pub const BUS_ID_SIZE: usize = 32;

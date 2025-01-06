@@ -2,11 +2,13 @@ use std::{io, marker::PhantomData};
 
 use bytes::Buf;
 
+use bytes::BufMut;
 use bytes::BytesMut;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
 use zerocopy::ConvertError;
+use zerocopy::FromZeros;
 use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
 use crate::GetSliceLen;
@@ -91,6 +93,14 @@ impl Ring {
         Self {
             buf: BytesMut::with_capacity(cap),
         }
+    }
+
+    pub fn reserve(&mut self, num_bytes: usize) -> Option<BytesMut> {
+        if num_bytes > self.buf.spare_capacity_mut().len() {
+            return None;
+        }
+
+        Some(self.buf.split_off(self.buf.len()))
     }
 
     pub fn peek<T>(&self) -> io::Result<&T>

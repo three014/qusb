@@ -29,8 +29,30 @@ pub struct Sender {
     iso_tx: quinn::Connection,
 }
 
+impl Sender {
+    /// # Panic
+    ///
+    /// Panics when `iso_urb` is not an ISO transfer.
+    pub async fn send<U: proto::msg::SendUrb>(&mut self, stream_id: quinn::StreamId, iso_urb: U) {
+        let urb = iso_urb.urb();
+        let transfer = iso_urb.transfer();
+        let iso_packets = iso_urb.iso_packets_tx();
+        if vhci::ioctl::UrbType::Iso != iso_urb.urb().kind {
+            panic!("URB must be an ISO transfer");
+        }
+
+        // self.iso_tx.send_datagram()
+    }
+}
+
 pub struct Receiver {
     iso_rx: mpsc::Receiver<Bytes>,
+}
+
+impl Receiver {
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.iso_rx.recv().await
+    }
 }
 
 pub struct Demuxer {
