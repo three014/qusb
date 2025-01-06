@@ -8,7 +8,7 @@ use crate::utils::{Ctrl, NoHash, SimpleMap};
 
 #[derive(Debug)]
 pub struct Handle {
-    pub handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    pub handle: tokio::task::JoinHandle<io::Result<()>>,
     pub register_tx: mpsc::Sender<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>,
     pub disconnect_tx: mpsc::Sender<Ctrl<quinn::StreamId, (), Infallible>>,
     pub conn: quinn::Connection,
@@ -62,7 +62,7 @@ pub struct Demuxer {
 }
 
 impl Demuxer {
-    pub async fn run(self) -> std::io::Result<()> {
+    pub async fn run(self) -> io::Result<()> {
         let Self {
             mut register_rx,
             mut disconnect_rx,
@@ -73,7 +73,7 @@ impl Demuxer {
 
         enum Event {
             Register(Option<Ctrl<quinn::StreamId, mpsc::Receiver<Bytes>, Infallible>>),
-            Datagram(Result<Bytes, quinn::ConnectionError>),
+            Datagram(std::result::Result<Bytes, quinn::ConnectionError>),
             Disconnect(Option<Ctrl<quinn::StreamId, (), Infallible>>),
         }
 

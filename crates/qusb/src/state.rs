@@ -10,9 +10,9 @@ use proto::{
     data::{Data, Ring},
     msg::{self, Header, IsoPacketData, IsoPacketGiveback, Transfer, UrbHeader},
 };
-use rusb::{UsbContext, UsbOption};
+use rusb::UsbContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace, Instrument};
+use tracing::{debug, trace};
 use vhci::{
     ioctl,
     usbfs::{
@@ -27,7 +27,7 @@ use crate::{
     dev::{self, RegisterPort},
     iso,
     utils::{self, SimpleMap},
-    Error, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
+    Error, Result, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
 };
 
 /// Rust-representation of a peer request
@@ -129,7 +129,7 @@ where
                 maybe_work = work_rx.recv() => {
                     Event::Work(maybe_work)
                 }
-                maybe_bytes = buf_rx.read_into_from_reader(&mut rx) => {
+                maybe_bytes = buf_rx.fill_with_reader(&mut rx) => {
                     Event::UrbResp(maybe_bytes)
                 }
             };
@@ -174,13 +174,18 @@ where
                     }
                     prev = next;
                 }
-                Event::Work(Some(ioctl::Work::ProcessUrb((urb, _))))
+                Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle))))
                     if ioctl::UrbType::Ctrl == urb.typ
                         && urb.address.is_for_unassigned()
                         && STANDARD_DEVICE_SET_ADDRESS
                             == (urb.setup_packet.request_type(), urb.setup_packet.req()) =>
                 {
-                    addr = urb.setup_packet.w_value.try_into().unwrap();
+                    addr = urb.setup_packet.value().try_into().unwrap();
+
+                    let mut urb = vhci::UrbWithData::from_ioctl(urb, handle);
+                    urb.set_status(vhci::Status::Success);
+
+                    vhci.giveback_urb(urb).unwrap();
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle)))) => {
                     assert_eq!(addr, urb.address.get());
@@ -411,7 +416,7 @@ where
     W: AsyncWrite + utils::CloseStream + Unpin,
     R: AsyncRead + Unpin,
 {
-    pub async fn run(self) -> Result<(), Error> {
+    pub async fn run(self) -> Result<()> {
         let Self {
             mut tx,
             mut rx,
@@ -456,7 +461,7 @@ where
         const HEADER_SIZE: usize = size_of::<Header>();
 
         loop {
-            match buf_rx.read_into_from_reader(&mut rx).await {
+            match buf_rx.fill_with_reader(&mut rx).await {
                 Ok(_) if HEADER_SIZE < buf_rx.len() => {
                     let header: Header = buf_rx.read().unwrap();
 
@@ -543,10 +548,7 @@ impl<W> ServerListDevices<W>
 where
     W: AsyncWrite + utils::CloseStream + Unpin,
 {
-    pub async fn resp_list_devices<'a, I, T>(
-        self,
-        iter: impl Fn() -> io::Result<I>,
-    ) -> Result<(), Error>
+    pub async fn resp_list_devices<'a, I, T>(self, iter: impl Fn() -> io::Result<I>) -> Result<()>
     where
         I: Iterator<Item = T>,
         T: msg::SendUsbDeviceInfo,

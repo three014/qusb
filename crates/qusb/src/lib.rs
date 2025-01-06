@@ -1,3 +1,4 @@
+use bytes::Buf;
 use iso::{Demuxer, Handle};
 use proto::{
     data::{IterDst, IterMutDst, Ring},
@@ -14,7 +15,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{io::AsyncWriteExt, sync::mpsc};
 use tracing::{debug, error, info, trace, warn};
 use usb_ids::UsbIds;
 use utils::CloseStream;
@@ -32,6 +33,8 @@ pub mod utils;
 
 static USB_IDS: LazyLock<UsbIds> =
     LazyLock::new(|| usb_ids::parse(Path::new("./usb-ids")).unwrap());
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn usb_ids() -> &'static UsbIds {
     USB_IDS.deref()
@@ -147,13 +150,13 @@ impl vhci::Urb for UrbWithIsoData<'_> {
 
 impl vhci::TransferMut for UrbWithIsoData<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
-        &mut self.transfer
+        self.transfer
     }
 }
 
 impl vhci::IsoPacketDataMut for UrbWithIsoData<'_> {
     fn iso_packet_data_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketData] {
-        &mut self.iso_data
+        self.iso_data
     }
 }
 
@@ -184,13 +187,13 @@ impl vhci::Urb for UrbWithIsoGiveback<'_> {
 
 impl vhci::TransferMut for UrbWithIsoGiveback<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
-        &mut self.transfer
+        self.transfer
     }
 }
 
 impl vhci::IsoPacketGivebackMut for UrbWithIsoGiveback<'_> {
     fn iso_packet_giveback_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketGiveback] {
-        &mut self.iso_giveback
+        self.iso_giveback
     }
 
     fn error_count(&self) -> u16 {
@@ -256,13 +259,13 @@ impl Session {
     #[tracing::instrument(skip_all, level = "trace")]
     pub async fn accept_stream(
         &self,
-    ) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>, Error> {
+    ) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>> {
         let (mut tx, mut rx) = self.conn.accept_bi().await?;
         let mut buf = Ring::with_capacity(32);
 
         const SIZE_OF_REQUEST: usize = size_of::<msg::Version>() + size_of::<msg::Request>();
         while SIZE_OF_REQUEST > buf.len() {
-            buf.read_into_from_reader(&mut rx).await?;
+            buf.fill_with_reader(&mut rx).await?;
         }
 
         let version: msg::Version = buf.read()?;
@@ -283,7 +286,7 @@ impl Session {
                 let mut slot = self.iso.lock().unwrap();
                 if slot
                     .as_ref()
-                    .is_none_or(|&Handle { ref handle, .. }| handle.is_finished())
+                    .is_none_or(|Handle { handle, .. }| handle.is_finished())
                 {
                     *slot = None;
                 }
@@ -303,7 +306,7 @@ impl Session {
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                tx.write_all(msg::Status::Unexpected.as_bytes()).await?;
+                tx.write_all(msg::Status::Proto.as_bytes()).await?;
                 tx.close().await?;
                 return Err(err.into());
             }
@@ -314,7 +317,7 @@ impl Session {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    pub async fn req_list_devices(&self) -> Result<UsbDevices, Error> {
+    pub async fn req_list_devices(&self) -> Result<UsbDevices> {
         let (mut tx, mut rx) = self
             .conn
             .open_bi()
@@ -336,7 +339,7 @@ impl Session {
 
         while 0
             == buf
-                .read_into_from_reader(&mut rx)
+                .fill_with_reader(&mut rx)
                 .await
                 .inspect_err(|err| error!("{err}"))?
         {}
@@ -365,20 +368,25 @@ impl Session {
     pub async fn borrow_device(
         &self,
         id: msg::UsbDeviceId,
-    ) -> Result<ClientBorrowDevice<quinn::SendStream, quinn::RecvStream>, Error> {
+    ) -> Result<ClientBorrowDevice<quinn::SendStream, quinn::RecvStream>> {
         let (mut tx, mut rx) = self.conn.open_bi().await?;
         let mut buf = Ring::with_capacity(1024);
 
         let version = proto::QUSB_VER;
         let req = msg::Request::BorrowDevice;
 
-        tx.write_all(version.as_bytes()).await?;
-        tx.write_all(req.as_bytes()).await?;
-        tx.write_all(id.as_bytes()).await?;
-        tx.write_all(&[0, 0, 0, 0, 0, 0]).await?;
+        let mut req = version
+            .as_bytes()
+            .chain(req.as_bytes())
+            .chain(id.as_bytes())
+            .chain(&[0u8; 6][..]);
+
+        debug_assert_eq!(req.remaining() % size_of::<u64>(), 0);
+
+        tx.write_all_buf(&mut req).await?;
 
         while size_of::<msg::Status>() + 7 > buf.len() {
-            buf.read_into_from_reader(&mut rx).await?;
+            buf.fill_with_reader(&mut rx).await?;
         }
 
         let status = buf.read()?;
@@ -396,7 +404,7 @@ impl Session {
             }
             msg::Status::VersionMismatch => {
                 if size_of::<msg::Version>() + 4 > buf.len() {
-                    buf.read_into_from_reader(&mut rx).await?;
+                    buf.fill_with_reader(&mut rx).await?;
                 }
                 let their_version = buf.read::<msg::Version>()?;
                 return Err(Error::VersionMismatch(their_version));
@@ -408,7 +416,7 @@ impl Session {
         let mut slot = self.iso.lock().unwrap();
         if slot
             .as_ref()
-            .is_none_or(|&Handle { ref handle, .. }| handle.is_finished())
+            .is_none_or(|Handle { handle, .. }| handle.is_finished())
         {
             *slot = None;
         }
@@ -439,7 +447,7 @@ pub struct Client {
 
 impl Client {
     #[tracing::instrument(skip(self), level = "debug")]
-    pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Result<Session, Error> {
+    pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Result<Session> {
         let conn = self.endpoint.connect(peer_addr, peer_name).unwrap().await?;
         Ok(Session::new(conn, self.dev.clone()))
     }
@@ -547,7 +555,7 @@ impl ReqHandler {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn run(self) -> Result<(), Error> {
+    async fn run(self) -> Result<()> {
         let conn = self.incoming.await?;
         trace!(
             "established new session with {} - RTT {:?}",
@@ -561,6 +569,8 @@ impl ReqHandler {
         }
     }
 }
+
+pub type ServerTaskResult = std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>;
 
 #[derive(Debug)]
 pub struct Server {
@@ -578,9 +588,8 @@ impl Server {
             info!("Server ready to accept new connections");
 
             async fn check_for_completed_task(
-                set: &mut tokio::task::JoinSet<Result<(), Error>>,
-            ) -> Option<Result<(tokio::task::Id, Result<(), Error>), tokio::task::JoinError>>
-            {
+                set: &mut tokio::task::JoinSet<Result<()>>,
+            ) -> Option<ServerTaskResult> {
                 if set.is_empty() {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
@@ -590,9 +599,7 @@ impl Server {
             enum Event {
                 Incoming(Option<quinn::Incoming>),
                 Cancel,
-                MaybeCompletedTask(
-                    Option<Result<(tokio::task::Id, Result<(), Error>), tokio::task::JoinError>>,
-                ),
+                MaybeCompletedTask(Option<ServerTaskResult>),
             }
 
             loop {
@@ -643,12 +650,12 @@ impl Server {
 }
 
 pub struct ServerHandle {
-    handle: tokio::task::JoinHandle<Result<(), Error>>,
+    handle: tokio::task::JoinHandle<Result<()>>,
     cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl ServerHandle {
-    pub async fn shutdown(self) -> Result<Result<(), Error>, tokio::task::JoinError> {
+    pub async fn shutdown(self) -> std::result::Result<Result<()>, tokio::task::JoinError> {
         self.cancel_token.cancel();
         self.handle.await
     }

@@ -29,17 +29,18 @@ pub struct Register {
     data_rate: DataRate,
 }
 
+pub type WorkReceiver = mpsc::Receiver<vhci::ioctl::Work>;
 type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::Sender<vhci::ioctl::Work>>;
 
 struct Demuxer {
-    register_rx: mpsc::Receiver<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
+    register_rx: mpsc::Receiver<Ctrl<Register, (Port, WorkReceiver)>>,
     disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
     vhci: vhci::Controller,
 }
 
 impl Demuxer {
     fn new(
-        register_rx: mpsc::Receiver<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
+        register_rx: mpsc::Receiver<Ctrl<Register, (Port, WorkReceiver)>>,
         disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
         vhci: vhci::Controller,
     ) -> Self {
@@ -71,7 +72,7 @@ impl Demuxer {
         }
 
         enum Event {
-            Register(Option<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>),
+            Register(Option<Ctrl<Register, (Port, WorkReceiver)>>),
             Disconnect(Option<Ctrl<Port>>),
             Work(vhci::ioctl::IocWork),
         }
@@ -85,7 +86,7 @@ impl Demuxer {
             Register(
                 (
                     io::Result<Port>,
-                    oneshot::Sender<io::Result<(Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
+                    oneshot::Sender<io::Result<(Port, WorkReceiver)>>,
                 ),
             ),
             Other,
@@ -249,7 +250,7 @@ impl Demuxer {
             }
         });
         work_rx.close();
-        while let Some(_) = work_rx.recv().await {}
+        while (work_rx.recv().await).is_some() {}
         drop(work_rx);
 
         trace!("about to wait on recv_work thread");
@@ -262,7 +263,7 @@ impl Demuxer {
 #[derive(Debug, Clone)]
 pub struct Controller {
     handle: Arc<Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>>,
-    register_tx: mpsc::Sender<Ctrl<Register, (Port, mpsc::Receiver<vhci::ioctl::Work>)>>,
+    register_tx: mpsc::Sender<Ctrl<Register, (Port, WorkReceiver)>>,
     disconnect_tx: mpsc::Sender<Ctrl<Port>>,
     remote: vhci::Remote,
 }
@@ -291,7 +292,7 @@ impl Controller {
         &mut self,
         port: RegisterPort,
         data_rate: DataRate,
-    ) -> io::Result<(Port, mpsc::Receiver<vhci::ioctl::Work>)> {
+    ) -> io::Result<(Port, WorkReceiver)> {
         let (rx, register) = Ctrl::new(Register { port, data_rate });
 
         // Let the work runner know that a new port needs enumeration.
@@ -349,7 +350,9 @@ impl Controller {
     pub async fn shutdown(self) {
         drop(self.register_tx);
         drop(self.disconnect_tx);
-        if let Some(handle) = self.handle.lock().unwrap().take() {
+        let handle = self.handle.lock().unwrap().take();
+        drop(self.handle);
+        if let Some(handle) = handle {
             trace!("about to wait for async handle");
             match handle.await {
                 Ok(Ok(_)) => trace!("controller thread finished with no issues"),
@@ -371,7 +374,7 @@ fn recv_work(
     }
 
     const TIMEOUT: TimeoutMillis = TimeoutMillis::Time(BoundedI16::new(999).unwrap());
-    while let Some(_) = match work_rx.fetch_work_timeout(TIMEOUT) {
+    while (match work_rx.fetch_work_timeout(TIMEOUT) {
         Ok(work) => work_tx.blocking_send(work).ok(),
         Err(err)
             if err.kind() == io::ErrorKind::TimedOut
@@ -384,7 +387,9 @@ fn recv_work(
             (!work_tx.is_closed()).then_some(())
         }
         Err(err) => return Err(err),
-    } {}
+    })
+    .is_some()
+    {}
 
     trace!("done with receiving work for VHCI");
     Ok(())

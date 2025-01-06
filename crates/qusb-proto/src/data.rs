@@ -2,13 +2,11 @@ use std::{io, marker::PhantomData};
 
 use bytes::Buf;
 
-use bytes::BufMut;
 use bytes::BytesMut;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
 use zerocopy::ConvertError;
-use zerocopy::FromZeros;
 use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
 use crate::GetSliceLen;
@@ -198,7 +196,7 @@ impl Ring {
             .map_while(|chunk| T::try_ref_from_bytes(chunk).ok())
     }
 
-    pub fn iter_dst<'a, T>(&'a self) -> IterDst<'a, T>
+    pub fn iter_dst<T>(&self) -> IterDst<'_, T>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
@@ -217,7 +215,7 @@ impl Ring {
             .map_while(|chunk| T::try_mut_from_bytes(chunk).ok())
     }
 
-    pub fn iter_mut_dst<'a, T>(&'a mut self) -> IterMutDst<'a, T>
+    pub fn iter_mut_dst<T>(&mut self) -> IterMutDst<'_, T>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
@@ -227,7 +225,7 @@ impl Ring {
         }
     }
 
-    pub async fn read_into_from_reader<R>(&mut self, mut rx: R) -> io::Result<usize>
+    pub async fn fill_with_reader<R>(&mut self, mut rx: R) -> io::Result<usize>
     where
         R: AsyncRead + Unpin,
     {
@@ -241,5 +239,9 @@ impl Ring {
 
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
 }
