@@ -92,7 +92,7 @@ use thiserror::Error;
 use zerocopy::{try_transmute, IntoBytes};
 use zerocopy_derive::*;
 
-use crate::GetSliceLen;
+use crate::{GetSliceLen, GetSliceLenErr};
 
 pub const BUS_ID_MAX_LEN: u8 = 32;
 pub const PATH_MAX_LEN: u16 = 256;
@@ -253,17 +253,17 @@ impl UsbDeviceInfo {
 }
 
 impl GetSliceLen for UsbDeviceInfo {
-    fn get_slice_len(buf: &[u8]) -> Option<usize> {
+    fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         let size_of_base = std::mem::size_of::<UsbDeviceInfoHeader>();
         if size_of_base > buf.len() {
-            return None;
+            return Err(GetSliceLenErr::BufferShort);
         }
 
         const HEADER_OFFSET: usize = std::mem::offset_of!(UsbDeviceInfo, header);
         const LEN_OFFSET: usize =
             HEADER_OFFSET + std::mem::offset_of!(UsbDeviceInfoHeader, padded_num_interfaces);
         let len = buf[LEN_OFFSET];
-        Some(len as usize)
+        Ok(len as usize)
     }
 }
 
@@ -351,15 +351,15 @@ impl Transfer {
 }
 
 impl GetSliceLen for Transfer {
-    fn get_slice_len(buf: &[u8]) -> Option<usize> {
+    fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         if std::mem::size_of::<TransferHeader>() > buf.len() {
-            return None;
+            return Err(GetSliceLenErr::BufferShort);
         }
 
         const LEN_OFFSET: usize = std::mem::offset_of!(TransferHeader, aligned_len);
         let len_bytes = &buf[LEN_OFFSET..LEN_OFFSET + size_of::<u16>()];
         let len = u16::from_le_bytes(len_bytes.try_into().unwrap());
-        Some(len.into())
+        Ok(len.into())
     }
 }
 
@@ -388,15 +388,15 @@ impl IsoPacketData {
 }
 
 impl GetSliceLen for IsoPacketData {
-    fn get_slice_len(buf: &[u8]) -> Option<usize> {
+    fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         if std::mem::size_of::<IsoPacketHeader>() > buf.len() {
-            return None;
+            return Err(GetSliceLenErr::BufferShort);
         }
 
         const LEN_OFFSET: usize = std::mem::offset_of!(IsoPacketHeader, len);
         let len_bytes = &buf[LEN_OFFSET..LEN_OFFSET + size_of::<u16>()];
         let len = u16::from_le_bytes(len_bytes.try_into().unwrap());
-        Some(len.into())
+        Ok(len.into())
     }
 }
 
@@ -418,15 +418,15 @@ impl IsoPacketGiveback {
 }
 
 impl GetSliceLen for IsoPacketGiveback {
-    fn get_slice_len(buf: &[u8]) -> Option<usize> {
+    fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         if std::mem::size_of::<IsoPacketHeader>() > buf.len() {
-            return None;
+            return Err(GetSliceLenErr::BufferShort);
         }
 
         const LEN_OFFSET: usize = std::mem::offset_of!(IsoPacketHeader, len);
         let len_bytes = &buf[LEN_OFFSET..LEN_OFFSET + size_of::<u16>()];
         let len = u16::from_le_bytes(len_bytes.try_into().unwrap());
-        Some(len.into())
+        Ok(len.into())
     }
 }
 
@@ -449,42 +449,42 @@ pub struct DeviceDescriptor {
     pub b_num_configurations: u8,
 }
 
-// pub trait SendUrb {
-//     fn urb(&self) -> &UrbHeader;
-//     fn transfer(&self) -> &Transfer;
-//     fn transfer_mut(&mut self) -> &mut Transfer;
-//     fn iso_packets_tx(&self) -> &IsoPacketData;
-//     fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData;
-//     fn iso_packets_rx(&self) -> &IsoPacketGiveback;
-//     fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback;
-// }
+pub trait SendUrb {
+    fn urb(&self) -> &UrbHeader;
+    fn transfer(&self) -> &Transfer;
+    fn transfer_mut(&mut self) -> &mut Transfer;
+    fn iso_packets_tx(&self) -> &IsoPacketData;
+    fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData;
+    fn iso_packets_rx(&self) -> &IsoPacketGiveback;
+    fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback;
+}
 
-// impl<T: SendUrb> SendUrb for &mut T {
-//     fn urb(&self) -> &UrbHeader {
-//         T::urb(self)
-//     }
+impl<T: SendUrb> SendUrb for &mut T {
+    fn urb(&self) -> &UrbHeader {
+        T::urb(self)
+    }
 
-//     fn transfer(&self) -> &Transfer {
-//         T::transfer(self)
-//     }
+    fn transfer(&self) -> &Transfer {
+        T::transfer(self)
+    }
 
-//     fn transfer_mut(&mut self) -> &mut Transfer {
-//         T::transfer_mut(self)
-//     }
+    fn transfer_mut(&mut self) -> &mut Transfer {
+        T::transfer_mut(self)
+    }
 
-//     fn iso_packets_tx(&self) -> &IsoPacketData {
-//         T::iso_packets_tx(self)
-//     }
+    fn iso_packets_tx(&self) -> &IsoPacketData {
+        T::iso_packets_tx(self)
+    }
 
-//     fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData {
-//         T::iso_packets_tx_mut(self)
-//     }
+    fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData {
+        T::iso_packets_tx_mut(self)
+    }
 
-//     fn iso_packets_rx(&self) -> &IsoPacketGiveback {
-//         T::iso_packets_rx(self)
-//     }
+    fn iso_packets_rx(&self) -> &IsoPacketGiveback {
+        T::iso_packets_rx(self)
+    }
 
-//     fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback {
-//         T::iso_packets_rx_mut(self)
-//     }
-// }
+    fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback {
+        T::iso_packets_rx_mut(self)
+    }
+}

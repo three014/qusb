@@ -3,6 +3,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -14,7 +15,7 @@ use vhci::{
     DataRate, Port,
 };
 
-use crate::utils::{Ctrl, NoHash, ThreeKeyMap};
+use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap};
 
 /// Specifies which port to plug virtual USB device into.
 pub enum RegisterPort {
@@ -34,6 +35,7 @@ type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::Sender<vhci::i
 
 struct Demuxer {
     register_rx: mpsc::Receiver<Ctrl<Register, (Port, WorkReceiver)>>,
+    giveback_rx: mpsc::Receiver<UrbHandle>,
     disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
     vhci: vhci::Controller,
 }
@@ -41,11 +43,13 @@ struct Demuxer {
 impl Demuxer {
     fn new(
         register_rx: mpsc::Receiver<Ctrl<Register, (Port, WorkReceiver)>>,
+        giveback_rx: mpsc::Receiver<UrbHandle>,
         disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
         vhci: vhci::Controller,
     ) -> Self {
         Self {
             register_rx,
+            giveback_rx,
             disconnect_rx,
             vhci,
         }
@@ -55,6 +59,7 @@ impl Demuxer {
     async fn run(self) -> io::Result<()> {
         let Self {
             mut register_rx,
+            mut giveback_rx,
             mut disconnect_rx,
             mut vhci,
         } = self;
@@ -73,6 +78,7 @@ impl Demuxer {
 
         enum Event {
             Register(Option<Ctrl<Register, (Port, WorkReceiver)>>),
+            GivebackUrb(Option<UrbHandle>),
             Disconnect(Option<Ctrl<Port>>),
             Work(vhci::ioctl::IocWork),
         }
@@ -103,6 +109,9 @@ impl Demuxer {
             let event = tokio::select! {
                 req = register_rx.recv() => {
                     Event::Register(req)
+                }
+                handle = giveback_rx.recv() => {
+                    Event::GivebackUrb(handle)
                 }
                 req = disconnect_rx.recv() => {
                     Event::Disconnect(req)
@@ -142,9 +151,18 @@ impl Demuxer {
                 })
                 .await
                 .unwrap(),
+                Event::GivebackUrb(Some(handle)) => tokio::task::spawn_blocking(move || {
+                    ctx.mailer.remove_by_key3(&handle);
+                    Ctx {
+                        cont: Continuation::Other,
+                        ctx,
+                    }
+                })
+                .await
+                .unwrap(),
                 Event::Disconnect(Some(Ctrl { data: port, tx })) => {
                     tokio::task::spawn_blocking(move || {
-                        ctx.mailer.remove_by_key1(&port);
+                        assert!(ctx.mailer.remove_by_key1(&port).is_some());
                         if ctx
                             .register_queue
                             .front()
@@ -161,6 +179,7 @@ impl Demuxer {
                     .unwrap()
                 }
                 Event::Work(work) => {
+                    let now = Instant::now();
                     let tx = match work.get() {
                         vhci::ioctl::WorkRef::PortStat(stat) => {
                             ctx.mailer.get_by_key1(&stat.index()).map(Cow::Borrowed)
@@ -175,13 +194,22 @@ impl Demuxer {
                                             urb.setup_packet.req(),
                                         ) =>
                             {
+                                // TODO: The logic around here is all messed up lmao
                                 let address = Address::new(urb.setup_packet.value() as u8)
                                     .expect("host should've assigned value address");
                                 let port = Port::new(address.get() - 1)
                                     .expect("host should've assigned valid address");
                                 assert_eq!(port, *ctx.register_queue.front().unwrap(), "wouldn't the new address correspond to the port currently registering its device?");
-                                ctx.mailer.link_key2_to_key1(NoHash(address), &port);
-                                ctx.mailer.link_key3_to_key1(handle, &port);
+
+                                ctx.mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
+                                assert_eq!(
+                                    LinkResult::Success,
+                                    ctx.mailer.link_key2_to_key1(NoHash(address), &port)
+                                );
+                                assert_eq!(
+                                    LinkResult::Success,
+                                    ctx.mailer.link_key3_to_key1(handle, &port)
+                                );
                                 ctx.register_queue.pop_front();
                                 ctx.mailer.get_by_key1(&port).map(Cow::Borrowed)
                             }
@@ -190,13 +218,19 @@ impl Demuxer {
                             {
                                 let maybe_port = ctx.register_queue.front().copied();
                                 maybe_port.and_then(|port| {
-                                    ctx.mailer.link_key3_to_key1(handle, &port);
+                                    assert_eq!(
+                                        LinkResult::Success,
+                                        ctx.mailer.link_key3_to_key1(handle, &port)
+                                    );
                                     ctx.mailer.get_by_key1(&port).map(Cow::Borrowed)
                                 })
                             }
                             _ => {
                                 let address = NoHash(urb.address);
-                                ctx.mailer.link_key3_to_key2(handle, &address);
+                                assert_eq!(
+                                    LinkResult::Success,
+                                    ctx.mailer.link_key3_to_key2(handle, &address)
+                                );
                                 ctx.mailer.get_by_key2(&address).map(Cow::Borrowed)
                             }
                         },
@@ -212,12 +246,16 @@ impl Demuxer {
                             // TODO: Remove by which key? By the value itself?
                         }
                     }
+                    let dur = now.elapsed();
+                    if Duration::from_micros(15) < dur {
+                        trace!("took {dur:?} to route URB");
+                    }
                     Ctx {
                         ctx,
                         cont: Continuation::Other,
                     }
                 }
-                Event::Register(None) | Event::Disconnect(None) => break,
+                Event::Register(None) | Event::Disconnect(None) | Event::GivebackUrb(None) => break,
             };
 
             let Ctx { ctx: c, cont } = cont;
@@ -226,7 +264,7 @@ impl Demuxer {
                 Continuation::Register((Ok(port), tx)) => {
                     ctx.register_queue.push_back(port);
                     let (work_tx, work_rx) = mpsc::channel(32);
-                    ctx.mailer.insert_by_key1(port, work_tx);
+                    assert!(ctx.mailer.insert_by_key1(port, work_tx).is_none());
                     if tx.send(Ok((port, work_rx))).is_err() {}
                 }
                 Continuation::Register((Err(err), tx)) => {
@@ -264,6 +302,7 @@ impl Demuxer {
 pub struct Controller {
     handle: Arc<Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>>,
     register_tx: mpsc::Sender<Ctrl<Register, (Port, WorkReceiver)>>,
+    giveback_tx: mpsc::Sender<UrbHandle>,
     disconnect_tx: mpsc::Sender<Ctrl<Port>>,
     remote: vhci::Remote,
 }
@@ -272,16 +311,18 @@ impl Controller {
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
         let (register_tx, register_rx) = mpsc::channel(4);
+        let (giveback_tx, giveback_rx) = mpsc::channel(32);
         let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
         let handle = Arc::new(Mutex::new(Some(tokio::spawn(
-            Demuxer::new(register_rx, disconnect_rx, vhci).run(),
+            Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).run(),
         ))));
 
         Ok(Self {
             handle,
             register_tx,
+            giveback_tx,
             disconnect_tx,
             remote,
         })
@@ -314,10 +355,11 @@ impl Controller {
         }
     }
 
-    pub fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
+    pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
         &self,
         urb: T,
     ) -> io::Result<()> {
+        let _ = self.giveback_tx.send(urb.handle()).await;
         if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
             tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
         {
@@ -363,7 +405,7 @@ impl Controller {
     }
 }
 
-#[tracing::instrument(level = "trace")]
+#[tracing::instrument(level = "trace", skip_all)]
 fn recv_work(
     work_rx: vhci::WorkReceiver,
     work_tx: mpsc::Sender<vhci::ioctl::IocWork>,
@@ -383,7 +425,6 @@ fn recv_work(
                     .raw_os_error()
                     .is_some_and(|err| err == vhci::libc::ENODATA) =>
         {
-            trace!("no data, but might try again");
             (!work_tx.is_closed()).then_some(())
         }
         Err(err) => return Err(err),
@@ -510,10 +551,10 @@ mod tests {
                     }
 
                     urb.set_status(vhci::Status::Stall);
-                    controller.giveback_urb(urb).unwrap();
+                    controller.giveback_urb(urb).await.unwrap();
                     break;
                 }
-                Some(vhci::ioctl::Work::CancelUrb(handle)) => unreachable!(),
+                Some(vhci::ioctl::Work::CancelUrb(_handle)) => unreachable!(),
                 None => break,
             }
         }

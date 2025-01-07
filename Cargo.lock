@@ -659,6 +659,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
  "usb_vhci",
  "zerocopy 0.8.14",

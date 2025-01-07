@@ -15,10 +15,10 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub fn make_channel(&self, id: quinn::StreamId) -> Option<(Sender, Receiver)> {
+    pub async fn make_channel(&self, id: quinn::StreamId) -> Option<(Sender, Receiver)> {
         let (rx, ctrl) = Ctrl::new(id);
-        self.register_tx.blocking_send(ctrl).ok()?;
-        let iso_rx = rx.blocking_recv().ok()?.unwrap();
+        self.register_tx.send(ctrl).await.ok()?;
+        let iso_rx = rx.await.ok()?.unwrap();
         let iso_tx = self.conn.clone();
 
         Some((Sender { iso_tx }, Receiver { iso_rx }))

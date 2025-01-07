@@ -1,14 +1,16 @@
 use std::{
     io,
-    num::NonZeroUsize,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use proto::{
-    data::{Data, Ring},
-    msg::{self, Header, IsoPacketData, IsoPacketGiveback, Transfer, UrbHeader},
+    data::{Data, ReadError, Ring},
+    msg::{
+        self, Header, IsoPacketData, IsoPacketGiveback, IsoPacketHeader, Transfer, TransferHeader,
+        UrbHeader,
+    },
 };
 use rusb::UsbContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -82,7 +84,7 @@ where
     /// Due to the reasons above, this function is not cancel
     /// safe.
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn run(self) {
+    pub async fn borrow(self) -> Result<()> {
         let Self {
             mut tx,
             mut rx,
@@ -108,6 +110,9 @@ where
 
         // Step 2: Setup context
         const HEADER_SIZE: usize = size_of::<Header>();
+        const MIN_URB_SUBMIT_SIZE: usize =
+            size_of::<UrbHeader>() + size_of::<TransferHeader>() + size_of::<IsoPacketHeader>();
+
         let seqnum = AtomicU64::new(0);
         let mut addr: u8 = 0xff;
         let mut prev = ioctl::IocPortStat::default();
@@ -115,6 +120,8 @@ where
             SimpleMap::<u64, ioctl::UrbHandle>::with_capacity_and_hasher(32, Default::default());
         let mut handles =
             SimpleMap::<ioctl::UrbHandle, u64>::with_capacity_and_hasher(32, Default::default());
+
+        trace!("starting event loop");
 
         // Step 3: Start event loop
         loop {
@@ -127,6 +134,7 @@ where
                 }
             };
 
+            debug!("==============================================");
             match event {
                 Event::Work(Some(ioctl::Work::PortStat(next))) => {
                     debug!("got port stat for {:?}", next.index());
@@ -174,14 +182,16 @@ where
                             == (urb.setup_packet.request_type(), urb.setup_packet.req()) =>
                 {
                     addr = urb.setup_packet.value().try_into().unwrap();
+                    trace!("set address to {addr:#x}");
 
                     let mut urb = vhci::UrbWithData::from_ioctl(urb, handle);
                     urb.set_status(vhci::Status::Success);
 
-                    vhci.giveback_urb(urb).unwrap();
+                    vhci.giveback_urb(urb).await.unwrap();
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle)))) => {
                     assert_eq!(addr, urb.address.get());
+                    trace!("got urb for {addr:#x}");
                     let now = Instant::now();
                     let next = seqnum.fetch_add(1, Ordering::Relaxed);
                     seqnums.insert(next, handle);
@@ -268,7 +278,14 @@ where
                         _padding: Default::default(),
                     };
 
-                    if urb.buffer_length > 0 || urb.packet_count > 0 {
+                    if vhci::usbfs::Dir::Out == urb.endpoint.direction()
+                        && (urb.buffer_length > 0 || urb.packet_count > 0)
+                    {
+                        trace!(
+                            "fetching data (transfer_len: {}, iso_packet_len: {})",
+                            urb.buffer_length,
+                            urb.packet_count
+                        );
                         let borrower_urb = UrbWithIsoData {
                             handle,
                             header: urb_header,
@@ -282,19 +299,26 @@ where
                     // And away we go!!!!
                     let dur = now.elapsed();
                     if Duration::from_micros(15) < dur {
-                        trace!("took {:?} to setup URB frame for sending", now);
+                        trace!("took {:?} to setup URB frame for sending", dur);
                     }
+
+                    trace!("about to write {} bytes to buffer", buf_tx.len());
                     tx.write_all_buf(&mut &buf_tx[..reserve_size])
                         .await
                         .unwrap();
                 }
                 Event::Work(Some(ioctl::Work::CancelUrb(handle))) => {
+                    // FIXME: Removing this before getting back the URB
+                    //        results in a panic!().
+                    //        If handle or seqnum is missing, then
+                    //        we disregard the URB because it was cancelled.
                     if let Some(seqnum) = handles.remove(&handle) {
                         let _ = seqnums.remove(&seqnum);
                     }
 
                     let next = seqnum.fetch_add(1, Ordering::Relaxed);
                     seqnums.insert(next, handle);
+                    handles.insert(handle, next);
 
                     // Calculate the total size of the URB frame...
                     let reserve_size = size_of::<Header>() + size_of::<ioctl::UrbHandle>();
@@ -321,6 +345,7 @@ where
                     };
                     *urb_handle = handle;
 
+                    trace!("about to write {} bytes into the buffer", buf_tx.len());
                     tx.write_all_buf(&mut buf_tx).await.unwrap();
                 }
                 Event::IsoUrbResp(_bytes) => {
@@ -333,6 +358,11 @@ where
                     let _ = handles.remove(&handle);
                     match header.status {
                         msg::Status::Success => {
+                            while MIN_URB_SUBMIT_SIZE > buf_rx.len() {
+                                if 0 == buf_rx.fill_with_reader(&mut rx).await? {
+                                    break;
+                                }
+                            }
                             let urb: UrbHeader = buf_rx.read().unwrap();
                             let mut transfer: Data<Transfer> = buf_rx.claim_dst().unwrap();
                             let mut iso_packets: Data<IsoPacketGiveback> =
@@ -345,11 +375,11 @@ where
                                 iso_giveback: &mut iso_packets.get_mut().get_mut(),
                             };
 
-                            vhci.giveback_urb(lender_urb).unwrap();
                             let dur = now.elapsed();
                             if Duration::from_micros(15) < dur {
-                                trace!("took {:?} to unpack URB frame for giveback", now);
+                                trace!("took {:?} to unpack URB frame for giveback", dur);
                             }
+                            vhci.giveback_urb(lender_urb).await.unwrap();
                         }
                         msg::Status::Failed => todo!(),
                         msg::Status::DevBusy => todo!(),
@@ -361,12 +391,14 @@ where
                         msg::Status::Proto => todo!(),
                     }
                 }
-                Event::UrbResp(Err(err)) => todo!(),
+                Event::UrbResp(Err(err)) => return Err(err.into()),
                 Event::UrbResp(Ok(0)) => break,
                 Event::Work(None) => todo!("how did we get here? should we shutdown here?"),
                 _ => (),
             }
         }
+
+        Ok(())
     }
 }
 
@@ -409,7 +441,8 @@ where
     W: AsyncWrite + utils::CloseStream + Unpin,
     R: AsyncRead + Unpin,
 {
-    pub async fn run(self) -> Result<()> {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub async fn lend(self) -> Result<()> {
         let Self {
             mut tx,
             mut rx,
@@ -436,7 +469,11 @@ where
                     dev,
                 ))
             }) {
-            Ok(dev) => dev,
+            Ok(dev) => {
+                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
+                tx.write_all_buf(&mut response).await?;
+                dev
+            }
             Err(err) => {
                 let err = RusbError { kind: err, dev_id };
                 let ret_err = Error::from(err);
@@ -451,133 +488,168 @@ where
         };
 
         const HEADER_SIZE: usize = size_of::<Header>();
+        const URB_UNLINK_SIZE: usize = size_of::<vhci::ioctl::UrbHandle>();
+        const MIN_URB_SUBMIT_SIZE: usize =
+            size_of::<UrbHeader>() + size_of::<TransferHeader>() + size_of::<IsoPacketHeader>();
 
-        loop {
-            match buf_rx.fill_with_reader(&mut rx).await {
-                Ok(_) if HEADER_SIZE < buf_rx.len() => {
-                    let mut header: Header = buf_rx.read().unwrap();
+        trace!("starting lender loop");
+        'outer: loop {
+            while HEADER_SIZE > buf_rx.len() {
+                if 0 == buf_rx.fill_with_reader(&mut rx).await? {
+                    break 'outer;
+                }
+            }
 
-                    // Parse request big-time
-                    match header.command {
-                        msg::Command::CmdSubmit => {
-                            let mut urb: UrbHeader = buf_rx.read().unwrap();
-                            let mut transfer: Data<Transfer> = buf_rx.claim_dst().unwrap();
-                            let mut iso_packets: Data<IsoPacketData> = buf_rx.claim_dst().unwrap();
-                            let status = match (urb.kind, urb.endpoint.direction()) {
-                                (ioctl::UrbType::Ctrl, vhci::usbfs::Dir::In) => {
-                                    let transfer_ref = transfer.get_mut();
-                                    let ctrl = urb.setup_packet;
-                                    match handle.read_control(
-                                        ctrl.bm_request_type,
-                                        ctrl.b_request as u8,
-                                        ctrl.w_value,
-                                        ctrl.w_index,
-                                        transfer_ref.get_mut(),
-                                        Duration::from_millis(300),
-                                    ) {
-                                        Ok(bytes_written) => {
-                                            transfer_ref.header.actual_len = bytes_written as u16;
-                                            transfer_ref.header.aligned_len = bytes_written
-                                                .next_multiple_of(8)
-                                                .try_into()
-                                                .unwrap_or(transfer_ref.header.aligned_len);
-                                            vhci::Status::Success
-                                        }
-                                        Err(rusb::Error::NoDevice) => {
-                                            vhci::Status::DeviceDisconnected
-                                        }
-                                        Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
-                                        Err(_) => vhci::Status::Stall,
-                                    }
+            let mut header: Header = buf_rx.read().unwrap();
+
+            // Parse request big-time
+            match header.command {
+                msg::Command::CmdSubmit => {
+                    trace!("got urb submit");
+
+                    while MIN_URB_SUBMIT_SIZE > buf_rx.len() {
+                        if 0 == buf_rx.fill_with_reader(&mut rx).await? {
+                            break 'outer;
+                        }
+                    }
+
+                    let mut urb: UrbHeader = buf_rx.read().unwrap();
+                    let mut transfer: Data<Transfer> = match buf_rx.claim_dst() {
+                        Ok(transfer) => transfer,
+                        Err(ReadError::BufferShort) => {
+                            if 0 == buf_rx.fill_with_reader(&mut rx).await? {
+                                break 'outer;
+                            }
+
+                            buf_rx.claim_dst().unwrap()
+                        }
+                        Err(ReadError::CorruptedData) => todo!(),
+                    };
+                    let mut iso_packets: Data<IsoPacketData> = match buf_rx.claim_dst() {
+                        Ok(transfer) => transfer,
+                        Err(ReadError::BufferShort) => {
+                            if 0 == buf_rx.fill_with_reader(&mut rx).await? {
+                                break 'outer;
+                            }
+
+                            buf_rx.claim_dst().unwrap()
+                        }
+                        Err(ReadError::CorruptedData) => todo!(),
+                    };
+
+                    let status = match (urb.kind, urb.endpoint.direction()) {
+                        (ioctl::UrbType::Ctrl, vhci::usbfs::Dir::In) => {
+                            let transfer_ref = transfer.get_mut();
+                            let ctrl = urb.setup_packet;
+                            match handle.read_control(
+                                ctrl.bm_request_type,
+                                ctrl.b_request as u8,
+                                ctrl.w_value,
+                                ctrl.w_index,
+                                transfer_ref.get_mut(),
+                                Duration::from_millis(300),
+                            ) {
+                                Ok(bytes_written) => {
+                                    transfer_ref.header.actual_len = bytes_written as u16;
+                                    transfer_ref.header.aligned_len = bytes_written
+                                        .next_multiple_of(8)
+                                        .try_into()
+                                        .unwrap_or(transfer_ref.header.aligned_len);
+                                    vhci::Status::Success
                                 }
-                                (ioctl::UrbType::Ctrl, vhci::usbfs::Dir::Out) => {
-                                    let ctrl = urb.setup_packet;
-                                    match handle.write_control(
-                                        ctrl.bm_request_type,
-                                        ctrl.b_request as u8,
-                                        ctrl.w_value,
-                                        ctrl.w_index,
-                                        transfer.get_mut().get_mut(),
-                                        Duration::from_millis(300),
-                                    ) {
-                                        Ok(_) => vhci::Status::Success,
-                                        Err(rusb::Error::NoDevice) => {
-                                            vhci::Status::DeviceDisconnected
-                                        }
-                                        Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
-                                        Err(_) => vhci::Status::Stall,
-                                    }
-                                }
-                                (ioctl::UrbType::Iso, _) => vhci::Status::Stall,
-                                (ioctl::UrbType::Int, vhci::usbfs::Dir::In) => {
-                                    let transfer_ref = transfer.get_mut();
-                                    match handle.read_interrupt(
-                                        urb.endpoint.0,
-                                        transfer_ref.get_mut(),
-                                        Duration::from_millis(50),
-                                    ) {
-                                        Ok(bytes_written) => {
-                                            transfer_ref.header.actual_len = bytes_written as u16;
-                                            transfer_ref.header.aligned_len = bytes_written
-                                                .next_multiple_of(8)
-                                                .try_into()
-                                                .unwrap_or(transfer_ref.header.aligned_len);
-                                            vhci::Status::Success
-                                        }
-                                        Err(rusb::Error::NoDevice) => {
-                                            vhci::Status::DeviceDisconnected
-                                        }
-                                        Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
-                                        Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
-                                        Err(_) => vhci::Status::Stall,
-                                    }
-                                }
-                                (ioctl::UrbType::Int, vhci::usbfs::Dir::Out) => todo!(),
-                                (ioctl::UrbType::Bulk, vhci::usbfs::Dir::In) => todo!(),
-                                (ioctl::UrbType::Bulk, vhci::usbfs::Dir::Out) => todo!(),
-                            };
-
-                            urb.status = status;
-
-                            header.command = msg::Command::RetSubmit;
-                            header.status = match status {
-                                vhci::Status::Pending => todo!(),
-                                vhci::Status::Error => todo!(),
-                                vhci::Status::TimedOut => todo!(),
-                                vhci::Status::DeviceDisabled => todo!(),
-                                vhci::Status::DeviceDisconnected => msg::Status::NoDev,
-                                vhci::Status::BitStuff => todo!(),
-                                vhci::Status::Crc => todo!(),
-                                vhci::Status::NoResponse => todo!(),
-                                vhci::Status::Babble => todo!(),
-                                vhci::Status::BufferUnderrun => todo!(),
-                                vhci::Status::AllIsoPacketsFailed => todo!(),
-                                vhci::Status::ShortPacket => todo!(),
-                                vhci::Status::Canceled => todo!(),
-                                vhci::Status::Success | _ => msg::Status::Success,
-                            };
-
-                            if msg::Status::Success == header.status {
-                                let mut response = header
-                                    .as_bytes()
-                                    .chain(urb.as_bytes())
-                                    .chain(transfer.as_bytes())
-                                    .chain(iso_packets.as_bytes());
-                                tx.write_all_buf(&mut response).await?;
-                            } else {
-                                let mut response = header.as_bytes();
-                                tx.write_all_buf(&mut response).await?;
-                                tx.close().await?;
-                                return Err(Error::Io(io::Error::other("usb device failed somehow")));
+                                Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
+                                Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+                                Err(_) => vhci::Status::Stall,
                             }
                         }
-                        msg::Command::CmdUnlink => todo!(),
-                        _ => unreachable!("smh smh client"),
+                        (ioctl::UrbType::Ctrl, vhci::usbfs::Dir::Out) => {
+                            let ctrl = urb.setup_packet;
+                            match handle.write_control(
+                                ctrl.bm_request_type,
+                                ctrl.b_request as u8,
+                                ctrl.w_value,
+                                ctrl.w_index,
+                                transfer.get_mut().get_mut(),
+                                Duration::from_millis(300),
+                            ) {
+                                Ok(_) => vhci::Status::Success,
+                                Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
+                                Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+                                Err(_) => vhci::Status::Stall,
+                            }
+                        }
+                        (ioctl::UrbType::Iso, _) => vhci::Status::Stall,
+                        (ioctl::UrbType::Int, vhci::usbfs::Dir::In) => {
+                            let transfer_ref = transfer.get_mut();
+                            match handle.read_interrupt(
+                                urb.endpoint.0,
+                                transfer_ref.get_mut(),
+                                Duration::from_millis(50),
+                            ) {
+                                Ok(bytes_written) => {
+                                    transfer_ref.header.actual_len = bytes_written as u16;
+                                    transfer_ref.header.aligned_len = bytes_written
+                                        .next_multiple_of(8)
+                                        .try_into()
+                                        .unwrap_or(transfer_ref.header.aligned_len);
+                                    vhci::Status::Success
+                                }
+                                Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
+                                Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+                                Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
+                                Err(_) => vhci::Status::Stall,
+                            }
+                        }
+                        (ioctl::UrbType::Int, vhci::usbfs::Dir::Out) => todo!(),
+                        (ioctl::UrbType::Bulk, vhci::usbfs::Dir::In) => todo!(),
+                        (ioctl::UrbType::Bulk, vhci::usbfs::Dir::Out) => todo!(),
+                    };
+
+                    urb.status = status;
+
+                    header.command = msg::Command::RetSubmit;
+                    header.status = match status {
+                        vhci::Status::Pending => todo!(),
+                        vhci::Status::Error => todo!(),
+                        vhci::Status::TimedOut => todo!(),
+                        vhci::Status::DeviceDisabled => todo!(),
+                        vhci::Status::DeviceDisconnected => msg::Status::NoDev,
+                        vhci::Status::BitStuff => todo!(),
+                        vhci::Status::Crc => todo!(),
+                        vhci::Status::NoResponse => todo!(),
+                        vhci::Status::Babble => todo!(),
+                        vhci::Status::BufferUnderrun => todo!(),
+                        vhci::Status::AllIsoPacketsFailed => todo!(),
+                        vhci::Status::ShortPacket => todo!(),
+                        vhci::Status::Canceled => todo!(),
+                        vhci::Status::Success | _ => msg::Status::Success,
+                    };
+
+                    if msg::Status::Success == header.status {
+                        let mut response = header
+                            .as_bytes()
+                            .chain(urb.as_bytes())
+                            .chain(transfer.as_bytes())
+                            .chain(iso_packets.as_bytes());
+                        tx.write_all_buf(&mut response).await?;
+                    } else {
+                        let mut response = header.as_bytes();
+                        tx.write_all_buf(&mut response).await?;
+                        tx.close().await?;
+                        return Err(Error::Unknown);
                     }
                 }
-                Ok(0) => break,
-                Err(err) => todo!(),
-                _ => (),
+                msg::Command::CmdUnlink => {
+                    trace!("got urb unlink");
+                    while URB_UNLINK_SIZE > buf_rx.len() {
+                        if 0 == buf_rx.fill_with_reader(&mut rx).await? {
+                            break 'outer;
+                        }
+                    }
+
+                    todo!("read handle and cancel request");
+                }
+                _ => unreachable!("smh smh client"),
             }
         }
         todo!()
@@ -598,6 +670,7 @@ impl<W> SendDevices<W>
 where
     W: AsyncWrite + utils::CloseStream + Unpin,
 {
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn resp_list_devices<'a, I, T>(self, iter: impl Fn() -> io::Result<I>) -> Result<()>
     where
         I: Iterator<Item = T>,
@@ -605,6 +678,8 @@ where
     {
         use tokio::io::AsyncWriteExt;
         let mut tx = self.tx;
+
+        trace!("getting available devices to send to peer");
 
         let devices = match iter() {
             Ok(devices) => {
@@ -627,6 +702,8 @@ where
                 .chain(usb.interfaces_with_padding().as_bytes());
             tx.write_all_buf(&mut device).await?;
         }
+
+        trace!("sent all devices to peer");
 
         tx.close().await.map_err(Error::from)
     }

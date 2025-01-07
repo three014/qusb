@@ -2,7 +2,7 @@ use bytes::Buf;
 use iso::{Demuxer, Handle};
 use operator::{ClientBorrowDevice, ClientReq, LendDevice, SendDevices, ServerResp};
 use proto::{
-    data::{IterDst, IterMutDst, Ring},
+    data::{IterDst, IterMutDst, ReadError, Ring},
     msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -12,14 +12,14 @@ use std::{
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     ops::Deref,
     path::Path,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 use tokio::{io::AsyncWriteExt, sync::mpsc};
 use tracing::{debug, error, info, trace, warn};
 use usb_ids::UsbIds;
 use utils::CloseStream;
-use vhci::utils::{BoundedU16, BoundedU8};
+use vhci::utils::BoundedU8;
 use zerocopy::{FromZeros, IntoBytes};
 
 pub use quinn::rustls;
@@ -50,6 +50,8 @@ pub enum Error {
     DevNotFound(msg::UsbDeviceId),
     #[error("request failed on the server side")]
     ReqFailed,
+    #[error("unknown data from peer")]
+    Unknown,
 }
 
 impl From<quinn::StoppedError> for Error {
@@ -239,7 +241,7 @@ fn init_iso(conn: quinn::Connection) -> Handle {
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
-    iso: Arc<Mutex<Option<Handle>>>,
+    iso: Arc<tokio::sync::Mutex<Option<Handle>>>,
     dev: stub::Controller,
 }
 
@@ -247,7 +249,7 @@ impl Session {
     fn new(conn: quinn::Connection, dev: stub::Controller) -> Self {
         Self {
             conn,
-            iso: Arc::new(Mutex::new(None)),
+            iso: Arc::new(tokio::sync::Mutex::new(None)),
             dev,
         }
     }
@@ -266,24 +268,35 @@ impl Session {
             buf.fill_with_reader(&mut rx).await?;
         }
 
-        let version: msg::Version = buf.read()?;
+        let version: msg::Version = match buf.read() {
+            Ok(version) => version,
+            Err(ReadError::CorruptedData) => {
+                unreachable!("msg::Version has FromBytes impl, and should be aligned")
+            }
+            Err(ReadError::BufferShort) => {
+                unreachable!("we should have read enough data to get the version")
+            }
+        };
         if !version.is_compat(&proto::QUSB_VER) {
             let mut response = msg::Status::VersionMismatch
                 .as_bytes()
-                .chain(&[0u8; 3][..])
-                .chain(proto::QUSB_VER.as_bytes());
+                .chain(&[0u8; 7][..])
+                .chain(proto::QUSB_VER.as_bytes())
+                .chain(&[0u8; 4][..]);
             tx.write_all_buf(&mut response).await?;
             tx.close().await?;
             return Err(Error::VersionMismatch(version));
         }
 
         let req = match buf.read::<msg::Request>().and_then(|req| match req {
-            msg::Request::ListDevices => Ok::<_, io::Error>(ClientReq::ListDevices),
+            msg::Request::ListDevices => Ok::<_, ReadError>(ClientReq::ListDevices),
             msg::Request::BorrowDevice => Ok(ClientReq::BorrowDevice(buf.read()?)),
         }) {
             Ok(ClientReq::ListDevices) => ServerResp::ListDevices(SendDevices::new(tx)),
             Ok(ClientReq::BorrowDevice(device)) => {
-                let mut slot = self.iso.lock().unwrap();
+                buf.consume(&[0u8; 6]);
+
+                let mut slot = self.iso.lock().await;
                 if slot
                     .as_ref()
                     .is_none_or(|Handle { handle, .. }| handle.is_finished())
@@ -294,6 +307,7 @@ impl Session {
                 match slot
                     .get_or_insert_with(|| init_iso(self.conn.clone()))
                     .make_channel(rx.id())
+                    .await
                 {
                     Some((iso_tx, iso_rx)) => ServerResp::BorrowDevice(LendDevice::new(
                         tx, rx, buf, iso_tx, iso_rx, device,
@@ -305,13 +319,13 @@ impl Session {
                     None => return Err(Error::Io(io::ErrorKind::BrokenPipe.into())),
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+            Err(ReadError::CorruptedData) => {
                 let mut response = msg::Status::Proto.as_bytes().chain(&[0u8; 7][..]);
                 tx.write_all_buf(&mut response).await?;
                 tx.close().await?;
-                return Err(err.into());
+                return Err(Error::Unknown);
             }
-            Err(err) => return Err(err.into()),
+            Err(ReadError::BufferShort) => todo!(),
         };
 
         Ok(req)
@@ -343,7 +357,13 @@ impl Session {
                 .inspect_err(|err| error!("{err}"))?
         {}
         trace!("finished reading from remote stream");
-        let status = buf.read()?;
+        let status = match buf.read() {
+            Ok(status) => status,
+            Err(ReadError::CorruptedData) => {
+                unreachable!("msg::Status is FromBytes, and should be aligned")
+            }
+            Err(ReadError::BufferShort) => return Err(Error::Unknown),
+        };
         buf.consume(&[0u8; 7]);
         match status {
             msg::Status::Success => {}
@@ -364,12 +384,20 @@ impl Session {
         Ok(UsbDevices(buf))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn borrow_device(
         &self,
         id: msg::UsbDeviceId,
     ) -> Result<ClientBorrowDevice<quinn::SendStream, quinn::RecvStream>> {
-        let (mut tx, mut rx) = self.conn.open_bi().await?;
+        let (mut tx, mut rx) = self.conn.open_bi().await.inspect_err(|err| {
+            warn! {
+                %err,
+                "err while opening new request with peer"
+            }
+        })?;
         let mut buf = Ring::with_capacity(1024);
+
+        trace!("established stream with stream id {:?}", tx.id());
 
         let version = proto::QUSB_VER;
         let req = msg::Request::BorrowDevice;
@@ -383,12 +411,26 @@ impl Session {
         debug_assert_eq!(req.remaining() % size_of::<u64>(), 0);
 
         tx.write_all_buf(&mut req).await?;
+        trace!(
+            "sent request to borrow device {id:?} from peer @ {:?}",
+            self.conn.remote_address()
+        );
 
         while size_of::<msg::Status>() + 7 > buf.len() {
             buf.fill_with_reader(&mut rx).await?;
         }
 
-        let status = buf.read()?;
+        trace!("received enough bytes for a status from peer");
+
+        let status = match buf.read() {
+            Ok(status) => status,
+            Err(ReadError::CorruptedData) => {
+                unreachable!("msg::Status is FromBytes, and should be aligned")
+            }
+            Err(ReadError::BufferShort) => {
+                unreachable!("we should have read enough bytes to read status")
+            }
+        };
         buf.consume(&[0u8; 7]);
         match status {
             msg::Status::Success => (),
@@ -405,14 +447,14 @@ impl Session {
                 if size_of::<msg::Version>() + 4 > buf.len() {
                     buf.fill_with_reader(&mut rx).await?;
                 }
-                let their_version = buf.read::<msg::Version>()?;
+                let their_version = buf.read::<msg::Version>().unwrap();
                 return Err(Error::VersionMismatch(their_version));
             }
             msg::Status::Timeout => todo!(),
             msg::Status::Proto => todo!(),
         }
 
-        let mut slot = self.iso.lock().unwrap();
+        let mut slot = self.iso.lock().await;
         if slot
             .as_ref()
             .is_none_or(|Handle { handle, .. }| handle.is_finished())
@@ -423,6 +465,7 @@ impl Session {
         let client = match slot
             .get_or_insert_with(|| init_iso(self.conn.clone()))
             .make_channel(tx.id())
+            .await
         {
             Some((iso_tx, iso_rx)) => {
                 ClientBorrowDevice::new(tx, rx, buf, iso_tx, iso_rx, self.dev.clone(), id)
@@ -472,6 +515,7 @@ impl msg::SendUsbDeviceInfo for UsbDeviceWrapper {
     }
 }
 
+#[tracing::instrument(level = "trace", skip_all)]
 fn get_usb_devices() -> io::Result<
     std::iter::FilterMap<
         impl Iterator<Item = nusb::DeviceInfo>,
@@ -561,17 +605,23 @@ impl ReqHandler {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn run(self) -> Result<()> {
-        let conn = self.incoming.await?;
+        let conn = self.incoming.await.inspect_err(|err| warn! { %err })?;
         trace!(
             "established new session with {} - RTT {:?}",
             conn.remote_address(),
             conn.rtt()
         );
-        let session = Session::new(conn, self.vhci);
-        match session.accept_stream().await? {
-            ServerResp::ListDevices(operator) => operator.resp_list_devices(get_usb_devices).await,
-            ServerResp::BorrowDevice(operator) => operator.run().await,
+        let session = Session::new(conn.clone(), self.vhci);
+        while conn.close_reason().is_none() {
+            match session.accept_stream().await? {
+                ServerResp::ListDevices(operator) => {
+                    operator.resp_list_devices(get_usb_devices).await?;
+                }
+                ServerResp::BorrowDevice(operator) => operator.lend().await?,
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -632,7 +682,7 @@ impl Server {
                     Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
                         warn! { %cause, "session {id} failed" }
                     }
-                    Event::MaybeCompletedTask(Some(Err(_err))) => todo!(),
+                    Event::MaybeCompletedTask(Some(Err(cause))) => error! { %cause },
                     Event::Incoming(None) | Event::Cancel => break,
                     _ => (),
                 }
@@ -640,9 +690,9 @@ impl Server {
 
             while let Some(result) = set.join_next_with_id().await {
                 match result {
-                    Ok((id, Ok(_))) => info!("Session {id} completed successfully"),
-                    Ok((id, Err(cause))) => warn! { %cause, "Session {id} failed" },
-                    Err(_) => todo!(),
+                    Ok((id, Ok(_))) => info!("session {id} completed successfully"),
+                    Ok((id, Err(cause))) => warn! { %cause, "session {id} failed" },
+                    Err(cause) => error! { %cause },
                 }
             }
 

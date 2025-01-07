@@ -13,6 +13,13 @@ pub const QUSB_VER: msg::Version = msg::Version {
 
 pub const BUS_ID_SIZE: usize = 32;
 
+pub enum GetSliceLenErr {
+    /// Impl is not confident that the obtained length is valid for the slice.
+    NoConfidence,
+    /// Buffer is too short to read the slice length.
+    BufferShort,
+}
+
 /// You received a DST from the internet in the
 /// form of bytes, and you want to find out the
 /// number of elements in the trailing slice.
@@ -48,7 +55,7 @@ where
     /// - The bytes of `buf` are in network endian
     /// - `buf` may not be exactly the length of
     ///   the DST and its trailing slice.
-    fn get_slice_len(buf: &[u8]) -> Option<usize>;
+    fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr>;
 }
 
 /*

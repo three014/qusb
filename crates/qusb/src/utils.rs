@@ -5,6 +5,13 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkResult {
+    Success,
+    NewKeyAlreadyExists,
+    ExistingKeyDoesNotExist
+}
+
 #[derive(Debug)]
 pub struct ThreeKeyMap<K1, K2, K3, V> {
     key1_map: SimpleMap<K1, usize>,
@@ -45,26 +52,26 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
     ///
     /// Panics if `index` is out of bounds.
     fn swap_remove(&mut self, index: usize) -> Option<V> {
-        let swapped_index = self.values.len() - 1;
+        let last_item_position = self.values.len() - 1;
         let (value, _) = self.values.swap_remove(index);
 
         self.key1_map
             .values_mut()
-            .filter(|&&mut value| swapped_index == value)
+            .filter(|&&mut key1_index| last_item_position == key1_index)
             .for_each(|value| *value = index);
         self.key2_map
             .values_mut()
-            .filter(|&&mut value| swapped_index == value)
+            .filter(|&&mut key2_index| last_item_position == key2_index)
             .for_each(|value| *value = index);
         self.key3_map
             .values_mut()
-            .filter(|&&mut value| swapped_index == value)
+            .filter(|&&mut key3_index| last_item_position == key3_index)
             .for_each(|value| *value = index);
 
         Some(value)
     }
 
-    pub fn link_key1_to_key2<Q>(&mut self, new_k: K1, existing_k: &Q) -> bool
+    pub fn link_key1_to_key2<Q>(&mut self, new_k: K1, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K1: Hash + Eq + IsEnabled,
@@ -78,7 +85,7 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
         .link_key_to_key(new_k, existing_k)
     }
 
-    pub fn link_key1_to_key3<Q>(&mut self, new_k: K1, existing_k: &Q) -> bool
+    pub fn link_key1_to_key3<Q>(&mut self, new_k: K1, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K1: Hash + Eq + IsEnabled,
@@ -92,7 +99,7 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
         .link_key_to_key(new_k, existing_k)
     }
 
-    pub fn link_key2_to_key1<Q>(&mut self, new_k: K2, existing_k: &Q) -> bool
+    pub fn link_key2_to_key1<Q>(&mut self, new_k: K2, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K2: Hash + Eq + IsEnabled,
@@ -105,8 +112,8 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
         }
         .link_key_to_key(new_k, existing_k)
     }
-
-    pub fn link_key2_to_key3<Q>(&mut self, new_k: K2, existing_k: &Q) -> bool
+    
+    pub fn link_key2_to_key3<Q>(&mut self, new_k: K2, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K2: Hash + Eq + IsEnabled,
@@ -120,7 +127,7 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
         .link_key_to_key(new_k, existing_k)
     }
 
-    pub fn link_key3_to_key1<Q>(&mut self, new_k: K3, existing_k: &Q) -> bool
+    pub fn link_key3_to_key1<Q>(&mut self, new_k: K3, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K3: Hash + Eq + IsEnabled,
@@ -134,7 +141,7 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
         .link_key_to_key(new_k, existing_k)
     }
 
-    pub fn link_key3_to_key2<Q>(&mut self, new_k: K3, existing_k: &Q) -> bool
+    pub fn link_key3_to_key2<Q>(&mut self, new_k: K3, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K3: Hash + Eq + IsEnabled,
@@ -161,7 +168,7 @@ where
         .insert_by_key(k, v)
     }
 
-    pub fn link_key1_to_key1<Q>(&mut self, k: K1, existing_k: &Q) -> bool
+    pub fn link_key1_to_key1<Q>(&mut self, k: K1, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K1: Borrow<Q>,
@@ -209,7 +216,7 @@ where
         .insert_by_key(k, v)
     }
 
-    pub fn link_key2_to_key2<Q>(&mut self, k: K2, existing_k: &Q) -> bool
+    pub fn link_key2_to_key2<Q>(&mut self, k: K2, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K2: Borrow<Q>,
@@ -231,8 +238,8 @@ where
             values: &mut self.values,
         }
         .remove_by_key(k)
-        .filter(|&(count, _)| 0 == count)
-        .and_then(|(_, index)| self.swap_remove(index))
+        .filter(|&(_, count)| 0 == count)
+        .and_then(|(index, _)| self.swap_remove(index))
     }
 
     pub fn get_by_key2<Q>(&self, k: &Q) -> Option<&V>
@@ -260,7 +267,7 @@ where
         .insert_by_key(k, v)
     }
 
-    pub fn link_key3_to_key3<Q>(&mut self, k: K3, existing_k: &Q) -> bool
+    pub fn link_key3_to_key3<Q>(&mut self, k: K3, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K3: Borrow<Q>,
@@ -282,8 +289,8 @@ where
             values: &mut self.values,
         }
         .remove_by_key(k)
-        .filter(|&(count, _)| 0 == count)
-        .and_then(|(_, index)| self.swap_remove(index))
+        .filter(|&(_, count)| 0 == count)
+        .and_then(|(index, _)| self.swap_remove(index))
     }
 
     pub fn get_by_key3<Q>(&self, k: &Q) -> Option<&V>
@@ -310,22 +317,22 @@ where
     K1: IsEnabled + Hash + Eq,
     K2: IsEnabled + Hash + Eq,
 {
-    fn link_key_to_key<Q>(&mut self, new_key: K1, existing_key: &Q) -> bool
+    fn link_key_to_key<Q>(&mut self, new_key: K1, existing_key: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K2: Borrow<Q>,
     {
         if self.map1.contains_key(new_key.borrow()) {
-            return false;
+            return LinkResult::NewKeyAlreadyExists;
         }
 
         if let Some(&index) = self.map2.get(existing_key) {
             self.map1.insert(new_key, index);
             let (_, count) = &mut self.values[index];
             *count += 1;
-            true
+            LinkResult::Success
         } else {
-            false
+            LinkResult::ExistingKeyDoesNotExist
         }
     }
 }
@@ -358,22 +365,22 @@ impl<K, V> OneKeyOperation<'_, K, V>
 where
     K: IsEnabled + Hash + Eq,
 {
-    fn link_key_to_key<Q>(&mut self, new_key: K, existing_key: &Q) -> bool
+    fn link_key_to_key<Q>(&mut self, new_key: K, existing_key: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
         K: Borrow<Q>,
     {
         if self.map.contains_key(new_key.borrow()) {
-            return false;
+            return LinkResult::NewKeyAlreadyExists;
         }
 
         if let Some(&index) = self.map.get(existing_key) {
             self.map.insert(new_key, index);
             let (_, count) = &mut self.values[index];
             *count += 1;
-            true
+            LinkResult::Success
         } else {
-            false
+            LinkResult::ExistingKeyDoesNotExist
         }
     }
 
@@ -393,7 +400,7 @@ where
     {
         let index = self.map.remove(k)?;
         let (_, count) = self.values.get_mut(index)?;
-        *count = count.saturating_sub(1);
+        *count = count.checked_sub(1).unwrap();
         Some((index, *count))
     }
 

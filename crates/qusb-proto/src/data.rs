@@ -3,6 +3,7 @@ use std::{io, marker::PhantomData};
 use bytes::Buf;
 
 use bytes::BytesMut;
+use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
@@ -10,9 +11,13 @@ use zerocopy::ConvertError;
 use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
 use crate::GetSliceLen;
+use crate::GetSliceLenErr;
 
-fn invalid<A, S, V>(_x: ConvertError<A, S, V>) -> io::Error {
-    io::Error::from(io::ErrorKind::InvalidData)
+fn invalid<A, S, V>(x: ConvertError<A, S, V>) -> ReadError {
+    match x {
+        ConvertError::Size(_) => ReadError::BufferShort,
+        _ => ReadError::CorruptedData,
+    }
 }
 
 pub struct IterMutDst<'a, T: ?Sized + 'a> {
@@ -28,7 +33,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let slice = std::mem::take(&mut self.buf);
-        let len = T::get_slice_len(slice)?;
+        let len = T::get_slice_len(slice).ok()?;
         let (item, remaining) = T::try_mut_from_prefix_with_elems(slice, len).ok()?;
         self.buf = remaining;
         Some(item)
@@ -47,7 +52,7 @@ where
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let len = T::get_slice_len(self.buf)?;
+        let len = T::get_slice_len(self.buf).ok()?;
         let (item, remaining) = T::try_ref_from_prefix_with_elems(self.buf, len)
             // .inspect_err(|err| println!("{err}"))
             .ok()?;
@@ -85,6 +90,23 @@ where
     }
 }
 
+#[derive(Debug, Error)]
+pub enum ReadError {
+    #[error("data doesn't match the type")]
+    CorruptedData,
+    #[error("buffer is too short to read the provided type")]
+    BufferShort,
+}
+
+impl From<GetSliceLenErr> for ReadError {
+    fn from(value: GetSliceLenErr) -> Self {
+        match value {
+            GetSliceLenErr::NoConfidence => ReadError::CorruptedData,
+            GetSliceLenErr::BufferShort => ReadError::BufferShort,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Ring {
     buf: BytesMut,
@@ -105,57 +127,62 @@ impl Ring {
         Some(self.buf.split_off(self.buf.len()))
     }
 
-    pub fn peek<T>(&self) -> io::Result<&T>
+    pub fn peek<T>(&self) -> Result<&T, ReadError>
     where
         T: TryFromBytes + KnownLayout + Immutable,
     {
         let size_of = std::mem::size_of::<T>();
         if self.buf.len() < size_of {
-            return Err(io::ErrorKind::InvalidData.into());
+            return Err(ReadError::BufferShort);
         }
         T::try_ref_from_bytes(&self.buf[..size_of]).map_err(invalid)
     }
 
-    pub fn peek_dst<T>(&self) -> io::Result<&T>
+    pub fn peek_dst<T>(&self) -> Result<&T, ReadError>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let len = T::get_slice_len(&self.buf)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+        let len = T::get_slice_len(&self.buf).map_err(ReadError::from)?;
         T::try_ref_from_prefix_with_elems(&self.buf, len)
+            .inspect_err(|err| {
+                println!(
+                    "------> error while decoding {}: {}",
+                    std::any::type_name::<T>(),
+                    err
+                )
+            })
             .map_err(invalid)
             .map(|(item, _)| item)
     }
 
-    pub fn peek_mut<T>(&mut self) -> io::Result<&mut T>
+    pub fn peek_mut<T>(&mut self) -> Result<&mut T, ReadError>
     where
         T: TryFromBytes + KnownLayout + Immutable,
     {
         let size_of = std::mem::size_of::<T>();
         if self.buf.len() < size_of {
-            return Err(io::ErrorKind::InvalidData.into());
+            return Err(ReadError::BufferShort);
         }
         T::try_mut_from_bytes(&mut self.buf[..size_of]).map_err(invalid)
     }
 
-    pub fn peek_mut_dst<T>(&mut self) -> io::Result<&mut T>
+    pub fn peek_mut_dst<T>(&mut self) -> Result<&mut T, ReadError>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let len = T::get_slice_len(&self.buf)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+        let len = T::get_slice_len(&self.buf).map_err(ReadError::from)?;
         T::try_mut_from_prefix_with_elems(&mut self.buf, len)
             .map_err(invalid)
             .map(|(item, _)| item)
     }
 
-    pub fn read<T>(&mut self) -> io::Result<T>
+    pub fn read<T>(&mut self) -> Result<T, ReadError>
     where
         T: TryFromBytes + KnownLayout + Immutable,
     {
         let size_of = std::mem::size_of::<T>();
         if self.buf.len() < size_of {
-            return Err(io::ErrorKind::InvalidData.into());
+            return Err(ReadError::BufferShort);
         }
         let item = T::try_read_from_bytes(&self.buf[..size_of]).map_err(invalid)?;
         self.buf.advance(size_of);
@@ -169,19 +196,19 @@ impl Ring {
         self.buf.advance(std::mem::size_of_val(item));
     }
 
-    pub fn claim<T>(&mut self) -> std::io::Result<Data<T>>
+    pub fn claim<T>(&mut self) -> Result<Data<T>, ReadError>
     where
         T: TryFromBytes + KnownLayout + Immutable,
     {
         let size_of = std::mem::size_of::<T>();
         if self.buf.len() < size_of {
-            return Err(io::ErrorKind::InvalidData.into());
+            return Err(ReadError::BufferShort);
         }
         let buf = self.buf.split_to(size_of);
         Ok(Data::new(buf))
     }
 
-    pub fn claim_dst<T>(&mut self) -> io::Result<Data<T>>
+    pub fn claim_dst<T>(&mut self) -> Result<Data<T>, ReadError>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
