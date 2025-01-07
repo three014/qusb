@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use proto::{
     data::{Data, Ring},
     msg::{self, Header, IsoPacketData, IsoPacketGiveback, Transfer, UrbHeader},
@@ -13,19 +13,12 @@ use proto::{
 use rusb::UsbContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace};
-use vhci::{
-    ioctl,
-    usbfs::{
-        DescriptorType, STANDARD_DEVICE_GET_CONFIGURATION, STANDARD_DEVICE_GET_DESCRIPTOR,
-        STANDARD_DEVICE_SET_ADDRESS,
-    },
-    DataRate, PortChange, PortFlag, PortStatus,
-};
+use vhci::{ioctl, usbfs::STANDARD_DEVICE_SET_ADDRESS, DataRate, PortChange, PortFlag, PortStatus};
 use zerocopy::{IntoBytes, TryFromBytes};
 
 use crate::{
-    dev::{self, RegisterPort},
     iso,
+    stub::{self, RegisterPort},
     utils::{self, SimpleMap},
     Error, Result, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
 };
@@ -44,7 +37,7 @@ pub struct ClientBorrowDevice<W, R> {
     buf_rx: Ring,
     iso_tx: iso::Sender,
     iso_rx: iso::Receiver,
-    vhci: dev::Controller,
+    vhci: stub::Controller,
     id: msg::UsbDeviceId,
 }
 
@@ -55,7 +48,7 @@ impl<W, R> ClientBorrowDevice<W, R> {
         buf_rx: Ring,
         iso_tx: iso::Sender,
         iso_rx: iso::Receiver,
-        vhci: dev::Controller,
+        vhci: stub::Controller,
         id: msg::UsbDeviceId,
     ) -> Self {
         Self {
@@ -196,6 +189,9 @@ where
 
                     // TODO: Do we reclaim the reserved chunk automatically??
                     //       - Seems like we gotta manually give back the chunk
+                    //       - Figure that out once we have a working system.
+                    //         It doesn't seem like it'll take took long to change
+                    //         if we're wrong.
                     // TODO: Decide whether we really want to use a "ring buffer":
                     //       - Different urb-tasks can claim a chunk of data and fill them
                     //         with their data, then give them back to the ring buffer
@@ -209,10 +205,9 @@ where
 
                     // To ensure 8 byte alignment, we make sure every whole part of the
                     // URB frame is aligned to 8 bytes.
-                    let transfer_padded_size: usize =
-                        NonZeroUsize::new(usize::try_from(urb.buffer_length).unwrap())
-                            .map(|len| len.get().next_multiple_of(8))
-                            .unwrap_or_default();
+                    let transfer_padded_size = usize::try_from(urb.buffer_length)
+                        .map(|len| len.next_multiple_of(8))
+                        .unwrap_or_default();
 
                     // We then calculate the total size of the URB frame...
                     let reserve_size = size_of::<Header>()
@@ -277,8 +272,8 @@ where
                         let borrower_urb = UrbWithIsoData {
                             handle,
                             header: urb_header,
-                            transfer: &mut transfer.buf[..transfer.header.actual_len as usize],
-                            iso_data: &mut iso.buf[..iso.header.len as usize],
+                            transfer: transfer.get_mut(),
+                            iso_data: iso.get_mut(),
                         };
 
                         vhci.fetch_data(borrower_urb).unwrap();
@@ -287,9 +282,11 @@ where
                     // And away we go!!!!
                     let dur = now.elapsed();
                     if Duration::from_micros(15) < dur {
-                        trace!("Took {:?} to setup URB frame for sending", now);
+                        trace!("took {:?} to setup URB frame for sending", now);
                     }
-                    tx.write_all_buf(&mut buf_tx).await.unwrap();
+                    tx.write_all_buf(&mut &buf_tx[..reserve_size])
+                        .await
+                        .unwrap();
                 }
                 Event::Work(Some(ioctl::Work::CancelUrb(handle))) => {
                     if let Some(seqnum) = handles.remove(&handle) {
@@ -338,24 +335,20 @@ where
                         msg::Status::Success => {
                             let urb: UrbHeader = buf_rx.read().unwrap();
                             let mut transfer: Data<Transfer> = buf_rx.claim_dst().unwrap();
-                            let transfer_ref = transfer.get_mut();
                             let mut iso_packets: Data<IsoPacketGiveback> =
                                 buf_rx.claim_dst().unwrap();
-                            let iso_packets_ref = iso_packets.get_mut();
 
                             let lender_urb = UrbWithIsoGiveback {
                                 handle,
                                 header: &urb,
-                                transfer: &mut transfer_ref.buf
-                                    [..transfer_ref.header.actual_len as usize],
-                                iso_giveback: &mut iso_packets_ref.buf
-                                    [..iso_packets_ref.header.len as usize],
+                                transfer: &mut transfer.get_mut().get_mut(),
+                                iso_giveback: &mut iso_packets.get_mut().get_mut(),
                             };
 
                             vhci.giveback_urb(lender_urb).unwrap();
                             let dur = now.elapsed();
                             if Duration::from_micros(15) < dur {
-                                trace!("Took {:?} to unpack URB frame for giveback", now);
+                                trace!("took {:?} to unpack URB frame for giveback", now);
                             }
                         }
                         msg::Status::Failed => todo!(),
@@ -378,11 +371,11 @@ where
 }
 
 pub enum ServerResp<W, R> {
-    ListDevices(ServerListDevices<W>),
-    BorrowDevice(ServerLendDevice<W, R>),
+    ListDevices(SendDevices<W>),
+    BorrowDevice(LendDevice<W, R>),
 }
 
-pub struct ServerLendDevice<W, R> {
+pub struct LendDevice<W, R> {
     tx: W,
     rx: R,
     buf_rx: Ring,
@@ -391,7 +384,7 @@ pub struct ServerLendDevice<W, R> {
     id: msg::UsbDeviceId,
 }
 
-impl<W, R> ServerLendDevice<W, R> {
+impl<W, R> LendDevice<W, R> {
     pub fn new(
         tx: W,
         rx: R,
@@ -411,7 +404,7 @@ impl<W, R> ServerLendDevice<W, R> {
     }
 }
 
-impl<W, R> ServerLendDevice<W, R>
+impl<W, R> LendDevice<W, R>
 where
     W: AsyncWrite + utils::CloseStream + Unpin,
     R: AsyncRead + Unpin,
@@ -449,10 +442,9 @@ where
                 let ret_err = Error::from(err);
                 let status = msg::Status::from(err);
 
-                tx.write_all_buf(&mut status.as_bytes()).await.unwrap();
-                tx.write_all_buf(&mut &[0, 0, 0, 0, 0, 0, 0][..])
-                    .await
-                    .unwrap();
+                let mut response = status.as_bytes().chain(&[0u8; 7][..]);
+
+                tx.write_all_buf(&mut response).await.unwrap();
                 tx.close().await.unwrap();
                 return Err(ret_err);
             }
@@ -463,7 +455,7 @@ where
         loop {
             match buf_rx.fill_with_reader(&mut rx).await {
                 Ok(_) if HEADER_SIZE < buf_rx.len() => {
-                    let header: Header = buf_rx.read().unwrap();
+                    let mut header: Header = buf_rx.read().unwrap();
 
                     // Parse request big-time
                     match header.command {
@@ -471,54 +463,112 @@ where
                             let mut urb: UrbHeader = buf_rx.read().unwrap();
                             let mut transfer: Data<Transfer> = buf_rx.claim_dst().unwrap();
                             let mut iso_packets: Data<IsoPacketData> = buf_rx.claim_dst().unwrap();
-                            match urb.kind {
-                                ioctl::UrbType::Ctrl => {
+                            let status = match (urb.kind, urb.endpoint.direction()) {
+                                (ioctl::UrbType::Ctrl, vhci::usbfs::Dir::In) => {
+                                    let transfer_ref = transfer.get_mut();
                                     let ctrl = urb.setup_packet;
-                                    match (ctrl.request_type(), ctrl.req()) {
-                                        STANDARD_DEVICE_GET_DESCRIPTOR => {
-                                            let index = u8::try_from(ctrl.value() & 0xff).unwrap();
-                                            // IDEA: Manually, painstakingly fill in transfer buffer
-                                            //       with each piece of data. Ow.
-                                            match  DescriptorType::from_u8(
-                                                u8::try_from(ctrl.value() >> 8).unwrap(),
-                                            ) {
-                                                Some(DescriptorType::Device) => {
-                                                    let desc = dev.device_descriptor().unwrap();
-                                                    let transfer_ref = transfer.get_mut();
-                                                    let (len, short) = if u16::from(desc.length()) < transfer_ref.header.actual_len {
-                                                        (u16::from(desc.length()), true)
-                                                    } else {
-                                                        (transfer_ref.header.actual_len, false)
-                                                    };
-
-                                                    urb.status = if short { vhci::Status::ShortPacket } else { vhci::Status::Success };
-                                                }
-                                                Some(DescriptorType::Configuration) => {
-                                                    let desc =
-                                                        dev.config_descriptor(index).unwrap();
-                                                }
-                                                Some(DescriptorType::String) => {
-                                                    // Needs open device
-                                                    let lang = languages.iter().find(|lang| ctrl.index() == lang.lang_id()).copied();
-                                                    let desc = handle.read_string_descriptor(lang.unwrap_or(languages[0]), index, Duration::from_millis(500)).unwrap();
-                                                }
-                                                Some(DescriptorType::Interface) => todo!(),
-                                                Some(DescriptorType::Endpoint) => todo!(),
-                                                None => todo!("thinking of mapping each unknown value to a connection break >:)"),
-                                            }
+                                    match handle.read_control(
+                                        ctrl.bm_request_type,
+                                        ctrl.b_request as u8,
+                                        ctrl.w_value,
+                                        ctrl.w_index,
+                                        transfer_ref.get_mut(),
+                                        Duration::from_millis(300),
+                                    ) {
+                                        Ok(bytes_written) => {
+                                            transfer_ref.header.actual_len = bytes_written as u16;
+                                            transfer_ref.header.aligned_len = bytes_written
+                                                .next_multiple_of(8)
+                                                .try_into()
+                                                .unwrap_or(transfer_ref.header.aligned_len);
+                                            vhci::Status::Success
                                         }
-                                        STANDARD_DEVICE_GET_CONFIGURATION => {
-                                            let transfer_ref = transfer.get_mut();
-                                            let conf = handle.active_configuration().unwrap();
-                                            transfer_ref.buf[0] = conf;
-                                            transfer_ref.header.actual_len = 1;
+                                        Err(rusb::Error::NoDevice) => {
+                                            vhci::Status::DeviceDisconnected
                                         }
-                                        _ => todo!("implement all ctrl requests"),
+                                        Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+                                        Err(_) => vhci::Status::Stall,
                                     }
                                 }
-                                ioctl::UrbType::Iso => todo!(),
-                                ioctl::UrbType::Int => todo!(),
-                                ioctl::UrbType::Bulk => todo!(),
+                                (ioctl::UrbType::Ctrl, vhci::usbfs::Dir::Out) => {
+                                    let ctrl = urb.setup_packet;
+                                    match handle.write_control(
+                                        ctrl.bm_request_type,
+                                        ctrl.b_request as u8,
+                                        ctrl.w_value,
+                                        ctrl.w_index,
+                                        transfer.get_mut().get_mut(),
+                                        Duration::from_millis(300),
+                                    ) {
+                                        Ok(_) => vhci::Status::Success,
+                                        Err(rusb::Error::NoDevice) => {
+                                            vhci::Status::DeviceDisconnected
+                                        }
+                                        Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+                                        Err(_) => vhci::Status::Stall,
+                                    }
+                                }
+                                (ioctl::UrbType::Iso, _) => vhci::Status::Stall,
+                                (ioctl::UrbType::Int, vhci::usbfs::Dir::In) => {
+                                    let transfer_ref = transfer.get_mut();
+                                    match handle.read_interrupt(
+                                        urb.endpoint.0,
+                                        transfer_ref.get_mut(),
+                                        Duration::from_millis(50),
+                                    ) {
+                                        Ok(bytes_written) => {
+                                            transfer_ref.header.actual_len = bytes_written as u16;
+                                            transfer_ref.header.aligned_len = bytes_written
+                                                .next_multiple_of(8)
+                                                .try_into()
+                                                .unwrap_or(transfer_ref.header.aligned_len);
+                                            vhci::Status::Success
+                                        }
+                                        Err(rusb::Error::NoDevice) => {
+                                            vhci::Status::DeviceDisconnected
+                                        }
+                                        Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+                                        Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
+                                        Err(_) => vhci::Status::Stall,
+                                    }
+                                }
+                                (ioctl::UrbType::Int, vhci::usbfs::Dir::Out) => todo!(),
+                                (ioctl::UrbType::Bulk, vhci::usbfs::Dir::In) => todo!(),
+                                (ioctl::UrbType::Bulk, vhci::usbfs::Dir::Out) => todo!(),
+                            };
+
+                            urb.status = status;
+
+                            header.command = msg::Command::RetSubmit;
+                            header.status = match status {
+                                vhci::Status::Pending => todo!(),
+                                vhci::Status::Error => todo!(),
+                                vhci::Status::TimedOut => todo!(),
+                                vhci::Status::DeviceDisabled => todo!(),
+                                vhci::Status::DeviceDisconnected => msg::Status::NoDev,
+                                vhci::Status::BitStuff => todo!(),
+                                vhci::Status::Crc => todo!(),
+                                vhci::Status::NoResponse => todo!(),
+                                vhci::Status::Babble => todo!(),
+                                vhci::Status::BufferUnderrun => todo!(),
+                                vhci::Status::AllIsoPacketsFailed => todo!(),
+                                vhci::Status::ShortPacket => todo!(),
+                                vhci::Status::Canceled => todo!(),
+                                vhci::Status::Success | _ => msg::Status::Success,
+                            };
+
+                            if msg::Status::Success == header.status {
+                                let mut response = header
+                                    .as_bytes()
+                                    .chain(urb.as_bytes())
+                                    .chain(transfer.as_bytes())
+                                    .chain(iso_packets.as_bytes());
+                                tx.write_all_buf(&mut response).await?;
+                            } else {
+                                let mut response = header.as_bytes();
+                                tx.write_all_buf(&mut response).await?;
+                                tx.close().await?;
+                                return Err(Error::Io(io::Error::other("usb device failed somehow")));
                             }
                         }
                         msg::Command::CmdUnlink => todo!(),
@@ -534,17 +584,17 @@ where
     }
 }
 
-pub struct ServerListDevices<W> {
+pub struct SendDevices<W> {
     tx: W,
 }
 
-impl<W> ServerListDevices<W> {
+impl<W> SendDevices<W> {
     pub fn new(tx: W) -> Self {
         Self { tx }
     }
 }
 
-impl<W> ServerListDevices<W>
+impl<W> SendDevices<W>
 where
     W: AsyncWrite + utils::CloseStream + Unpin,
 {
@@ -558,21 +608,24 @@ where
 
         let devices = match iter() {
             Ok(devices) => {
-                tx.write_all(msg::Status::Success.as_bytes()).await?;
-                tx.write_all(&[0, 0, 0]).await?;
+                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
+                tx.write_all_buf(&mut response).await?;
                 devices
             }
             Err(err) => {
-                tx.write_all(msg::Status::Failed.as_bytes()).await?;
+                let mut response = msg::Status::Failed.as_bytes().chain(&[0u8; 7][..]);
+                tx.write_all_buf(&mut response).await?;
+                tx.close().await?;
                 return Err(err.into());
             }
         };
 
         for usb in devices {
-            let main_info = usb.get();
-            tx.write_all(main_info.as_bytes()).await?;
-            tx.write_all(usb.interfaces_with_padding().as_bytes())
-                .await?;
+            let mut device = usb
+                .get()
+                .as_bytes()
+                .chain(usb.interfaces_with_padding().as_bytes());
+            tx.write_all_buf(&mut device).await?;
         }
 
         tx.close().await.map_err(Error::from)

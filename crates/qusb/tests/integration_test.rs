@@ -23,8 +23,13 @@ async fn list_devices_works() {
         let session = client.connect(addr, "localhost").await.unwrap();
         tracing::info!("Connected to {}", session.remote_address());
 
-        let _devices = session.req_list_devices().await.unwrap();
-        // println!("{devices:?}");
+        let devices = session.req_list_devices().await.unwrap();
+        for dev in devices.iter() {
+            println!("=========================================");
+            println!("{:?}", dev.path());
+            println!("{:?}", dev.header);
+            println!("{:?}", &dev.interfaces[..dev.header.b_num_interfaces as usize]);
+        }
     }
 
     handle.shutdown().await.unwrap().unwrap();

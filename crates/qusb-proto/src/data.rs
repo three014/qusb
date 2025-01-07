@@ -79,6 +79,10 @@ where
             _p: PhantomData,
         }
     }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 #[derive(Debug)]

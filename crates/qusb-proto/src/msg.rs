@@ -87,8 +87,9 @@
 
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
 
+use bytes::Buf;
 use thiserror::Error;
-use zerocopy::try_transmute;
+use zerocopy::{try_transmute, IntoBytes};
 use zerocopy_derive::*;
 
 use crate::GetSliceLen;
@@ -339,6 +340,16 @@ pub struct TransferHeader {
     pub _padding: [u8; 4],
 }
 
+impl Transfer {
+    pub fn get_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.header.actual_len as usize]
+    }
+
+    pub fn as_buf(&self) -> impl Buf + use<'_> {
+        self.header.as_bytes().chain(self.buf.as_bytes())
+    }
+}
+
 impl GetSliceLen for Transfer {
     fn get_slice_len(buf: &[u8]) -> Option<usize> {
         if std::mem::size_of::<TransferHeader>() > buf.len() {
@@ -366,6 +377,16 @@ pub struct IsoPacketData {
     pub buf: [vhci::ioctl::IocIsoPacketData],
 }
 
+impl IsoPacketData {
+    pub fn get_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketData] {
+        &mut self.buf[..self.header.len as usize]
+    }
+
+    pub fn as_buf(&self) -> impl Buf + use<'_> {
+        self.header.as_bytes().chain(self.buf.as_bytes())
+    }
+}
+
 impl GetSliceLen for IsoPacketData {
     fn get_slice_len(buf: &[u8]) -> Option<usize> {
         if std::mem::size_of::<IsoPacketHeader>() > buf.len() {
@@ -386,6 +407,16 @@ pub struct IsoPacketGiveback {
     pub buf: [vhci::ioctl::IocIsoPacketGiveback],
 }
 
+impl IsoPacketGiveback {
+    pub fn get_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketGiveback] {
+        &mut self.buf[..self.header.len as usize]
+    }
+
+    pub fn as_buf(&self) -> impl Buf + use<'_> {
+        self.header.as_bytes().chain(self.buf.as_bytes())
+    }
+}
+
 impl GetSliceLen for IsoPacketGiveback {
     fn get_slice_len(buf: &[u8]) -> Option<usize> {
         if std::mem::size_of::<IsoPacketHeader>() > buf.len() {
@@ -399,42 +430,61 @@ impl GetSliceLen for IsoPacketGiveback {
     }
 }
 
-pub trait SendUrb {
-    fn urb(&self) -> &UrbHeader;
-    fn transfer(&self) -> &Transfer;
-    fn transfer_mut(&mut self) -> &mut Transfer;
-    fn iso_packets_tx(&self) -> &IsoPacketData;
-    fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData;
-    fn iso_packets_rx(&self) -> &IsoPacketGiveback;
-    fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback;
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes)]
+#[repr(C)]
+pub struct DeviceDescriptor {
+    pub b_length: u8,
+    pub b_descriptor_type: u8,
+    pub bcd_usb: u16,
+    pub b_device_class: u8,
+    pub b_device_subclass: u8,
+    pub b_device_protocol: u8,
+    pub b_max_packet_size0: u8,
+    pub id_vendor: u16,
+    pub id_product: u16,
+    pub bcd_device: u16,
+    pub i_manufacturer: u8,
+    pub i_product: u8,
+    pub i_serial_number: u8,
+    pub b_num_configurations: u8,
 }
 
-impl<T: SendUrb> SendUrb for &mut T {
-    fn urb(&self) -> &UrbHeader {
-        T::urb(self)
-    }
+// pub trait SendUrb {
+//     fn urb(&self) -> &UrbHeader;
+//     fn transfer(&self) -> &Transfer;
+//     fn transfer_mut(&mut self) -> &mut Transfer;
+//     fn iso_packets_tx(&self) -> &IsoPacketData;
+//     fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData;
+//     fn iso_packets_rx(&self) -> &IsoPacketGiveback;
+//     fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback;
+// }
 
-    fn transfer(&self) -> &Transfer {
-        T::transfer(self)
-    }
+// impl<T: SendUrb> SendUrb for &mut T {
+//     fn urb(&self) -> &UrbHeader {
+//         T::urb(self)
+//     }
 
-    fn transfer_mut(&mut self) -> &mut Transfer {
-        T::transfer_mut(self)
-    }
+//     fn transfer(&self) -> &Transfer {
+//         T::transfer(self)
+//     }
 
-    fn iso_packets_tx(&self) -> &IsoPacketData {
-        T::iso_packets_tx(self)
-    }
+//     fn transfer_mut(&mut self) -> &mut Transfer {
+//         T::transfer_mut(self)
+//     }
 
-    fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData {
-        T::iso_packets_tx_mut(self)
-    }
+//     fn iso_packets_tx(&self) -> &IsoPacketData {
+//         T::iso_packets_tx(self)
+//     }
 
-    fn iso_packets_rx(&self) -> &IsoPacketGiveback {
-        T::iso_packets_rx(self)
-    }
+//     fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData {
+//         T::iso_packets_tx_mut(self)
+//     }
 
-    fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback {
-        T::iso_packets_rx_mut(self)
-    }
-}
+//     fn iso_packets_rx(&self) -> &IsoPacketGiveback {
+//         T::iso_packets_rx(self)
+//     }
+
+//     fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback {
+//         T::iso_packets_rx_mut(self)
+//     }
+// }

@@ -1,11 +1,11 @@
 use bytes::Buf;
 use iso::{Demuxer, Handle};
+use operator::{ClientBorrowDevice, ClientReq, LendDevice, SendDevices, ServerResp};
 use proto::{
     data::{IterDst, IterMutDst, Ring},
     msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use state::{ClientBorrowDevice, ClientReq, ServerLendDevice, ServerListDevices, ServerResp};
 use std::os::unix::ffi::OsStrExt;
 use std::{
     io,
@@ -25,9 +25,9 @@ use zerocopy::{FromZeros, IntoBytes};
 pub use quinn::rustls;
 pub use rcgen;
 
-mod dev;
 mod iso;
-mod state;
+mod operator;
+mod stub;
 mod usb_ids;
 pub mod utils;
 
@@ -240,11 +240,11 @@ fn init_iso(conn: quinn::Connection) -> Handle {
 pub struct Session {
     conn: quinn::Connection,
     iso: Arc<Mutex<Option<Handle>>>,
-    dev: dev::Controller,
+    dev: stub::Controller,
 }
 
 impl Session {
-    fn new(conn: quinn::Connection, dev: dev::Controller) -> Self {
+    fn new(conn: quinn::Connection, dev: stub::Controller) -> Self {
         Self {
             conn,
             iso: Arc::new(Mutex::new(None)),
@@ -257,9 +257,7 @@ impl Session {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
-    pub async fn accept_stream(
-        &self,
-    ) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>> {
+    pub async fn accept_stream(&self) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>> {
         let (mut tx, mut rx) = self.conn.accept_bi().await?;
         let mut buf = Ring::with_capacity(32);
 
@@ -270,9 +268,11 @@ impl Session {
 
         let version: msg::Version = buf.read()?;
         if !version.is_compat(&proto::QUSB_VER) {
-            tx.write_all(msg::Status::VersionMismatch.as_bytes())
-                .await?;
-            tx.write_all(proto::QUSB_VER.as_bytes()).await?;
+            let mut response = msg::Status::VersionMismatch
+                .as_bytes()
+                .chain(&[0u8; 3][..])
+                .chain(proto::QUSB_VER.as_bytes());
+            tx.write_all_buf(&mut response).await?;
             tx.close().await?;
             return Err(Error::VersionMismatch(version));
         }
@@ -281,7 +281,7 @@ impl Session {
             msg::Request::ListDevices => Ok::<_, io::Error>(ClientReq::ListDevices),
             msg::Request::BorrowDevice => Ok(ClientReq::BorrowDevice(buf.read()?)),
         }) {
-            Ok(ClientReq::ListDevices) => ServerResp::ListDevices(ServerListDevices::new(tx)),
+            Ok(ClientReq::ListDevices) => ServerResp::ListDevices(SendDevices::new(tx)),
             Ok(ClientReq::BorrowDevice(device)) => {
                 let mut slot = self.iso.lock().unwrap();
                 if slot
@@ -295,7 +295,7 @@ impl Session {
                     .get_or_insert_with(|| init_iso(self.conn.clone()))
                     .make_channel(rx.id())
                 {
-                    Some((iso_tx, iso_rx)) => ServerResp::BorrowDevice(ServerLendDevice::new(
+                    Some((iso_tx, iso_rx)) => ServerResp::BorrowDevice(LendDevice::new(
                         tx, rx, buf, iso_tx, iso_rx, device,
                     )),
                     // One way this can happen is if the demuxer wasn't finished
@@ -306,7 +306,8 @@ impl Session {
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                tx.write_all(msg::Status::Proto.as_bytes()).await?;
+                let mut response = msg::Status::Proto.as_bytes().chain(&[0u8; 7][..]);
+                tx.write_all_buf(&mut response).await?;
                 tx.close().await?;
                 return Err(err.into());
             }
@@ -329,10 +330,8 @@ impl Session {
         let version = proto::QUSB_VER;
         let req = msg::Request::ListDevices;
 
-        tx.write_all(version.as_bytes())
-            .await
-            .inspect_err(|err| error!("{err}"))?;
-        tx.write_all(req.as_bytes())
+        let mut request = version.as_bytes().chain(req.as_bytes());
+        tx.write_all_buf(&mut request)
             .await
             .inspect_err(|err| error!("{err}"))?;
         drop(tx);
@@ -442,7 +441,7 @@ impl Session {
 #[derive(Debug, Clone)]
 pub struct Client {
     endpoint: quinn::Endpoint,
-    dev: dev::Controller,
+    dev: stub::Controller,
 }
 
 impl Client {
@@ -508,18 +507,24 @@ fn get_usb_devices() -> io::Result<
         let bus_id = info.sysfs_path().file_name().map(|name| name.as_bytes())?;
         let bus_id_len = bus_id.len();
         let info = msg::UsbDeviceInfoHeader {
-            path_len: BoundedU16::<0, { PATH_MAX_LEN + 1 }>::new(u16::try_from(path_len).unwrap())
+            path_len: u16::try_from(path_len)
                 .unwrap_or_default()
-                .get(),
-            path: <[u8; PATH_MAX_LEN as usize]>::try_from(path)
-                .unwrap_or([0; PATH_MAX_LEN as usize]),
-            bus_id_len: BoundedU8::<0, { BUS_ID_MAX_LEN + 1 }>::new(
-                u8::try_from(bus_id_len).unwrap(),
-            )
-            .unwrap_or_default()
-            .get(),
-            bus_id: <[u8; BUS_ID_MAX_LEN as usize]>::try_from(bus_id)
-                .unwrap_or([0; BUS_ID_MAX_LEN as usize]),
+                .clamp(0, PATH_MAX_LEN),
+            path: {
+                let mut arr = [0; PATH_MAX_LEN as usize];
+                let len = path_len.clamp(0, PATH_MAX_LEN as usize);
+                arr[..len].copy_from_slice(&path[..len]);
+                arr
+            },
+            bus_id_len: u8::try_from(bus_id_len)
+                .unwrap_or_default()
+                .clamp(0, BUS_ID_MAX_LEN),
+            bus_id: {
+                let mut arr = [0; BUS_ID_MAX_LEN as usize];
+                let len = bus_id_len.clamp(0, BUS_ID_MAX_LEN as usize);
+                arr[..len].copy_from_slice(&bus_id[..len]);
+                arr
+            },
             busnum: info.bus_number(),
             devnum: info.device_address(),
             speed: info
@@ -545,12 +550,12 @@ fn get_usb_devices() -> io::Result<
 }
 
 struct ReqHandler {
-    vhci: dev::Controller,
+    vhci: stub::Controller,
     incoming: quinn::Incoming,
 }
 
 impl ReqHandler {
-    const fn new(vhci: dev::Controller, incoming: quinn::Incoming) -> Self {
+    const fn new(vhci: stub::Controller, incoming: quinn::Incoming) -> Self {
         Self { vhci, incoming }
     }
 
@@ -564,18 +569,19 @@ impl ReqHandler {
         );
         let session = Session::new(conn, self.vhci);
         match session.accept_stream().await? {
-            ServerResp::ListDevices(state) => state.resp_list_devices(get_usb_devices).await,
-            ServerResp::BorrowDevice(state) => state.run().await,
+            ServerResp::ListDevices(operator) => operator.resp_list_devices(get_usb_devices).await,
+            ServerResp::BorrowDevice(operator) => operator.run().await,
         }
     }
 }
 
-pub type ServerTaskResult = std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>;
+pub type ServerTaskResult =
+    std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>;
 
 #[derive(Debug)]
 pub struct Server {
     endpoint: quinn::Endpoint,
-    dev: dev::Controller,
+    dev: stub::Controller,
 }
 
 impl Server {
@@ -701,7 +707,7 @@ pub fn peer(
     .unwrap();
     endpoint.set_default_client_config(client_tls);
 
-    let dev = dev::Controller::start(num_ports).unwrap();
+    let dev = stub::Controller::start(num_ports).unwrap();
 
     (
         Client {
