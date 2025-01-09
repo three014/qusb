@@ -273,7 +273,7 @@ impl Session {
             Err(ReadError::CorruptedData) => {
                 unreachable!("msg::Version has FromBytes impl, and should be aligned")
             }
-            Err(ReadError::BufferShort) => {
+            Err(ReadError::BufferShort { .. }) => {
                 unreachable!("we should have read enough data to get the version")
             }
         };
@@ -294,7 +294,7 @@ impl Session {
         }) {
             Ok(ClientReq::ListDevices) => ServerResp::ListDevices(SendDevices::new(tx)),
             Ok(ClientReq::BorrowDevice(device)) => {
-                buf.consume(&[0u8; 6]);
+                buf.consume(6);
 
                 let mut slot = self.iso.lock().await;
                 if slot
@@ -325,7 +325,7 @@ impl Session {
                 tx.close().await?;
                 return Err(Error::Unknown);
             }
-            Err(ReadError::BufferShort) => todo!(),
+            Err(ReadError::BufferShort { .. }) => todo!(),
         };
 
         Ok(req)
@@ -362,9 +362,9 @@ impl Session {
             Err(ReadError::CorruptedData) => {
                 unreachable!("msg::Status is FromBytes, and should be aligned")
             }
-            Err(ReadError::BufferShort) => return Err(Error::Unknown),
+            Err(ReadError::BufferShort { .. }) => return Err(Error::Unknown),
         };
-        buf.consume(&[0u8; 7]);
+        buf.consume(7);
         match status {
             msg::Status::Success => {}
             msg::Status::Failed => return Err(Error::ReqFailed),
@@ -427,15 +427,15 @@ impl Session {
             Err(ReadError::CorruptedData) => {
                 unreachable!("msg::Status is FromBytes, and should be aligned")
             }
-            Err(ReadError::BufferShort) => {
+            Err(ReadError::BufferShort { .. }) => {
                 unreachable!("we should have read enough bytes to read status")
             }
         };
-        buf.consume(&[0u8; 7]);
+        buf.consume(7);
         match status {
             msg::Status::Success => (),
             msg::Status::Failed => return Err(Error::ReqFailed),
-            msg::Status::DevBusy => todo!(),
+            msg::Status::DevBusy => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
             msg::Status::DevErr => todo!(),
             msg::Status::NoDev => {
                 return Err(Error::DevNotFound(id));

@@ -1,5 +1,6 @@
 use crate::rustls;
-use nohash_hasher::{BuildNoHashHasher, IsEnabled};
+use fxhash::FxBuildHasher;
+use nohash_hasher::IsEnabled;
 use std::{
     borrow::Borrow, collections::HashMap, fmt::Debug, future::Future, hash::Hash, io, sync::Arc,
 };
@@ -9,7 +10,7 @@ use tokio::sync::oneshot;
 pub enum LinkResult {
     Success,
     NewKeyAlreadyExists,
-    ExistingKeyDoesNotExist
+    ExistingKeyDoesNotExist,
 }
 
 #[derive(Debug)]
@@ -21,12 +22,12 @@ pub struct ThreeKeyMap<K1, K2, K3, V> {
 }
 
 impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
-    pub fn with_capacity(cap: usize) -> Self {
+    pub fn with_capacities(values_cap: usize, k1_cap: usize, k2_cap: usize, k3_cap: usize) -> Self {
         Self {
-            key1_map: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
-            key2_map: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
-            key3_map: SimpleMap::with_capacity_and_hasher(cap, Default::default()),
-            values: Vec::with_capacity(cap),
+            key1_map: SimpleMap::with_capacity_and_hasher(k1_cap, Default::default()),
+            key2_map: SimpleMap::with_capacity_and_hasher(k2_cap, Default::default()),
+            key3_map: SimpleMap::with_capacity_and_hasher(k3_cap, Default::default()),
+            values: Vec::with_capacity(values_cap),
         }
     }
 
@@ -112,7 +113,7 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
         }
         .link_key_to_key(new_k, existing_k)
     }
-    
+
     pub fn link_key2_to_key3<Q>(&mut self, new_k: K2, existing_k: &Q) -> LinkResult
     where
         Q: ?Sized + Hash + Eq,
@@ -414,7 +415,7 @@ where
     }
 }
 
-pub type SimpleMap<K, V> = HashMap<K, V, BuildNoHashHasher<K>>;
+pub type SimpleMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NoHash<T>(pub T);
@@ -627,7 +628,7 @@ mod tests {
 
     #[test]
     fn remove_last_tx_works() {
-        let mut mailer = Mailer::with_capacity(4);
+        let mut mailer = Mailer::with_capacities(8, 8, 10, 64);
 
         let (tx, _rx) = tokio::sync::mpsc::channel(20);
         mailer.insert_by_key1(Port::new(1).unwrap(), tx);
@@ -638,7 +639,7 @@ mod tests {
 
     #[test]
     fn remove_tx_works() {
-        let mut mailer = Mailer::with_capacity(4);
+        let mut mailer = Mailer::with_capacities(4, 4, 6, 32);
 
         let (tx, _rx) = tokio::sync::mpsc::channel(20);
         mailer.insert_by_key1(Port::new(1).unwrap(), tx);
@@ -649,13 +650,5 @@ mod tests {
         mailer.remove_by_key1(&Port::new(1).unwrap());
         let index = mailer.key1_map.get(&Port::new(5).unwrap()).unwrap();
         assert_eq!(*index, 0);
-    }
-
-    #[test]
-    fn trait_bounds_for_address() {
-        let mut mailer = Mailer::with_capacity(4);
-
-        let (tx, _rx) = mpsc::channel(4);
-        mailer.insert_by_key2(NoHash(Addr(Address::new(0).unwrap())), tx);
     }
 }

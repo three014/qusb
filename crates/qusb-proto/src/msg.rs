@@ -85,11 +85,16 @@
 //!
 //!
 
-use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+use std::{
+    ffi::OsStr,
+    mem::{offset_of, size_of},
+    os::unix::ffi::OsStrExt,
+    path::Path,
+};
 
 use bytes::Buf;
 use thiserror::Error;
-use zerocopy::{try_transmute, IntoBytes};
+use zerocopy::{try_transmute, FromBytes, IntoBytes};
 use zerocopy_derive::*;
 
 use crate::{GetSliceLen, GetSliceLenErr};
@@ -254,16 +259,28 @@ impl UsbDeviceInfo {
 
 impl GetSliceLen for UsbDeviceInfo {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
-        let size_of_base = std::mem::size_of::<UsbDeviceInfoHeader>();
-        if size_of_base > buf.len() {
-            return Err(GetSliceLenErr::BufferShort);
+        const SIZE_OF_BASE: usize = size_of::<UsbDeviceInfoHeader>();
+        if SIZE_OF_BASE > buf.len() {
+            return Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: SIZE_OF_BASE - buf.len(),
+                buf_len: buf.len(),
+            });
         }
 
-        const HEADER_OFFSET: usize = std::mem::offset_of!(UsbDeviceInfo, header);
+        const HEADER_OFFSET: usize = offset_of!(UsbDeviceInfo, header);
         const LEN_OFFSET: usize =
-            HEADER_OFFSET + std::mem::offset_of!(UsbDeviceInfoHeader, padded_num_interfaces);
-        let len = buf[LEN_OFFSET];
-        Ok(len as usize)
+            HEADER_OFFSET + offset_of!(UsbDeviceInfoHeader, padded_num_interfaces);
+        let padded_len = usize::from(buf[LEN_OFFSET]);
+
+        let size_of_t = padded_len * size_of::<UsbInterfaceInfo>() + SIZE_OF_BASE;
+        if size_of_t > buf.len() {
+            Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: size_of_t - buf.len(),
+                buf_len: buf.len(),
+            })
+        } else {
+            Ok(padded_len)
+        }
     }
 }
 
@@ -297,21 +314,24 @@ pub struct UsbDeviceInfoHeader {
 pub enum Command {
     CmdSubmit = 0,
     CmdUnlink = 1,
-    RetSubmit = 2,
-    RetUnlink = 3,
+    CmdPort = 2,
+    RetSubmit = 3,
+    RetUnlink = 4,
+    RetPort = 5,
 }
 
-#[derive(KnownLayout, Immutable, FromZeros, IntoBytes)]
+#[derive(Debug, KnownLayout, Immutable, FromZeros, IntoBytes)]
 #[repr(C, align(8))]
 pub struct Header {
     pub seqnum: u64,
     pub dev_id: UsbDeviceId,
     pub command: Command,
     pub status: Status,
-    pub _padding: [u8; 4],
+    pub reset: bool,
+    pub _padding: [u8; 3],
 }
 
-#[derive(KnownLayout, Immutable, IntoBytes, TryFromBytes)]
+#[derive(Debug, KnownLayout, Immutable, IntoBytes, FromZeros)]
 #[repr(C, align(8))]
 pub struct UrbHeader {
     pub setup_packet: vhci::ioctl::IocSetupPacket,
@@ -352,14 +372,24 @@ impl Transfer {
 
 impl GetSliceLen for Transfer {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
-        if std::mem::size_of::<TransferHeader>() > buf.len() {
-            return Err(GetSliceLenErr::BufferShort);
+        const SIZE_OF_TRANSFER_HEADER: usize = size_of::<TransferHeader>();
+        if SIZE_OF_TRANSFER_HEADER > buf.len() {
+            return Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: SIZE_OF_TRANSFER_HEADER - buf.len(),
+                buf_len: buf.len(),
+            });
         }
 
-        const LEN_OFFSET: usize = std::mem::offset_of!(TransferHeader, aligned_len);
-        let len_bytes = &buf[LEN_OFFSET..LEN_OFFSET + size_of::<u16>()];
-        let len = u16::from_le_bytes(len_bytes.try_into().unwrap());
-        Ok(len.into())
+        let (header, rest) = TransferHeader::read_from_prefix(buf).unwrap();
+        let aligned_len = usize::from(header.aligned_len);
+        if aligned_len > rest.len() {
+            Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: aligned_len - rest.len(),
+                buf_len: buf.len(),
+            })
+        } else {
+            Ok(aligned_len)
+        }
     }
 }
 
@@ -389,14 +419,25 @@ impl IsoPacketData {
 
 impl GetSliceLen for IsoPacketData {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
-        if std::mem::size_of::<IsoPacketHeader>() > buf.len() {
-            return Err(GetSliceLenErr::BufferShort);
+        const SIZE_OF_HEADER: usize = size_of::<IsoPacketHeader>();
+        if SIZE_OF_HEADER > buf.len() {
+            return Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: SIZE_OF_HEADER - buf.len(),
+                buf_len: buf.len(),
+            });
         }
 
-        const LEN_OFFSET: usize = std::mem::offset_of!(IsoPacketHeader, len);
-        let len_bytes = &buf[LEN_OFFSET..LEN_OFFSET + size_of::<u16>()];
-        let len = u16::from_le_bytes(len_bytes.try_into().unwrap());
-        Ok(len.into())
+        let (header, rest) = IsoPacketHeader::read_from_prefix(buf).unwrap();
+        let len = usize::from(header.len);
+        let byte_len = len * size_of::<vhci::ioctl::IocIsoPacketData>();
+        if byte_len > rest.len() {
+            Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: byte_len - rest.len(),
+                buf_len: buf.len(),
+            })
+        } else {
+            Ok(len)
+        }
     }
 }
 
@@ -419,14 +460,80 @@ impl IsoPacketGiveback {
 
 impl GetSliceLen for IsoPacketGiveback {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
-        if std::mem::size_of::<IsoPacketHeader>() > buf.len() {
-            return Err(GetSliceLenErr::BufferShort);
+        const SIZE_OF_HEADER: usize = size_of::<IsoPacketHeader>();
+        if SIZE_OF_HEADER > buf.len() {
+            return Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: SIZE_OF_HEADER - buf.len(),
+                buf_len: buf.len(),
+            });
         }
 
-        const LEN_OFFSET: usize = std::mem::offset_of!(IsoPacketHeader, len);
-        let len_bytes = &buf[LEN_OFFSET..LEN_OFFSET + size_of::<u16>()];
-        let len = u16::from_le_bytes(len_bytes.try_into().unwrap());
-        Ok(len.into())
+        let (header, rest) = IsoPacketHeader::read_from_prefix(buf).unwrap();
+        let len = usize::from(header.len);
+        let byte_len = len * size_of::<vhci::ioctl::IocIsoPacketGiveback>();
+        if byte_len > rest.len() {
+            Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: byte_len - rest.len(),
+                buf_len: buf.len(),
+            })
+        } else {
+            Ok(len)
+        }
+    }
+}
+
+#[derive(KnownLayout, Immutable, FromZeros)]
+#[repr(C)]
+pub struct UrbFrame {
+    pub header: UrbHeader,
+    pub data: [u8],
+}
+
+impl GetSliceLen for UrbFrame {
+    fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
+        const BASE_LEN: usize =
+            size_of::<UrbHeader>() + size_of::<IsoPacketHeader>() + size_of::<TransferHeader>();
+
+        if BASE_LEN > buf.len() {
+            return Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: BASE_LEN - buf.len(),
+                buf_len: buf.len(),
+            });
+        }
+
+        const TRANSFER_OFFSET: usize = size_of::<UrbHeader>();
+        let (transfer_header, rest) =
+            TransferHeader::read_from_prefix(&buf[TRANSFER_OFFSET..]).unwrap();
+        let transfer_aligned_len = usize::from(transfer_header.aligned_len);
+
+        let iso_packet_data =
+            rest.get(transfer_aligned_len..)
+                .ok_or_else(|| GetSliceLenErr::BufferShort {
+                    num_bytes_needed: transfer_aligned_len - rest.len(),
+                    buf_len: buf.len(),
+                })?;
+
+        let (iso_header, rest) = IsoPacketHeader::read_from_prefix(iso_packet_data)
+            .ok()
+            .ok_or_else(|| GetSliceLenErr::BufferShort {
+                num_bytes_needed: size_of::<IsoPacketHeader>() - iso_packet_data.len(),
+                buf_len: buf.len(),
+            })?;
+
+        let iso_len = usize::from(iso_header.len);
+        let iso_byte_len = iso_len * size_of::<vhci::ioctl::IocIsoPacketData>();
+        if iso_byte_len > rest.len() {
+            Err(GetSliceLenErr::BufferShort {
+                num_bytes_needed: iso_byte_len - rest.len(),
+                buf_len: buf.len(),
+            })
+        } else {
+            // This is the size of the unsized slice
+            Ok(size_of::<TransferHeader>()
+                + size_of::<IsoPacketHeader>()
+                + transfer_aligned_len
+                + iso_byte_len)
+        }
     }
 }
 

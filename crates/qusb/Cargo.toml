@@ -33,6 +33,7 @@ vhci = { package = "usb_vhci", git = "https://github.com/three014/usb_vhci", fea
 bytes = "1.9.0"
 zerocopy = "0.8.13"
 rusb = "0.9.4"
+fxhash = "0.2.1"
 
 [dev-dependencies]
 tracing-test = { version = "0.2.5" }

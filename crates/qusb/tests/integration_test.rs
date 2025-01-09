@@ -69,6 +69,6 @@ async fn send_usb_data() {
             })
             .await
             .unwrap();
-        usb.borrow().await;
+        usb.borrow().await.unwrap();
     }
 }

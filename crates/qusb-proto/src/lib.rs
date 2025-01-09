@@ -1,4 +1,5 @@
 pub use lstr;
+use thiserror::Error;
 use zerocopy::KnownLayout;
 
 pub mod data;
@@ -13,11 +14,16 @@ pub const QUSB_VER: msg::Version = msg::Version {
 
 pub const BUS_ID_SIZE: usize = 32;
 
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum GetSliceLenErr {
-    /// Impl is not confident that the obtained length is valid for the slice.
+    #[error("impl is not confident that the obtained length is valid for the slice")]
     NoConfidence,
     /// Buffer is too short to read the slice length.
-    BufferShort,
+    #[error("buffer is too short to read the slice length (missing >{num_bytes_needed} bytes, buf.len() == {buf_len})")]
+    BufferShort {
+        num_bytes_needed: usize,
+        buf_len: usize
+    },
 }
 
 /// You received a DST from the internet in the
