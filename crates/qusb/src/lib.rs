@@ -1,5 +1,4 @@
 use bytes::Buf;
-use iso::{Demuxer, Handle};
 use operator::{ClientBorrowDevice, ClientReq, LendDevice, SendDevices, ServerResp};
 use proto::{
     data::{IterDst, IterMutDst, ReadError, Ring},
@@ -15,7 +14,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, sync::mpsc};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, trace, warn};
 use usb_ids::UsbIds;
 use utils::CloseStream;
@@ -25,7 +24,6 @@ use zerocopy::{FromZeros, IntoBytes};
 pub use quinn::rustls;
 pub use rcgen;
 
-mod iso;
 mod operator;
 mod stub;
 mod usb_ids;
@@ -216,32 +214,9 @@ impl UsbDevices {
     }
 }
 
-fn init_iso(conn: quinn::Connection) -> Handle {
-    let (register_tx, register_rx) = mpsc::channel(8);
-    let (disconnect_tx, disconnect_rx) = mpsc::channel(8);
-    let demux_conn = conn.clone();
-    let handle = tokio::spawn(async move {
-        Demuxer {
-            register_rx,
-            disconnect_rx,
-            conn: demux_conn,
-        }
-        .run()
-        .await
-    });
-
-    Handle {
-        handle,
-        register_tx,
-        disconnect_tx,
-        conn,
-    }
-}
-
 #[derive(Debug)]
 pub struct Session {
     conn: quinn::Connection,
-    iso: Arc<tokio::sync::Mutex<Option<Handle>>>,
     dev: stub::Controller,
 }
 
@@ -249,7 +224,6 @@ impl Session {
     fn new(conn: quinn::Connection, dev: stub::Controller) -> Self {
         Self {
             conn,
-            iso: Arc::new(tokio::sync::Mutex::new(None)),
             dev,
         }
     }
@@ -296,28 +270,7 @@ impl Session {
             Ok(ClientReq::BorrowDevice(device)) => {
                 buf.consume(6);
 
-                let mut slot = self.iso.lock().await;
-                if slot
-                    .as_ref()
-                    .is_none_or(|Handle { handle, .. }| handle.is_finished())
-                {
-                    *slot = None;
-                }
-
-                match slot
-                    .get_or_insert_with(|| init_iso(self.conn.clone()))
-                    .make_channel(rx.id())
-                    .await
-                {
-                    Some((iso_tx, iso_rx)) => ServerResp::BorrowDevice(LendDevice::new(
-                        tx, rx, buf, iso_tx, iso_rx, device,
-                    )),
-                    // One way this can happen is if the demuxer wasn't finished
-                    // when we checked, but then finished right after.
-                    // TODO: Have this process run in a short loop so we can try to
-                    // initialize the demuxer again.
-                    None => return Err(Error::Io(io::ErrorKind::BrokenPipe.into())),
-                }
+                ServerResp::BorrowDevice(LendDevice::new(tx, rx, buf, device))
             }
             Err(ReadError::CorruptedData) => {
                 let mut response = msg::Status::Proto.as_bytes().chain(&[0u8; 7][..]);
@@ -454,29 +407,7 @@ impl Session {
             msg::Status::Proto => todo!(),
         }
 
-        let mut slot = self.iso.lock().await;
-        if slot
-            .as_ref()
-            .is_none_or(|Handle { handle, .. }| handle.is_finished())
-        {
-            *slot = None;
-        }
-
-        let client = match slot
-            .get_or_insert_with(|| init_iso(self.conn.clone()))
-            .make_channel(tx.id())
-            .await
-        {
-            Some((iso_tx, iso_rx)) => {
-                ClientBorrowDevice::new(tx, rx, buf, iso_tx, iso_rx, self.dev.clone(), id)
-            }
-            // One way this can happen is if the demuxer wasn't finished
-            // when we checked, but then finished right after.
-            // TODO: Have this process run in a short loop so we can try to
-            // initialize the demuxer again.
-            None => return Err(Error::Io(io::ErrorKind::BrokenPipe.into())),
-        };
-
+        let client = ClientBorrowDevice::new(tx, rx, buf, self.dev.clone(), id);
         Ok(client)
     }
 }

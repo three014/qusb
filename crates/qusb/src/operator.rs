@@ -1,12 +1,10 @@
 use std::{
-    hash::Hash,
     io,
-    path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use proto::{
     data::{ReadError, Ring},
     msg::{
@@ -14,18 +12,17 @@ use proto::{
         UrbHeader,
     },
 };
-use rusb::{LogCallbackMode, LogLevel, UsbContext};
+use rusb::UsbContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, trace, warn};
 use vhci::{
     ioctl::{self, UrbType},
-    usbfs::{self, Dir, Req, STANDARD_DEVICE_SET_ADDRESS, STANDARD_DEVICE_SET_CONFIGURATION},
+    usbfs::{Dir, Req, STANDARD_DEVICE_SET_ADDRESS, STANDARD_DEVICE_SET_CONFIGURATION},
     DataRate, PortChange, PortFlag, PortStatus,
 };
 use zerocopy::{FromBytes, IntoBytes, TryFromBytes};
 
 use crate::{
-    iso,
     stub::{self, RegisterPort},
     utils::{self, SimpleMap},
     Error, Result, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
@@ -43,8 +40,6 @@ pub struct ClientBorrowDevice<W, R> {
     tx: W,
     rx: R,
     buf_rx: Ring,
-    iso_tx: iso::Sender,
-    iso_rx: iso::Receiver,
     vhci: stub::Controller,
     id: msg::UsbDeviceId,
 }
@@ -54,8 +49,6 @@ impl<W, R> ClientBorrowDevice<W, R> {
         tx: W,
         rx: R,
         buf_rx: Ring,
-        iso_tx: iso::Sender,
-        iso_rx: iso::Receiver,
         vhci: stub::Controller,
         id: msg::UsbDeviceId,
     ) -> Self {
@@ -63,8 +56,6 @@ impl<W, R> ClientBorrowDevice<W, R> {
             tx,
             rx,
             buf_rx,
-            iso_tx,
-            iso_rx,
             vhci,
             id,
         }
@@ -95,8 +86,6 @@ where
             mut tx,
             mut rx,
             mut buf_rx,
-            iso_tx: _,
-            iso_rx: _,
             mut vhci,
             id: dev_id,
         } = self;
@@ -110,7 +99,6 @@ where
 
         enum Event {
             Work(Option<ioctl::Work>),
-            IsoUrbResp(Option<Bytes>),
             UrbResp(io::Result<usize>),
         }
 
@@ -386,9 +374,6 @@ where
                         trace!("URB with {handle:?} had already been returned");
                     }
                 }
-                Event::IsoUrbResp(_bytes) => {
-                    unimplemented!("will eventually be handled almost the same way as normal urbs")
-                }
                 Event::UrbResp(Ok(_)) if HEADER_SIZE <= buf_rx.len() => {
                     let header: Header = buf_rx.read().unwrap();
                     debug!("got response with seqnum {}", header.seqnum);
@@ -510,8 +495,6 @@ pub struct LendDevice<W, R> {
     tx: W,
     rx: R,
     buf_rx: Ring,
-    iso_tx: iso::Sender,
-    iso_rx: iso::Receiver,
     id: msg::UsbDeviceId,
 }
 
@@ -520,16 +503,12 @@ impl<W, R> LendDevice<W, R> {
         tx: W,
         rx: R,
         buf_rx: Ring,
-        iso_tx: iso::Sender,
-        iso_rx: iso::Receiver,
         id: msg::UsbDeviceId,
     ) -> Self {
         Self {
             tx,
             rx,
             buf_rx,
-            iso_tx,
-            iso_rx,
             id,
         }
     }
@@ -546,8 +525,6 @@ where
             mut tx,
             mut rx,
             mut buf_rx,
-            iso_tx: _,
-            iso_rx: _,
             id: dev_id,
         } = self;
 
