@@ -1,9 +1,10 @@
 use quinn::rustls;
-use vhci::utils::BoundedU8;
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
+use vhci::utils::BoundedU8;
 
 pub fn addr(port: u16) -> SocketAddr {
     (Ipv4Addr::new(127, 0, 0, 1), port).into()
@@ -16,11 +17,14 @@ pub fn setup(addr: SocketAddr) -> (qusb::Client, qusb::Server) {
     let client = rustls::ClientConfig::builder()
         .with_root_certificates(Arc::new(certs))
         .with_no_client_auth();
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+
     qusb::peer(
         server,
         client,
         Some(addr),
-        quinn::TransportConfig::default(),
-        BoundedU8::new(4).unwrap()
+        transport,
+        BoundedU8::new(4).unwrap(),
     )
 }

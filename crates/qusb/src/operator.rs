@@ -1,5 +1,6 @@
 use std::{
     io,
+    mem::MaybeUninit,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -7,14 +8,11 @@ use std::{
 use bytes::{Buf, BufMut, BytesMut};
 use proto::{
     data::{ReadError, Ring},
-    msg::{
-        self, Header, IsoPacketData, IsoPacketGiveback, IsoPacketHeader, TransferHeader, UrbFrame,
-        UrbHeader,
-    },
+    msg::{self, Header, UrbFrame, UrbHeader},
 };
 use rusb::UsbContext;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use vhci::{
     ioctl::{self, UrbType},
     usbfs::{Dir, Req, STANDARD_DEVICE_SET_ADDRESS, STANDARD_DEVICE_SET_CONFIGURATION},
@@ -24,7 +22,7 @@ use zerocopy::{FromBytes, IntoBytes, TryFromBytes};
 
 use crate::{
     stub::{self, RegisterPort},
-    utils::{self, SimpleMap},
+    utils::{self, align_to_usize, SimpleMap},
     Error, Result, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
 };
 
@@ -45,13 +43,7 @@ pub struct ClientBorrowDevice<W, R> {
 }
 
 impl<W, R> ClientBorrowDevice<W, R> {
-    pub fn new(
-        tx: W,
-        rx: R,
-        buf_rx: Ring,
-        vhci: stub::Controller,
-        id: msg::UsbDeviceId,
-    ) -> Self {
+    pub fn new(tx: W, rx: R, buf_rx: Ring, vhci: stub::Controller, id: msg::UsbDeviceId) -> Self {
         Self {
             tx,
             rx,
@@ -89,7 +81,8 @@ where
             mut vhci,
             id: dev_id,
         } = self;
-        let mut buf_tx = BytesMut::with_capacity(1024);
+        let mut scratch_buf = BytesMut::with_capacity(1024);
+        buf_rx.reserve(4096);
 
         // Step 1: Connect VHCI port
         let (port, mut work_rx) = vhci
@@ -104,8 +97,7 @@ where
 
         // Step 2: Setup context
         const HEADER_SIZE: usize = size_of::<Header>();
-        const MIN_URB_SUBMIT_SIZE: usize =
-            size_of::<UrbHeader>() + size_of::<TransferHeader>() + size_of::<IsoPacketHeader>();
+        const MIN_URB_SUBMIT_SIZE: usize = size_of::<UrbHeader>();
 
         let seqnum = AtomicU64::new(0);
         let mut addr: u8 = 0xff;
@@ -115,10 +107,12 @@ where
         let mut seqnums =
             SimpleMap::<ioctl::UrbHandle, u64>::with_capacity_and_hasher(32, Default::default());
 
-        trace!("starting event loop");
+        info!("starting event loop");
 
         // Step 3: Start event loop
         'outer: loop {
+            debug!("==============================================");
+            trace!("waiting for work or data");
             let event = tokio::select! {
                 maybe_work = work_rx.recv() => {
                     Event::Work(maybe_work)
@@ -128,8 +122,6 @@ where
                 }
             };
 
-            debug!("==============================================");
-            let now = Instant::now();
             match event {
                 Event::Work(Some(ioctl::Work::PortStat(next))) => {
                     debug!("got port stat for {:?}", port);
@@ -137,44 +129,36 @@ where
                     // debug!("change: {:?}", next.change());
                     // debug!("index: {:?}", next.index());
                     // debug!("flags: {:?}", next.flags());
-                    if next.change().contains(PortChange::CONNECTION) {
-                        trace!("CONNECTION state changed -> invalidating address");
+                    let status = next.status();
+                    let change = next.change();
+                    let flags = next.flags();
+                    if change.contains(PortChange::CONNECTION) {
+                        debug!("CONNECTION state changed -> invalidating address");
                         addr = 0xff;
                     }
-                    if next.change().contains(PortChange::RESET)
-                        && (!next.status()).contains(PortStatus::RESET)
-                        && next.status().contains(PortStatus::ENABLE)
+                    if change.contains(PortChange::RESET)
+                        && (!status).contains(PortStatus::RESET)
+                        && status.contains(PortStatus::ENABLE)
                     {
-                        trace!("RESET successful -> use default address");
+                        debug!("RESET successful -> use default address");
                         addr = 0;
                     }
                     if prev.status().contains(PortStatus::POWER)
-                        && (!next.status()).contains(PortStatus::POWER)
+                        && (!status).contains(PortStatus::POWER)
                     {
-                        trace!("port is powered off");
+                        debug!("port is powered off");
                     }
                     if (!prev.status()).contains(PortStatus::RESET)
-                        && next
-                            .status()
-                            .contains(PortStatus::RESET | PortStatus::CONNECTION)
+                        && status.contains(PortStatus::RESET | PortStatus::CONNECTION)
                     {
-                        trace!("port is resetting");
                         let next = seqnum.fetch_add(1, Ordering::Relaxed);
                         let handle = ioctl::UrbHandle(u64::MAX);
                         seqnums.insert(handle, next);
                         handles.insert(next, handle);
+                        debug!("port is resetting with seqnum {next}");
+                        let now = Instant::now();
 
-                        let reserve_size = size_of::<Header>();
-
-                        buf_tx.clear();
-                        buf_tx.reserve(reserve_size.saturating_sub(buf_tx.capacity()));
-                        buf_tx.put_bytes(0, reserve_size);
-
-                        let reserved_chunk = &mut buf_tx[..reserve_size];
-
-                        // Grab mutable references for each part of our frame
-                        let header = Header::try_mut_from_bytes(reserved_chunk).unwrap();
-                        *header = Header {
+                        let header = Header {
                             seqnum: next,
                             dev_id,
                             command: msg::Command::CmdPort,
@@ -183,15 +167,17 @@ where
                             _padding: Default::default(),
                         };
 
-                        tx.write_all_buf(&mut &buf_tx[..reserve_size])
-                            .await
-                            .unwrap();
+                        let elapsed = now.elapsed();
+                        if Duration::from_micros(5) < elapsed {
+                            trace!("took {elapsed:?} to setup port reset frame");
+                        }
+                        tx.write_all_buf(&mut header.as_bytes()).await.unwrap();
                     }
                     if (!prev.flags()).contains(PortFlag::RESUMING)
-                        && next.flags().contains(PortFlag::RESUMING)
-                        && next.status().contains(PortStatus::CONNECTION)
+                        && flags.contains(PortFlag::RESUMING)
+                        && status.contains(PortStatus::CONNECTION)
                     {
-                        trace!("port is resuming -> completing resume");
+                        debug!("port is resuming -> completing resume");
                         todo!("do the actual resume thing");
                     }
                     prev = next;
@@ -212,11 +198,11 @@ where
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle)))) => {
                     assert_eq!(addr, urb.address.get());
-                    debug!("got urb with {addr:#x}");
-                    let now = Instant::now();
                     let next = seqnum.fetch_add(1, Ordering::Relaxed);
+                    debug!("got urb with {addr:#x} with seqnum {next}");
                     assert!(handles.insert(next, handle).is_none());
                     assert!(seqnums.insert(handle, next).is_none());
+                    let now = Instant::now();
 
                     // TODO: Do we reclaim the reserved chunk automatically??
                     //       - Seems like we gotta manually give back the chunk
@@ -236,42 +222,42 @@ where
 
                     // To ensure 8 byte alignment, we make sure every whole part of the
                     // URB frame is aligned to 8 bytes.
-                    let transfer_padded_size = usize::try_from(urb.buffer_length)
-                        .map(|len| len.next_multiple_of(8))
-                        .unwrap_or_default();
+                    let num_isos = urb.packet_count as usize;
+                    let transfer_actual_len = urb.buffer_length as usize;
+                    let transfer_padded_size = {
+                        let buf_and_ctrl_pkt_len =
+                            transfer_actual_len + size_of::<ioctl::IocSetupPacket>();
+                        align_to_usize(buf_and_ctrl_pkt_len)
+                    };
 
                     // We then calculate the total size of the URB frame...
-                    let reserve_size = size_of::<Header>()
-                        + size_of::<msg::UrbHeader>()
-                        + size_of::<msg::TransferHeader>()
-                        + transfer_padded_size
-                        + size_of::<msg::IsoPacketHeader>()
-                        + usize::try_from(urb.packet_count).unwrap()
-                            * size_of::<ioctl::IocIsoPacketData>();
+                    let reserve_size =
+                        transfer_padded_size + num_isos * size_of::<ioctl::IocIsoPacketData>();
 
                     // ...and make sure we have enough space in our scratch buffer
-                    buf_tx.clear();
-                    buf_tx.reserve(reserve_size.saturating_sub(buf_tx.capacity()));
-                    buf_tx.put_bytes(0, reserve_size);
+                    scratch_buf.clear();
+                    scratch_buf.reserve(reserve_size.saturating_sub(scratch_buf.capacity()));
+                    let uninit_slice = &mut scratch_buf.spare_capacity_mut()[..reserve_size];
 
-                    // By this point `reserved_chunk` should be a zero-initialized
-                    // slice of u8's ready for writing our data
-                    let reserved_chunk = &mut buf_tx[..reserve_size];
+                    // SAFETY: The byte slice may have uninitialized data in it,
+                    //         however no function reads this slice until after the slice
+                    //         has been written to. Both [u8] and [ioctl::IocIsoPacketData]
+                    //         implement the `zerocopy::FromBytes` trait, and therefore can
+                    //         safely be casted from an arbitrary slice.
+                    let reserved_chunk = unsafe {
+                        std::mem::transmute::<&mut [MaybeUninit<u8>], &mut [u8]>(uninit_slice)
+                    };
 
                     // Grab mutable references for each part of our frame
-                    let (header, rest) = Header::try_mut_from_prefix(reserved_chunk).unwrap();
-                    let (urb_header, rest) = msg::UrbHeader::try_mut_from_prefix(rest).unwrap();
-                    let (transfer, rest) =
-                        msg::Transfer::try_mut_from_prefix_with_elems(rest, transfer_padded_size)
-                            .unwrap();
-                    let iso = msg::IsoPacketData::try_mut_from_bytes_with_elems(
+                    let (transfer, rest) = reserved_chunk.split_at_mut(transfer_padded_size);
+                    let iso_data = <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(
                         rest,
-                        urb.packet_count.try_into().unwrap(),
+                        num_isos
                     )
                     .unwrap();
 
                     // Write our required data into the slice
-                    *header = Header {
+                    let header = Header {
                         seqnum: next,
                         dev_id,
                         command: msg::Command::CmdSubmit,
@@ -279,48 +265,49 @@ where
                         reset: false,
                         _padding: Default::default(),
                     };
-                    *urb_header = msg::UrbHeader {
-                        setup_packet: urb.setup_packet,
-                        interval: urb.interval.try_into().unwrap(),
+                    let mut urb_header = msg::UrbHeader {
+                        kind: urb.typ,
+                        transfer_padded_len: transfer_padded_size as u16,
+                        transfer_actual_len: transfer_actual_len as u16,
+                        num_isos: num_isos as u16,
+                        interval: urb.interval as u16,
                         flags: urb.flags,
                         address: urb.address,
                         endpoint: urb.endpoint,
-                        kind: urb.typ,
                         num_errors: 0,
                         status: vhci::Status::Pending,
                         _padding: Default::default(),
                     };
-                    transfer.header = msg::TransferHeader {
-                        aligned_len: transfer_padded_size.try_into().unwrap(),
-                        actual_len: urb.buffer_length.try_into().unwrap(),
-                        _padding: Default::default(),
-                    };
-                    iso.header = msg::IsoPacketHeader {
-                        len: urb.packet_count.try_into().unwrap(),
-                        _padding: Default::default(),
-                    };
+
+                    urb.setup_packet.write_to_prefix(transfer).unwrap();
 
                     if Dir::Out == urb.endpoint.direction()
                         && (urb.buffer_length > 0 || urb.packet_count > 0)
                     {
-                        trace!(
+                        debug!(
                             "fetching data (transfer_len: {}, iso_packet_len: {})",
-                            urb.buffer_length,
-                            urb.packet_count
+                            urb.buffer_length, urb.packet_count
                         );
                         let borrower_urb = UrbWithIsoData {
                             handle,
-                            header: urb_header,
-                            transfer: transfer.get_mut(),
-                            iso_data: iso.get_mut(),
+                            header: &urb_header,
+                            transfer: &mut transfer[size_of::<ioctl::IocSetupPacket>()..],
+                            iso_data,
                         };
 
                         vhci.fetch_data(borrower_urb).unwrap();
                     }
 
-                    let dur = now.elapsed();
-                    if Duration::from_micros(15) < dur {
-                        trace!("took {:?} to setup URB frame for sending", dur);
+                    urb_header.transfer_actual_len += size_of::<ioctl::IocSetupPacket>() as u16;
+
+                    let mut request = header
+                        .as_bytes()
+                        .chain(urb_header.as_bytes())
+                        .chain(reserved_chunk.as_bytes());
+
+                    let elapsed = now.elapsed();
+                    if Duration::from_micros(5) < elapsed {
+                        trace!("took {:?} to setup URB frame for sending", elapsed);
                     }
 
                     // trace!(
@@ -330,18 +317,11 @@ where
                     // );
 
                     // And away we go!!!!
-                    tx.write_all_buf(&mut &buf_tx[..reserve_size])
-                        .await
-                        .unwrap();
+                    tx.write_all_buf(&mut request).await.unwrap();
                 }
                 Event::Work(Some(ioctl::Work::CancelUrb(handle))) => {
                     debug!("got cancel urb with {handle:?}");
                     if let Some(&seqnum) = seqnums.get(&handle) {
-                        assert!(
-                            handles.remove(&seqnum).is_some(),
-                            "tried to remove seqnum {seqnum}"
-                        );
-
                         // TODO: Once we get async usb transfer working,
                         //       we can send cancel requests. For now,
                         //       we can just break here.
@@ -349,10 +329,10 @@ where
 
                         let reserve_size = size_of::<Header>();
 
-                        buf_tx.clear();
-                        buf_tx.reserve(reserve_size.saturating_sub(buf_tx.capacity()));
-                        buf_tx.put_bytes(0, reserve_size);
-                        let reserved_chunk = &mut buf_tx[..reserve_size];
+                        scratch_buf.clear();
+                        scratch_buf.reserve(reserve_size.saturating_sub(scratch_buf.capacity()));
+                        scratch_buf.put_bytes(0, reserve_size);
+                        let reserved_chunk = &mut scratch_buf[..reserve_size];
 
                         let header = Header::try_mut_from_bytes(reserved_chunk).unwrap();
 
@@ -367,9 +347,9 @@ where
 
                         trace!(
                             "about to write {} bytes into the buffer with seqnum {seqnum}",
-                            buf_tx.len(),
+                            scratch_buf.len(),
                         );
-                        tx.write_all_buf(&mut buf_tx).await.unwrap();
+                        tx.write_all_buf(&mut scratch_buf).await.unwrap();
                     } else {
                         trace!("URB with {handle:?} had already been returned");
                     }
@@ -381,66 +361,64 @@ where
                     match header.status {
                         msg::Status::Success => match header.command {
                             msg::Command::RetSubmit => {
-                                if let Some(handle) = handles.remove(&header.seqnum) {
-                                    let _ = seqnums.remove(&handle).unwrap();
-
-                                    let mut min_len = MIN_URB_SUBMIT_SIZE;
-                                    let frame: &mut UrbFrame = loop {
-                                        if buf_rx.fill_until(&mut rx, min_len).await?.is_none() {
-                                            break 'outer;
-                                        }
-
-                                        match buf_rx.peek_mut_dst() {
-                                            Ok(frame) => break frame,
-                                            Err(ReadError::CorruptedData) => todo!(),
-                                            Err(ReadError::BufferShort {
-                                                num_bytes_needed,
-                                                ..
-                                            }) => {
-                                                min_len = buf_rx.len() + num_bytes_needed;
-                                            }
-                                        }
-                                    };
-                                    let dbg = true;
-                                    let urb = if dbg {
-                                        dbg!(&mut frame.header)
-                                    } else {
-                                        &mut frame.header
-                                    };
-                                    let (transfer_header, rest) =
-                                        TransferHeader::mut_from_prefix(&mut frame.data).unwrap();
-                                    if dbg {
-                                        dbg!(&transfer_header);
+                                let mut min_len = MIN_URB_SUBMIT_SIZE;
+                                let frame: &mut UrbFrame = loop {
+                                    if buf_rx.fill_until(&mut rx, min_len).await?.is_none() {
+                                        break 'outer;
                                     }
-                                    let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
+
+                                    match buf_rx.peek_mut_dst() {
+                                        Ok(frame) => break frame,
+                                        Err(ReadError::CorruptedData) => todo!(),
+                                        Err(ReadError::BufferShort {
+                                            num_bytes_needed, ..
+                                        }) => {
+                                            trace!("needs {num_bytes_needed} more bytes while receiving urb frame");
+                                            min_len = buf_rx.len() + num_bytes_needed;
+                                        }
+                                    }
+                                };
+                                let now = Instant::now();
+                                let dbg = false; //&& vhci::Status::Success != frame.header.status;
+                                let urb = if dbg {
+                                    dbg!(&mut frame.header)
+                                } else {
+                                    &mut frame.header
+                                };
+                                let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
+                                    &mut frame.data,
+                                    usize::from(urb.transfer_padded_len),
+                                )
+                                .unwrap();
+                                let transfer_len = usize::from(urb.transfer_actual_len);
+                                if dbg {
+                                    dbg!(&transfer[..transfer_len]);
+                                }
+                                let iso_packets =
+                                    <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
                                         rest,
-                                        usize::from(transfer_header.aligned_len),
+                                        usize::from(urb.num_isos),
                                     )
                                     .unwrap();
-                                    let iso_packets =
-                                        IsoPacketGiveback::try_mut_from_bytes(rest).unwrap();
 
-                                    let dur = now.elapsed();
-                                    if Duration::from_micros(15) < dur {
-                                        trace!("took {dur:?} to unpack URB for giveback");
-                                    }
-                                    let lender_urb = UrbWithIsoGiveback {
-                                        handle,
-                                        header: urb,
-                                        transfer: &mut transfer
-                                            [..usize::from(transfer_header.actual_len)],
-                                        iso_giveback: iso_packets.get_mut(),
-                                    };
+                                let handle = handles.remove(&header.seqnum).unwrap();
+                                let _ = seqnums.remove(&handle).unwrap();
 
-                                    vhci.giveback_urb(lender_urb).await.unwrap();
-                                    let size_of_frame = size_of_val(frame);
-                                    buf_rx.consume(size_of_frame);
-                                } else {
-                                    trace!(
-                                        "URB with seqnum {} had already been dropped",
-                                        header.seqnum
-                                    );
+                                let lender_urb = UrbWithIsoGiveback {
+                                    handle,
+                                    header: urb,
+                                    transfer: &mut transfer[..transfer_len],
+                                    iso_giveback: iso_packets,
+                                };
+
+                                let elapsed = now.elapsed();
+                                if Duration::from_micros(5) < elapsed {
+                                    trace!("took {elapsed:?} to unpack URB for giveback");
                                 }
+
+                                vhci.giveback_urb(lender_urb).await.unwrap();
+                                let size_of_frame = size_of_val(frame);
+                                buf_rx.consume(size_of_frame);
                             }
                             msg::Command::RetUnlink => {
                                 if let Some(handle) = handles.remove(&header.seqnum) {
@@ -478,7 +456,9 @@ where
                 Event::UrbResp(Err(err)) => return Err(err.into()),
                 Event::UrbResp(Ok(0)) => break,
                 Event::Work(None) => todo!("how did we get here? should we shutdown here?"),
-                _ => (),
+                Event::UrbResp(Ok(num_bytes)) => trace!(
+                    "read {num_bytes} bytes and it wasn't enough to decode any msg, continuing..."
+                ),
             }
         }
 
@@ -499,18 +479,8 @@ pub struct LendDevice<W, R> {
 }
 
 impl<W, R> LendDevice<W, R> {
-    pub fn new(
-        tx: W,
-        rx: R,
-        buf_rx: Ring,
-        id: msg::UsbDeviceId,
-    ) -> Self {
-        Self {
-            tx,
-            rx,
-            buf_rx,
-            id,
-        }
+    pub fn new(tx: W, rx: R, buf_rx: Ring, id: msg::UsbDeviceId) -> Self {
+        Self { tx, rx, buf_rx, id }
     }
 }
 
@@ -529,7 +499,7 @@ where
         } = self;
 
         let handle = match rusb::Context::new()
-            .and_then(|mut ctx| {
+            .and_then(|ctx| {
                 // ctx.set_log_level(LogLevel::Debug);
                 ctx.devices()
             })
@@ -570,8 +540,7 @@ where
         };
 
         const HEADER_SIZE: usize = size_of::<Header>();
-        const MIN_URB_SUBMIT_SIZE: usize =
-            size_of::<UrbHeader>() + size_of::<TransferHeader>() + size_of::<IsoPacketHeader>();
+        const MIN_URB_SUBMIT_SIZE: usize = size_of::<UrbHeader>();
 
         trace!("starting lender loop");
         'outer: loop {
@@ -603,38 +572,52 @@ where
                         }
                     };
 
-                    let urb = dbg!(&mut frame.header);
-                    let (transfer_header, rest) =
-                        TransferHeader::mut_from_prefix(&mut frame.data).unwrap();
+                    let dbg = false;
+                    let urb = if dbg {
+                        dbg!(&mut frame.header)
+                    } else {
+                        &mut frame.header
+                    };
                     let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
-                        rest,
-                        usize::from(transfer_header.aligned_len),
+                        &mut frame.data,
+                        usize::from(urb.transfer_padded_len),
                     )
                     .unwrap();
-                    let iso_packets = IsoPacketData::try_mut_from_bytes(rest).unwrap();
-                    let ctrl = urb.setup_packet;
+                    let iso_packets = <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(
+                        rest,
+                        usize::from(urb.num_isos),
+                    )
+                    .unwrap();
+                    let (ctrl, transfer) =
+                        ioctl::IocSetupPacket::try_mut_from_prefix(transfer).unwrap();
+                    urb.transfer_actual_len -= size_of::<ioctl::IocSetupPacket>() as u16;
+                    urb.transfer_padded_len -= size_of::<ioctl::IocSetupPacket>() as u16;
 
                     let status = match (urb.kind, urb.endpoint.direction()) {
                         (UrbType::Ctrl, Dir::In) => {
+                            if dbg {
+                                dbg!((ctrl.request_type(), ctrl.req()));
+                                dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
+                            }
                             match handle.read_control(
                                 ctrl.bm_request_type,
                                 ctrl.b_request as u8,
                                 ctrl.w_value,
                                 ctrl.w_index,
-                                &mut transfer[..usize::from(transfer_header.actual_len)],
+                                &mut transfer[..usize::from(urb.transfer_actual_len)],
                                 Duration::from_millis(600),
                             ) {
                                 Ok(bytes_written) => {
-                                    transfer_header.actual_len = bytes_written as u16;
-                                    transfer_header.aligned_len = bytes_written
-                                        .next_multiple_of(8)
+                                    urb.transfer_actual_len = bytes_written as u16;
+                                    urb.transfer_padded_len = align_to_usize(bytes_written)
                                         .try_into()
-                                        .unwrap_or(transfer_header.aligned_len);
+                                        .unwrap_or(urb.transfer_padded_len);
                                     vhci::Status::Success
                                 }
                                 Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
                                 Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
                                 Err(rusb::Error::Io) => vhci::Status::Error,
+                                Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
                                 Err(err) => {
                                     warn! { %err, "couldn't read from ctrl" };
                                     vhci::Status::Stall
@@ -645,6 +628,10 @@ where
                             if STANDARD_DEVICE_SET_CONFIGURATION
                                 == (ctrl.request_type(), ctrl.req()) =>
                         {
+                            if dbg {
+                                dbg!((ctrl.request_type(), ctrl.req()));
+                                dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
+                            }
                             let desired = (ctrl.value() & 0xFF) as u8;
                             if handle
                                 .device()
@@ -654,7 +641,11 @@ where
                                 vhci::Status::Success
                             } else {
                                 match handle.set_active_configuration(desired) {
-                                    Ok(_) => vhci::Status::Success,
+                                    Ok(_) => {
+                                        urb.transfer_actual_len = 0;
+                                        urb.transfer_padded_len = 0;
+                                        vhci::Status::Success
+                                    }
                                     Err(err) => {
                                         warn! { %err, "couldn't set configuration" };
                                         vhci::Status::Stall
@@ -663,6 +654,10 @@ where
                             }
                         }
                         (UrbType::Ctrl, Dir::Out) => {
+                            if dbg {
+                                dbg!((ctrl.request_type(), ctrl.req()));
+                                dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
+                            }
                             if Req::GetInterface == ctrl.req() {
                                 let interface = (ctrl.index() & 0xFF) as u8;
                                 let _ = handle.detach_kernel_driver(interface);
@@ -680,10 +675,14 @@ where
                                 ctrl.b_request as u8,
                                 ctrl.w_value,
                                 ctrl.w_index,
-                                &mut transfer[..usize::from(transfer_header.actual_len)],
+                                &mut transfer[..usize::from(urb.transfer_actual_len)],
                                 Duration::from_millis(600),
                             ) {
-                                Ok(_) => vhci::Status::Success,
+                                Ok(_) => {
+                                    urb.transfer_actual_len = 0;
+                                    urb.transfer_padded_len = 0;
+                                    vhci::Status::Success
+                                }
                                 Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
                                 Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
                                 Err(rusb::Error::Io) => vhci::Status::Error,
@@ -697,16 +696,14 @@ where
                         (UrbType::Int, Dir::In) => {
                             match handle.read_interrupt(
                                 urb.endpoint.0,
-                                &mut transfer[..usize::from(transfer_header.actual_len)],
-                                // Duration::from_millis(urb.interval.into()),
-                                Duration::from_millis(5500),
+                                &mut transfer[..usize::from(urb.transfer_actual_len)],
+                                Duration::from_secs(30),
                             ) {
                                 Ok(bytes_written) => {
-                                    transfer_header.actual_len = bytes_written as u16;
-                                    transfer_header.aligned_len = bytes_written
-                                        .next_multiple_of(8)
+                                    urb.transfer_actual_len = bytes_written as u16;
+                                    urb.transfer_padded_len = align_to_usize(bytes_written)
                                         .try_into()
-                                        .unwrap_or(transfer_header.aligned_len);
+                                        .unwrap_or(urb.transfer_padded_len);
                                     vhci::Status::Success
                                 }
                                 Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
@@ -723,6 +720,11 @@ where
                         (UrbType::Bulk, Dir::In) => todo!(),
                         (UrbType::Bulk, Dir::Out) => todo!(),
                     };
+
+                    if vhci::Status::Success != status {
+                        urb.transfer_actual_len = 0;
+                        urb.transfer_padded_len = 0;
+                    }
 
                     urb.status = status;
 
@@ -749,9 +751,8 @@ where
                         let mut response = header
                             .as_bytes()
                             .chain(urb.as_bytes())
-                            .chain(transfer_header.as_bytes())
-                            .chain(&transfer[..usize::from(transfer_header.aligned_len)])
-                            .chain(iso_packets.as_buf());
+                            .chain(&transfer[..usize::from(urb.transfer_padded_len)])
+                            .chain(iso_packets.as_bytes());
                         tx.write_all_buf(&mut response).await?;
                     } else {
                         let _errno = dbg!(io::Error::last_os_error());

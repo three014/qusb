@@ -233,10 +233,10 @@ impl Ring {
         Ok(Data::new(buf))
     }
 
-    pub fn giveback_chunk<T: ?Sized>(&mut self, data: Data<T>) {
+    pub fn giveback_chunk<T: ?Sized>(&mut self, mut data: Data<T>) {
         let len = data.buf.len();
+        data.buf.advance(len);
         self.buf.unsplit(data.buf);
-        self.buf.advance(len);
     }
 
     pub fn iter<'a, T>(&'a self) -> impl Iterator<Item = &'a T>
@@ -301,9 +301,14 @@ impl Ring {
     where
         R: AsyncRead + Unpin,
     {
+        let mut now = Instant::now();
         while num_bytes > self.len() {
-            if 0 == self.fill_with_reader(&mut rx).await? {
+            if 0 == tokio::task::unconstrained(self.fill_with_reader(&mut rx)).await? {
                 return Ok(None);
+            }
+            if Duration::from_micros(50) < now.elapsed() {
+                tokio::task::yield_now().await;
+                now = Instant::now();
             }
         }
 

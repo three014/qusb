@@ -6,9 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fxhash::FxHashSet;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace, warn};
 use vhci::{
     ioctl::{Address, UrbHandle},
     usbfs::STANDARD_DEVICE_SET_ADDRESS,
@@ -58,7 +57,7 @@ impl Demuxer {
         }
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     async fn run(self) -> io::Result<()> {
         let Self {
             mut register_rx,
@@ -67,32 +66,20 @@ impl Demuxer {
             mut vhci,
         } = self;
 
-        let register_queue = VecDeque::new();
-        let mailer = Mailer::with_capacities(8, 8, 10, 67);
+        let register_queue = Mutex::new(VecDeque::new());
+        let mailer = Mutex::new(Mailer::with_capacities(8, 8, 10, 67));
         let (work_tx, mut work_rx) = mpsc::channel(64);
         let work_receiver = vhci.work_receiver().unwrap();
         let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx));
 
-        let mut dbg_register_complete_bucket = FxHashSet::with_hasher(Default::default());
-        let mut dbg_register_inprogress_bucket = FxHashSet::with_hasher(Default::default());
-        let mut dbg_urb_bucket = FxHashSet::with_hasher(Default::default());
+        // let mut dbg_register_complete_bucket = FxHashSet::with_hasher(Default::default());
+        // let mut dbg_register_inprogress_bucket = FxHashSet::with_hasher(Default::default());
+        // let mut dbg_urb_bucket = FxHashSet::with_hasher(Default::default());
 
         struct Context {
-            vhci: vhci::Controller,
-            mailer: Mailer,
-            register_queue: VecDeque<Port>,
-        }
-
-        enum Event {
-            Register(Option<Ctrl<Register, RegisterPayload>>),
-            GivebackUrb(Option<UrbHandle>),
-            Disconnect(Option<Ctrl<Port>>),
-            Work(vhci::ioctl::IocWork),
-        }
-
-        struct Ctx {
-            ctx: Box<Context>,
-            cont: Continuation,
+            vhci: Mutex<vhci::Controller>,
+            mailer: Mutex<Mailer>,
+            register_queue: Mutex<VecDeque<Port>>,
         }
 
         type RegisterResult = (
@@ -108,11 +95,30 @@ impl Demuxer {
             Disconnect(DisconnectResult),
         }
 
-        let mut ctx = Box::new(Context {
-            vhci,
+        enum Event {
+            Register(Option<Ctrl<Register, RegisterPayload>>),
+            GivebackUrb(Option<UrbHandle>),
+            Disconnect(Option<Ctrl<Port>>),
+            Work(vhci::ioctl::IocWork),
+            Task(Option<Result<Continuation, tokio::task::JoinError>>),
+        }
+
+        let ctx = Arc::new(Context {
+            vhci: Mutex::new(vhci),
             mailer,
             register_queue,
         });
+
+        let mut set = tokio::task::JoinSet::new();
+
+        async fn check_for_completed_task(
+            set: &mut tokio::task::JoinSet<Continuation>,
+        ) -> Option<Result<Continuation, tokio::task::JoinError>> {
+            if set.is_empty() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            set.join_next().await
+        }
 
         loop {
             let event = tokio::select! {
@@ -128,9 +134,11 @@ impl Demuxer {
                 work = work_rx.recv() => {
                     Event::Work(work.expect("we can only get here if we shutdown in the wrong order"))
                 }
+                task = check_for_completed_task(&mut set) => {
+                    Event::Task(task)
+                }
             };
-
-            let cont = match event {
+            match event {
                 Event::Register(Some(Ctrl {
                     data:
                         Register {
@@ -138,12 +146,15 @@ impl Demuxer {
                             data_rate,
                         },
                     tx,
-                })) => tokio::task::spawn_blocking(move || Ctx {
-                    cont: Continuation::Register((ctx.vhci.port_connect_any(data_rate), tx)),
-                    ctx,
-                })
-                .await
-                .unwrap(),
+                })) => {
+                    let ctx = Arc::clone(&ctx);
+                    set.spawn_blocking(move || {
+                        Continuation::Register((
+                            ctx.vhci.lock().unwrap().port_connect_any(data_rate),
+                            tx,
+                        ))
+                    });
+                }
                 Event::Register(Some(Ctrl {
                     data:
                         Register {
@@ -151,194 +162,184 @@ impl Demuxer {
                             data_rate,
                         },
                     tx,
-                })) => tokio::task::spawn_blocking(move || Ctx {
-                    cont: Continuation::Register((
-                        ctx.vhci.port_connect(port, data_rate).map(|_| port),
-                        tx,
-                    )),
-                    ctx,
-                })
-                .await
-                .unwrap(),
+                })) => {
+                    let ctx = Arc::clone(&ctx);
+                    set.spawn_blocking(move || {
+                        Continuation::Register((
+                            ctx.vhci
+                                .lock()
+                                .unwrap()
+                                .port_connect(port, data_rate)
+                                .map(|_| port),
+                            tx,
+                        ))
+                    });
+                }
                 Event::GivebackUrb(Some(handle)) => {
-                    dbg_urb_bucket.remove(&handle);
-                    dbg_register_complete_bucket.remove(&handle);
-                    ctx.mailer.remove_by_key3(&handle);
-                    Ctx {
-                        cont: Continuation::Other,
-                        ctx,
-                    }
+                    // dbg_urb_bucket.remove(&handle);
+                    // dbg_register_complete_bucket.remove(&handle);
+                    _ = ctx.mailer.lock().unwrap().remove_by_key3(&handle);
                 }
                 Event::Disconnect(Some(Ctrl { data: port, tx })) => {
-                    tokio::task::spawn_blocking(move || {
-                        assert!(ctx.mailer.remove_by_key1(&port).is_some(), "{port:?}");
-                        if let Some(index) = ctx
-                            .register_queue
-                            .iter()
-                            .position(|queue_port| port == *queue_port)
+                    let ctx = Arc::clone(&ctx);
+                    set.spawn_blocking(move || {
+                        let mut mailer = ctx.mailer.lock().unwrap();
+                        assert!(mailer.remove_by_key1(&port).is_some(), "{port:?}");
+                        let mut queue = ctx.register_queue.lock().unwrap();
+                        if let Some(index) = queue.iter().position(|queue_port| port == *queue_port)
                         {
-                            ctx.register_queue.remove(index);
+                            queue.remove(index);
                         }
-                        Ctx {
-                            cont: Continuation::Disconnect((ctx.vhci.port_disconnect(port), tx)),
-                            ctx,
-                        }
-                    })
-                    .await
-                    .unwrap()
+                        let result = (ctx.vhci.lock().unwrap().port_disconnect(port), tx);
+                        Continuation::Disconnect(result)
+                    });
                 }
-                Event::Work(work) => {
-                    trace!("got work!");
-                    // let now = Instant::now();
-                    let tx = match work.get() {
-                        vhci::ioctl::WorkRef::PortStat(stat) => {
-                            if stat.change().contains(PortChange::RESET)
-                                && (!stat.status()).contains(PortStatus::RESET)
-                                && stat.status().contains(PortStatus::ENABLE)
-                            {
-                                if !ctx.register_queue.contains(&stat.index()) {
-                                    ctx.register_queue.push_back(stat.index());
+                Event::Work(ioc_work) => {
+                    let ctx = Arc::clone(&ctx);
+                    set.spawn(async move {
+                        // SAFETY: Per the function's safety contract,
+                        //         the work item is unalterned from the
+                        //         ioctl call.
+                        let work = unsafe { ioc_work.into_inner() };
+                        let tx = {
+                            let mut queue = ctx.register_queue.lock().unwrap();
+                            let mut mailer = ctx.mailer.lock().unwrap();
+                            match work {
+                                vhci::ioctl::Work::PortStat(ref stat) => {
+                                    if stat.change().contains(PortChange::RESET)
+                                        && (!stat.status()).contains(PortStatus::RESET)
+                                        && stat.status().contains(PortStatus::ENABLE)
+                                    {
+                                        if !queue.contains(&stat.index()) {
+                                            queue.push_back(stat.index());
+                                        }
+                                    }
+                                    mailer.get_by_key1(&stat.index()).cloned()
+                                }
+                                vhci::ioctl::Work::ProcessUrb((ref urb, ref handle)) => match urb.typ {
+                                    vhci::ioctl::UrbType::Ctrl
+                                        if urb.endpoint.is_anycast()
+                                            && !queue.is_empty()
+                                            && STANDARD_DEVICE_SET_ADDRESS
+                                                == (
+                                                    urb.setup_packet.request_type(),
+                                                    urb.setup_packet.req(),
+                                                ) =>
+                                    {
+                                        // TODO: The logic around here is all messed up lmao
+                                        let address = Address::new(urb.setup_packet.value() as u8)
+                                            .expect("host should've assigned value address");
+                                        let port = Port::new(address.get() - 1)
+                                            .expect("host should've assigned valid address");
+                                        assert_eq!(port, queue.pop_front().unwrap(), "wouldn't the new address correspond to the port currently registering its device?");
+
+                                        mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
+                                        mailer.link_key2_to_key1(NoHash(address), &port);
+                                        // assert_eq!(
+                                        //     LinkResult::Success,
+                                        //     ctx.mailer.link_key2_to_key1(NoHash(address), &port),
+                                        //     "{address:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                        //     dbg_register_inprogress_bucket,
+                                        //     dbg_register_complete_bucket,
+                                        //     dbg_urb_bucket
+                                        // );
+                                        assert_eq!(
+                                            LinkResult::Success,
+                                            mailer.link_key3_to_key1(*handle, &port),
+                                            // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                            // dbg_register_inprogress_bucket,
+                                            // dbg_register_complete_bucket,
+                                            // dbg_urb_bucket
+                                        );
+                                        // dbg_register_complete_bucket.insert(handle);
+                                        // dbg_register_inprogress_bucket.remove(&handle);
+                                        mailer.get_by_key1(&port).cloned()
+                                    }
+                                    vhci::ioctl::UrbType::Ctrl
+                                        if urb.endpoint.is_anycast() && !queue.is_empty() =>
+                                    {
+                                        let port = queue.front().copied().unwrap();
+                                        assert_eq!(
+                                            LinkResult::Success,
+                                            mailer.link_key3_to_key1(*handle, &port),
+                                            // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                            // dbg_register_inprogress_bucket,
+                                            // dbg_register_complete_bucket,
+                                            // dbg_urb_bucket
+                                        );
+                                        // dbg_register_inprogress_bucket.insert(handle);
+                                        mailer.get_by_key1(&port).cloned()
+                                    }
+                                    _ => {
+                                        let address = NoHash(urb.address);
+                                        match mailer.link_key3_to_key2(*handle, &address) {
+                                            LinkResult::Success => {
+                                                // dbg_urb_bucket.insert(handle);
+                                                mailer.get_by_key2(&address).cloned()
+                                            }
+                                            LinkResult::NewKeyAlreadyExists => None,
+                                            LinkResult::ExistingKeyDoesNotExist => panic!(
+                                                // "LinkResult::ExistingKeyDoesNotExist\nurb: {urb:?}\n{handle:?}/{address:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                                // dbg_register_inprogress_bucket,
+                                                // dbg_register_complete_bucket,
+                                                // dbg_urb_bucket
+                                            ),
+                                        }
+                                    }
+                                },
+                                vhci::ioctl::Work::CancelUrb(ref handle) => {
+                                    let tx = mailer.get_by_key3(handle).cloned();
+                                    mailer.remove_by_key3(handle);
+                                    tx
                                 }
                             }
-                            ctx.mailer.get_by_key1(&stat.index()).map(Cow::Borrowed)
-                        }
-                        vhci::ioctl::WorkRef::ProcessUrb((urb, handle)) => match urb.typ {
-                            vhci::ioctl::UrbType::Ctrl
-                                if urb.endpoint.is_anycast()
-                                    && !ctx.register_queue.is_empty()
-                                    && STANDARD_DEVICE_SET_ADDRESS
-                                        == (
-                                            urb.setup_packet.request_type(),
-                                            urb.setup_packet.req(),
-                                        ) =>
-                            {
-                                // TODO: The logic around here is all messed up lmao
-                                let address = Address::new(urb.setup_packet.value() as u8)
-                                    .expect("host should've assigned value address");
-                                let port = Port::new(address.get() - 1)
-                                    .expect("host should've assigned valid address");
-                                assert_eq!(port, ctx.register_queue.pop_front().unwrap(), "wouldn't the new address correspond to the port currently registering its device?");
+                        };
 
-                                ctx.mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
-                                ctx.mailer.link_key2_to_key1(NoHash(address), &port);
-                                // assert_eq!(
-                                //     LinkResult::Success,
-                                //     ctx.mailer.link_key2_to_key1(NoHash(address), &port),
-                                //     "{address:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                //     dbg_register_inprogress_bucket,
-                                //     dbg_register_complete_bucket,
-                                //     dbg_urb_bucket
-                                // );
-                                assert_eq!(
-                                    LinkResult::Success,
-                                    ctx.mailer.link_key3_to_key1(handle, &port),
-                                    "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                    dbg_register_inprogress_bucket,
-                                    dbg_register_complete_bucket,
-                                    dbg_urb_bucket
-                                );
-                                dbg_register_complete_bucket.insert(handle);
-                                dbg_register_inprogress_bucket.remove(&handle);
-                                ctx.mailer.get_by_key1(&port).map(Cow::Borrowed)
+                        if let Some(tx) = tx {
+                            if tx.send(work).await.is_err() {
+                                // TODO: Remove by which key? By the value itself?
                             }
-                            vhci::ioctl::UrbType::Ctrl
-                                if urb.endpoint.is_anycast() && !ctx.register_queue.is_empty() =>
-                            {
-                                let port = ctx.register_queue.front().copied().unwrap();
-                                assert_eq!(
-                                    LinkResult::Success,
-                                    ctx.mailer.link_key3_to_key1(handle, &port),
-                                    "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                    dbg_register_inprogress_bucket,
-                                    dbg_register_complete_bucket,
-                                    dbg_urb_bucket
-                                );
-                                dbg_register_inprogress_bucket.insert(handle);
-                                ctx.mailer.get_by_key1(&port).map(Cow::Borrowed)
-                            }
-                            _ => {
-                                let address = NoHash(urb.address);
-                                match ctx.mailer.link_key3_to_key2(handle, &address) {
-                                    LinkResult::Success => {
-                                        dbg_urb_bucket.insert(handle);
-                                        ctx.mailer.get_by_key2(&address).map(Cow::Borrowed)
-                                    },
-                                    LinkResult::NewKeyAlreadyExists => {
-                                        None
-                                    },
-                                    LinkResult::ExistingKeyDoesNotExist => panic!(
-                                        "LinkResult::ExistingKeyDoesNotExist\nurb: {urb:?}\n{handle:?}/{address:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                        dbg_register_inprogress_bucket,
-                                        dbg_register_complete_bucket,
-                                        dbg_urb_bucket
-                                    ),
-                                }
-                            }
-                        },
-                        vhci::ioctl::WorkRef::CancelUrb(handle) => {
-                            let tx = ctx.mailer.get_by_key3(&handle).cloned();
-                            ctx.mailer.remove_by_key3(&handle);
-                            tx.map(Cow::Owned)
                         }
-                    };
-                    if let Some(tx) = tx {
-                        // SAFETY: Work item is still unaltered from the ioctl
-                        if tx.send(unsafe { work.into_inner() }).await.is_err() {
-                            // TODO: Remove by which key? By the value itself?
-                        }
-                    }
-                    // let dur = now.elapsed();
-                    // if Duration::from_micros(15) < dur {
-                    //     trace!("took {dur:?} to route URB");
-                    // }
-                    Ctx {
-                        ctx,
-                        cont: Continuation::Other,
-                    }
+                        Continuation::Other
+                    });
                 }
-                Event::Register(None) | Event::Disconnect(None) | Event::GivebackUrb(None) => break,
-            };
-
-            let Ctx { ctx: c, cont } = cont;
-            ctx = c;
-            match cont {
-                Continuation::Register((Ok(port), tx)) => {
-                    ctx.register_queue.push_back(port);
+                Event::Task(Some(Ok(Continuation::Register((Ok(port), tx))))) => {
                     let (work_tx, work_rx) = mpsc::channel(32);
-                    assert!(
-                        ctx.mailer.insert_by_key1(port, work_tx).is_none(),
-                        "{port:?}"
-                    );
+                    // TODO: Remove queue stuff because the work_queue task handles this now
+                    let mut queue = ctx.register_queue.lock().unwrap();
+                    queue.push_back(port);
+                    let mut mailer = ctx.mailer.lock().unwrap();
+                    assert!(mailer.insert_by_key1(port, work_tx).is_none(), "{port:?}");
                     if tx.send(Ok((port, work_rx))).is_err() {
-                        ctx.register_queue.pop_back();
-                        ctx.mailer.remove_by_key1(&port);
+                        queue.pop_back();
+                        mailer.remove_by_key1(&port);
                     }
                 }
-                Continuation::Register((Err(err), tx)) => {
-                    let _ = tx.send(Err(err));
+                Event::Task(Some(Ok(Continuation::Register((Err(err), tx))))) => {
+                    _ = tx.send(Err(err));
                 }
-                Continuation::Disconnect((result, tx)) => {
-                    let _ = tx.send(result);
+                Event::Task(Some(Ok(Continuation::Disconnect((result, tx))))) => {
+                    _ = tx.send(result);
                 }
-                Continuation::Other => (),
-            }
+                Event::Task(Some(Err(_err))) => todo!(),
+                Event::Register(None) | Event::Disconnect(None) | Event::GivebackUrb(None) => break,
+                Event::Task(Some(Ok(Continuation::Other)))
+                | Event::Task(None) => (),
+            };
         }
 
-        let Context {
-            mut vhci, mailer, ..
-        } = *ctx;
-
-        trace!("disconnecting leftover devices and closing work_rx");
-        mailer.key1_iter().for_each(|port| {
+        info!("disconnecting leftover devices and closing work_rx");
+        ctx.mailer.lock().unwrap().key1_iter().for_each(|port| {
+            let mut vhci = ctx.vhci.lock().unwrap();
             if let Err(err) = vhci.port_disconnect(*port) {
-                debug!("error while disconnecting vhci device: {err}");
+                warn!("error while disconnecting vhci device: {err}");
             }
         });
         work_rx.close();
         while (work_rx.recv().await).is_some() {}
         drop(work_rx);
 
-        trace!("about to wait on recv_work thread");
+        info!("waiting on recv_work thread");
         tokio::task::spawn_blocking(|| handle.join().expect("recv thread should not panic"))
             .await
             .unwrap()
@@ -393,27 +394,15 @@ impl Controller {
         &self,
         urb: T,
     ) -> io::Result<()> {
-        if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
-            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
-        {
-            tokio::task::block_in_place(|| self.remote.fetch_data(urb))
-        } else {
-            self.remote.fetch_data(urb)
-        }
+        self.remote.fetch_data(urb)
     }
 
     pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
         &self,
         urb: T,
     ) -> io::Result<()> {
-        let _ = self.giveback_tx.send(urb.handle()).await;
-        if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
-            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
-        {
-            tokio::task::block_in_place(|| self.remote.giveback(urb))
-        } else {
-            self.remote.giveback(urb)
-        }
+        _ = self.giveback_tx.send(urb.handle()).await;
+        self.remote.giveback(urb)
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -435,14 +424,14 @@ impl Controller {
         }
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub async fn shutdown(self) {
         drop(self.register_tx);
         drop(self.disconnect_tx);
         let handle = self.handle.lock().unwrap().take();
         drop(self.handle);
         if let Some(handle) = handle {
-            trace!("about to wait for async handle");
+            info!("about to wait for vhci controller handle");
             match handle.await {
                 Ok(Ok(_)) => trace!("controller thread finished with no issues"),
                 Ok(Err(_err)) => todo!("Figure out what kind of I/O errors we can get"),
@@ -458,7 +447,7 @@ fn recv_work(
     work_tx: mpsc::Sender<vhci::ioctl::IocWork>,
 ) -> io::Result<()> {
     if work_tx.is_closed() {
-        trace!("done with receiving work for VHCI");
+        info!("done with receiving work for vhci");
         return Ok(());
     }
 
@@ -479,7 +468,7 @@ fn recv_work(
     .is_some()
     {}
 
-    trace!("done with receiving work for VHCI");
+    info!("done with receiving work for vhci");
     Ok(())
 }
 

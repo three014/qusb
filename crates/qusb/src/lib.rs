@@ -222,10 +222,7 @@ pub struct Session {
 
 impl Session {
     fn new(conn: quinn::Connection, dev: stub::Controller) -> Self {
-        Self {
-            conn,
-            dev,
-        }
+        Self { conn, dev }
     }
 
     pub fn remote_address(&self) -> SocketAddr {

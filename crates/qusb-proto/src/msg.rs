@@ -94,7 +94,7 @@ use std::{
 
 use bytes::Buf;
 use thiserror::Error;
-use zerocopy::{try_transmute, FromBytes, IntoBytes};
+use zerocopy::{try_transmute, FromBytes, IntoBytes, TryFromBytes};
 use zerocopy_derive::*;
 
 use crate::{GetSliceLen, GetSliceLenErr};
@@ -334,15 +334,17 @@ pub struct Header {
 #[derive(Debug, KnownLayout, Immutable, IntoBytes, FromZeros)]
 #[repr(C, align(8))]
 pub struct UrbHeader {
-    pub setup_packet: vhci::ioctl::IocSetupPacket,
+    pub kind: vhci::ioctl::UrbType,
+    pub endpoint: vhci::ioctl::Endpoint,
     pub interval: u16,
     pub flags: u16,
     pub num_errors: u16,
-    pub address: vhci::ioctl::Address,
-    pub endpoint: vhci::ioctl::Endpoint,
     pub status: vhci::Status,
-    pub kind: vhci::ioctl::UrbType,
-    pub _padding: [u8; 3],
+    pub transfer_padded_len: u16,
+    pub transfer_actual_len: u16,
+    pub num_isos: u16,
+    pub address: vhci::ioctl::Address,
+    pub _padding: [u8; 5],
 }
 
 #[derive(KnownLayout, Immutable, FromBytes)]
@@ -491,48 +493,23 @@ pub struct UrbFrame {
 
 impl GetSliceLen for UrbFrame {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
-        const BASE_LEN: usize =
-            size_of::<UrbHeader>() + size_of::<IsoPacketHeader>() + size_of::<TransferHeader>();
+        const BASE_LEN: usize = size_of::<UrbHeader>();
 
-        if BASE_LEN > buf.len() {
-            return Err(GetSliceLenErr::BufferShort {
+        let (header, rest) = UrbHeader::try_ref_from_prefix(buf).map_err(|err| match err {
+            zerocopy::ConvertError::Alignment(_) => GetSliceLenErr::NoConfidence,
+            zerocopy::ConvertError::Validity(_) => GetSliceLenErr::NoConfidence,
+            zerocopy::ConvertError::Size(_) => GetSliceLenErr::BufferShort {
                 num_bytes_needed: BASE_LEN - buf.len(),
                 buf_len: buf.len(),
-            });
-        }
+            },
+        })?;
 
-        const TRANSFER_OFFSET: usize = size_of::<UrbHeader>();
-        let (transfer_header, rest) =
-            TransferHeader::read_from_prefix(&buf[TRANSFER_OFFSET..]).unwrap();
-        let transfer_aligned_len = usize::from(transfer_header.aligned_len);
-
-        let iso_packet_data =
-            rest.get(transfer_aligned_len..)
-                .ok_or_else(|| GetSliceLenErr::BufferShort {
-                    num_bytes_needed: transfer_aligned_len - rest.len(),
-                    buf_len: buf.len(),
-                })?;
-
-        let (iso_header, rest) = IsoPacketHeader::read_from_prefix(iso_packet_data)
-            .ok()
-            .ok_or_else(|| GetSliceLenErr::BufferShort {
-                num_bytes_needed: size_of::<IsoPacketHeader>() - iso_packet_data.len(),
-                buf_len: buf.len(),
-            })?;
-
-        let iso_len = usize::from(iso_header.len);
-        let iso_byte_len = iso_len * size_of::<vhci::ioctl::IocIsoPacketData>();
-        if iso_byte_len > rest.len() {
-            Err(GetSliceLenErr::BufferShort {
-                num_bytes_needed: iso_byte_len - rest.len(),
-                buf_len: buf.len(),
-            })
+        let required_byte_len = usize::from(header.transfer_padded_len)
+            + usize::from(header.num_isos) * size_of::<vhci::ioctl::IocIsoPacketData>();
+        if required_byte_len > rest.len() {
+            Err(GetSliceLenErr::BufferShort { num_bytes_needed: required_byte_len - rest.len(), buf_len: buf.len() })
         } else {
-            // This is the size of the unsized slice
-            Ok(size_of::<TransferHeader>()
-                + size_of::<IsoPacketHeader>()
-                + transfer_aligned_len
-                + iso_byte_len)
+            Ok(required_byte_len)
         }
     }
 }

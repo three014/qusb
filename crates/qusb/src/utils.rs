@@ -448,6 +448,10 @@ impl CloseStream for quinn::SendStream {
     }
 }
 
+pub const fn align_to_usize(val: usize) -> usize {
+    val + (size_of::<usize>() - 1) & !(size_of::<usize>() - 1)
+}
+
 // /// A synchronous sleep function that uses
 // /// spinlocking for small sleep durations.
 // ///
