@@ -1,6 +1,6 @@
 pub use lstr;
 use thiserror::Error;
-use zerocopy::KnownLayout;
+use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
 pub mod data;
 pub mod msg;
@@ -47,6 +47,8 @@ pub trait GetSliceLen
 where
     Self: KnownLayout<PointerMetadata = usize>,
 {
+    type Header: TryFromBytes + KnownLayout + Immutable + Sized;
+
     /// If `buf` was some DST `T`, then this
     /// function returns the number of elements
     /// in the slice at the end of the DST instance.

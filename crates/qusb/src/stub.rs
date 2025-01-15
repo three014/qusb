@@ -401,7 +401,7 @@ impl Controller {
         &self,
         urb: T,
     ) -> io::Result<()> {
-        _ = self.giveback_tx.send(urb.handle()).await;
+        _ = tokio::task::unconstrained(self.giveback_tx.send(urb.handle())).await;
         self.remote.giveback(urb)
     }
 

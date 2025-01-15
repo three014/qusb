@@ -52,6 +52,7 @@ async fn send_usb_data() {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(true)
         .open(log_path)
         .unwrap();
     _ = tracing_subscriber::fmt()

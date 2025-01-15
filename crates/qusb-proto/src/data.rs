@@ -62,7 +62,7 @@ pub struct Data<T: ?Sized> {
 
 impl<T> Data<T>
 where
-    T: TryFromBytes + Immutable + KnownLayout + ?Sized,
+    T: KnownLayout + TryFromBytes + Immutable + ?Sized,
 {
     pub fn get(&self) -> &T {
         T::try_ref_from_bytes(&self.buf).unwrap()
@@ -70,6 +70,13 @@ where
 
     pub fn get_mut(&mut self) -> &mut T {
         T::try_mut_from_bytes(&mut self.buf).unwrap()
+    }
+
+    pub fn read(&self) -> T
+    where
+        T: Sized + Clone,
+    {
+        T::try_read_from_bytes(&self.buf).unwrap()
     }
 
     fn new(buf: BytesMut) -> Self {
@@ -89,6 +96,28 @@ where
 
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+
+    pub fn split<U>(mut self) -> (Data<T::Header>, Data<U>)
+    where
+        T: GetSliceLen,
+        U: TryFromBytes + Immutable + KnownLayout + ?Sized,
+    {
+        let rest = self.buf.split_off(size_of::<T::Header>());
+        let header = std::mem::replace(&mut self.buf, BytesMut::new());
+        (Data::new(header), Data::new(rest))
+    }
+}
+
+impl Data<[u8]> {
+    pub fn into_bytes_mut(mut self) -> BytesMut {
+        std::mem::replace(&mut self.buf, BytesMut::new())
+    }
+}
+
+impl<T: ?Sized> Drop for Data<T> {
+    fn drop(&mut self) {
+        self.buf.advance(self.buf.len());
     }
 }
 
@@ -130,12 +159,8 @@ impl Ring {
         }
     }
 
-    pub fn reserve(&mut self, num_bytes: usize) -> Option<BytesMut> {
-        if num_bytes > self.buf.spare_capacity_mut().len() {
-            return None;
-        }
-
-        Some(self.buf.split_off(self.buf.len()))
+    pub fn reserve(&mut self, additional: usize) {
+        self.buf.reserve(additional);
     }
 
     pub fn peek<T>(&self) -> Result<&T, ReadError>
@@ -203,25 +228,24 @@ impl Ring {
         Ok(item)
     }
 
-    pub fn consume(&mut self, num_bytes: usize)
-    {
+    pub fn consume(&mut self, num_bytes: usize) {
         self.buf.advance(num_bytes);
     }
 
-    pub fn claim<T>(&mut self) -> Result<Data<T>, ReadError>
-    where
-        T: TryFromBytes + KnownLayout + Immutable,
-    {
-        let size_of = std::mem::size_of::<T>();
-        if self.buf.len() < size_of {
-            return Err(ReadError::BufferShort {
-                num_bytes_needed: size_of - self.len(),
-                buf_len: self.len(),
-            });
-        }
-        let buf = self.buf.split_to(size_of);
-        Ok(Data::new(buf))
-    }
+    // pub fn claim<T>(&mut self) -> Result<Data<T>, ReadError>
+    // where
+    //     T: TryFromBytes + KnownLayout + Immutable,
+    // {
+    //     let size_of = std::mem::size_of::<T>();
+    //     if self.buf.len() < size_of {
+    //         return Err(ReadError::BufferShort {
+    //             num_bytes_needed: size_of - self.len(),
+    //             buf_len: self.len(),
+    //         });
+    //     }
+    //     let buf = self.buf.split_to(size_of);
+    //     Ok(Data::new(buf))
+    // }
 
     pub fn claim_dst<T>(&mut self) -> Result<Data<T>, ReadError>
     where
@@ -233,11 +257,7 @@ impl Ring {
         Ok(Data::new(buf))
     }
 
-    pub fn giveback_chunk<T: ?Sized>(&mut self, mut data: Data<T>) {
-        let len = data.buf.len();
-        data.buf.advance(len);
-        self.buf.unsplit(data.buf);
-    }
+    pub fn giveback_chunk<T: ?Sized>(&mut self, _data: Data<T>) {}
 
     pub fn iter<'a, T>(&'a self) -> impl Iterator<Item = &'a T>
     where

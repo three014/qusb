@@ -150,7 +150,7 @@ impl vhci::Urb for UrbWithIsoData<'_> {
 
 impl vhci::TransferMut for UrbWithIsoData<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
-        self.transfer
+        &mut self.transfer[..self.header.transfer_actual_len as usize]
     }
 }
 
@@ -160,6 +160,7 @@ impl vhci::IsoPacketDataMut for UrbWithIsoData<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct UrbWithIsoGiveback<'a> {
     pub handle: vhci::ioctl::UrbHandle,
     pub header: &'a msg::UrbHeader,
@@ -187,7 +188,7 @@ impl vhci::Urb for UrbWithIsoGiveback<'_> {
 
 impl vhci::TransferMut for UrbWithIsoGiveback<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
-        self.transfer
+        &mut self.transfer[..self.header.transfer_actual_len as usize]
     }
 }
 
@@ -545,7 +546,7 @@ impl ReqHandler {
                 ServerResp::ListDevices(operator) => {
                     operator.resp_list_devices(get_usb_devices).await?;
                 }
-                ServerResp::BorrowDevice(operator) => operator.lend().await?,
+                ServerResp::BorrowDevice(operator) => operator.lend2().await?,
             }
         }
 
