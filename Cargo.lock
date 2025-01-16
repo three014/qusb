@@ -806,7 +806,7 @@ dependencies = [
 [[package]]
 name = "rusb_async"
 version = "0.1.0"
-source = "git+https://github.com/three014/rusb-async.git#40e5fbe318dac92cb6e5123242745135f6a2ad91"
+source = "git+https://github.com/three014/rusb-async.git#9cc9cc1a972c4c32d6fe0679e07b20b880b5ebb2"
 dependencies = [
  "bytes",
  "rusb",

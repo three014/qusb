@@ -15,7 +15,7 @@ use proto::{
     msg::{self, Header, QusbFrame, UrbFrame, UrbHeader},
 };
 use rusb::UsbContext;
-use rusb_async::{Transfer, TransferStatus};
+use rusb_async::{InnerTransfer, TransferStatus};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     task::JoinSet,
@@ -371,9 +371,7 @@ where
                                 };
 
                                 let elapsed = now.elapsed();
-                                if Duration::from_micros(5) < elapsed {
-                                    trace!("took {elapsed:?} to unpack URB for giveback");
-                                }
+                                trace!("took {elapsed:?} to unpack URB for giveback");
 
                                 vhci.giveback_urb(lender_urb).await.unwrap();
                                 let size_of_frame = size_of_val(frame);
@@ -644,7 +642,7 @@ where
                                 //         required lengths, and setup packet
                                 //         contains the right length as well.
                                 let mut transfer = unsafe {
-                                    Transfer::new_ctrl(&handle, buf, Duration::from_millis(600))
+                                    InnerTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600))
                                 };
 
                                 urb_header.status = match transfer.submit(cancel).await {
@@ -680,7 +678,7 @@ where
                                     .split_off(size_of::<ioctl::IocSetupPacket>())
                                     .split_to(transfer_len);
                                 let mut transfer = unsafe {
-                                    Transfer::new_int(&handle, urb_header.endpoint.0, buf)
+                                    InnerTransfer::new(0).into_int(&handle, urb_header.endpoint.0, buf)
                                 };
 
                                 urb_header.status = match transfer.submit(cancel).await {
@@ -709,7 +707,42 @@ where
 
                                 (header, urb_header, transfer.into_buf().unwrap_or_default())
                             }
-                            UrbType::Bulk => todo!(),
+                            UrbType::Bulk => {
+                                let transfer_len =
+                                    transfer_len - size_of::<ioctl::IocSetupPacket>();
+                                let buf = transfer_buf
+                                    .split_off(size_of::<ioctl::IocSetupPacket>())
+                                    .split_to(transfer_len);
+                                let mut transfer = unsafe {
+                                    InnerTransfer::new(0).into_bulk(&handle, urb_header.endpoint.0, buf)
+                                };
+
+                                urb_header.status = match transfer.submit(cancel).await {
+                                    Ok(TransferStatus::Completed) => vhci::Status::Success,
+                                    Ok(TransferStatus::Error) => vhci::Status::Error,
+                                    Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
+                                    Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
+                                    Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => {
+                                        vhci::Status::Stall
+                                    }
+                                    Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
+                                        vhci::Status::DeviceDisconnected
+                                    }
+                                    Ok(TransferStatus::Overflow) => vhci::Status::BufferOverrun,
+                                    Err(rusb::Error::Busy) => {
+                                        unreachable!("for now, no transfer can be resubmitted")
+                                    }
+                                    Err(rusb::Error::NotSupported) => {
+                                        unreachable!("will we ever mess with the transfer flags?")
+                                    }
+                                    Err(err) => {
+                                        warn! { %err, "int transfer failed on {dev_id:?}"};
+                                        vhci::Status::Error
+                                    }
+                                };
+
+                                (header, urb_header, transfer.into_buf().unwrap_or_default())
+                            },
                             UrbType::Iso => todo!(),
                         }
                     });
