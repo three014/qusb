@@ -1,14 +1,13 @@
 use std::{
     io,
-    mem::MaybeUninit,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use nohash_hasher::IntMap;
 use proto::{
     data::{Data, ReadError, Ring},
@@ -23,11 +22,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use vhci::{
-    ioctl::{self, UrbHandle, UrbType},
-    usbfs::{Dir, Req, STANDARD_DEVICE_SET_ADDRESS, STANDARD_DEVICE_SET_CONFIGURATION},
+    ioctl::{self, UrbType},
+    usbfs::{Dir, Recipient, Request},
     DataRate, PortChange, PortFlag, PortStatus,
 };
-use zerocopy::{FromBytes, IntoBytes, Ref, TryFromBytes};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     stub::{self, RegisterPort},
@@ -88,14 +87,14 @@ where
             mut rx,
             mut buf_rx,
             mut vhci,
-            id: dev_id,
+            id: _dev_id,
         } = self;
         let mut scratch_buf = [0u8; 2048];
         buf_rx.reserve(4096);
 
         // Step 1: Connect VHCI port
         let (port, mut work_rx) = vhci
-            .register(RegisterPort::Any, DataRate::Full)
+            .register(RegisterPort::Any, DataRate::High)
             .await
             .unwrap();
 
@@ -104,17 +103,13 @@ where
             UrbResp(io::Result<usize>),
         }
 
-        // Step 2: Setup context
-        const HEADER_SIZE: usize = size_of::<Header>();
-        const MIN_URB_SUBMIT_SIZE: usize = size_of::<UrbHeader>();
-
-        let seqnum = AtomicU64::new(0);
+        let seqnum = AtomicU32::new(0);
         let mut addr: u8 = 0xff;
         let mut prev = ioctl::IocPortStat::default();
         let mut handles =
-            SimpleMap::<u64, ioctl::UrbHandle>::with_capacity_and_hasher(32, Default::default());
+            SimpleMap::<u32, ioctl::UrbHandle>::with_capacity_and_hasher(32, Default::default());
         let mut seqnums =
-            SimpleMap::<ioctl::UrbHandle, u64>::with_capacity_and_hasher(32, Default::default());
+            SimpleMap::<ioctl::UrbHandle, u32>::with_capacity_and_hasher(32, Default::default());
 
         info!("starting event loop");
 
@@ -168,9 +163,8 @@ where
                         let now = Instant::now();
 
                         let header = Header {
-                            total_frame_len: size_of::<Header>() as u32,
+                            total_frame_len: (size_of::<Header>() / 8) as u16,
                             seqnum: next,
-                            dev_id,
                             command: msg::Command::CmdPort,
                             status: msg::Status::Success,
                         };
@@ -197,8 +191,7 @@ where
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle))))
                     if UrbType::Ctrl == urb.typ
                         && urb.address.is_for_unassigned()
-                        && STANDARD_DEVICE_SET_ADDRESS
-                            == (urb.setup_packet.request_type(), urb.setup_packet.req()) =>
+                        && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                 {
                     addr = urb.setup_packet.value().try_into().unwrap();
                     debug!("set address to {addr:#x}");
@@ -240,9 +233,8 @@ where
 
                     // Write our required data into the slice
                     let header = Header {
-                        total_frame_len: total_frame_len as u32,
+                        total_frame_len: (total_frame_len / 8) as u16,
                         seqnum: next,
-                        dev_id,
                         command: msg::Command::CmdSubmit,
                         status: msg::Status::Success,
                     };
@@ -296,9 +288,8 @@ where
                     debug!("got cancel urb with {handle:?}");
                     if let Some(&seqnum) = seqnums.get(&handle) {
                         let header = Header {
-                            total_frame_len: size_of::<Header>() as u32,
+                            total_frame_len: (size_of::<Header>() / 8) as u16,
                             seqnum,
-                            dev_id,
                             command: msg::Command::CmdUnlink,
                             status: msg::Status::Success,
                         };
@@ -338,21 +329,18 @@ where
                                         }
                                     }
                                 };
-                                let dbg = false; //&& vhci::Status::Success != frame.header.status;
-                                let urb = if dbg {
-                                    dbg!(&mut frame.header)
-                                } else {
-                                    &mut frame.header
-                                };
+
+                                let urb = &mut frame.header;
+
+                                if vhci::Status::Success != urb.status {
+                                    warn!("transfer {} failed: {:?}", header.seqnum, urb.status);
+                                }
                                 let transfer_len = urb.transfer_actual_len as usize;
                                 let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
                                     &mut frame.data,
                                     align_to_usize(transfer_len),
                                 )
                                 .unwrap();
-                                if dbg {
-                                    dbg!(&transfer[..transfer_len]);
-                                }
                                 let iso_packets =
                                     <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
                                         rest,
@@ -527,7 +515,7 @@ where
                 handle.set_auto_detach_kernel_driver(true)?;
                 for interface in 0..=16 {
                     if let Ok(true) = handle.kernel_driver_active(interface) {
-                        handle.detach_kernel_driver(interface)?;
+                        handle.claim_interface(interface)?;
                     }
                 }
                 handle.unconfigure()?;
@@ -556,13 +544,13 @@ where
         let ctx = device.context().clone();
         let event_handler_loop = std::thread::spawn(move || {
             while !runtime.is_cancelled() {
-                if let Err(err) = ctx.handle_events(Some(Duration::from_secs(15))) {
+                if let Err(err) = ctx.handle_events(Some(Duration::from_secs(500))) {
                     warn!("error from event handler: {err}");
                 }
             }
         });
 
-        let mut cancel_tokens: IntMap<u64, CancellationToken> =
+        let mut cancel_tokens: IntMap<u32, CancellationToken> =
             IntMap::with_capacity_and_hasher(256, Default::default());
         let mut transfers: JoinSet<(Header, UrbHeader, BytesMut)> = JoinSet::new();
 
@@ -590,24 +578,27 @@ where
                         let transfer_len = urb_header.transfer_actual_len as usize;
                         let mut transfer_buf = data.split_to(align_to_usize(transfer_len));
                         let ctrl =
-                            ioctl::IocSetupPacket::try_ref_from_bytes(&transfer_buf[..8]).unwrap();
-                        // `data` now should contain only iso packets
+                            ioctl::IocSetupPacket::ref_from_bytes(&transfer_buf[..8]).unwrap();
 
                         match urb_header.kind {
                             UrbType::Ctrl
-                                if STANDARD_DEVICE_SET_CONFIGURATION
-                                    == (ctrl.request_type(), ctrl.req()) =>
+                                if Request::STANDARD_DEVICE_SET_CONFIGURATION == ctrl.req() =>
                             {
+                                trace! { %ctrl };
                                 let desired = (ctrl.value() & 0xFF) as u8;
                                 urb_header.status = if handle
                                     .device()
                                     .active_config_descriptor()
                                     .is_ok_and(|config| desired == config.number())
                                 {
+                                    debug!("config {desired} is already set");
                                     vhci::Status::Success
                                 } else {
                                     match handle.set_active_configuration(desired) {
-                                        Ok(_) => vhci::Status::Success,
+                                        Ok(_) => {
+                                            debug!("set config {desired}");
+                                            vhci::Status::Success
+                                        }
                                         Err(err) => {
                                             warn! { %err, "couldn't set configuration" };
                                             vhci::Status::Stall
@@ -619,22 +610,45 @@ where
                                 (header, urb_header, transfer_buf)
                             }
                             UrbType::Ctrl => {
+                                trace! { %ctrl };
                                 assert!(transfer_len >= 8);
-                                if Req::GetInterface == ctrl.req() {
-                                    let interface = (ctrl.index() & 0xFF) as u8;
-                                    let _ = handle.detach_kernel_driver(interface);
-                                    handle.claim_interface(interface).unwrap();
-                                    trace!("successfully claimed interface {interface}");
-                                    let alternate = transfer_buf
-                                        .get(size_of::<ioctl::IocSetupPacket>())
-                                        .copied()
-                                        .unwrap_or_default();
-                                    if interface != alternate {
-                                        let _ = handle.detach_kernel_driver(alternate);
-                                        handle.claim_interface(alternate).unwrap();
-                                        trace!("successfully claimed interface {alternate}");
-                                    }
+                                let (mut interface, mut alternate) =
+                                    if Request::STANDARD_INTERFACE_GET_INTERFACE == ctrl.req() {
+                                        let interface = (ctrl.index() & 0xFF) as u8;
+                                        let alternate = transfer_buf
+                                            .get(size_of::<ioctl::IocSetupPacket>())
+                                            .copied()
+                                            .unwrap_or_default();
+
+                                        if interface != alternate {
+                                            (Some(interface), Some(alternate))
+                                        } else {
+                                            (Some(interface), None)
+                                        }
+                                    } else if Recipient::Interface == ctrl.req().recipient() {
+                                        (Some((ctrl.index() & 0xFF) as u8), None)
+                                    } else {
+                                        (None, None)
+                                    };
+
+                                if let Some(int) = interface.take_if(|int| {
+                                    handle
+                                        .kernel_driver_active(*int)
+                                        .is_ok_and(|is_active| true == is_active)
+                                }) {
+                                    handle.claim_interface(int).unwrap();
+                                    debug!("successfully claimed interface {int}");
                                 }
+
+                                if let Some(alt) = alternate.take_if(|int| {
+                                    handle
+                                        .kernel_driver_active(*int)
+                                        .is_ok_and(|is_active| true == is_active)
+                                }) {
+                                    handle.claim_interface(alt).unwrap();
+                                    debug!("successfully claimed interface {alt}");
+                                }
+
                                 let w_length = ctrl.length();
                                 assert_eq!(w_length + 8, transfer_len as u16);
                                 let buf = transfer_buf.split_to(transfer_len);
@@ -642,7 +656,11 @@ where
                                 //         required lengths, and setup packet
                                 //         contains the right length as well.
                                 let mut transfer = unsafe {
-                                    InnerTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600))
+                                    InnerTransfer::new(0).into_ctrl(
+                                        &handle,
+                                        buf,
+                                        Duration::from_millis(900),
+                                    )
                                 };
 
                                 urb_header.status = match transfer.submit(cancel).await {
@@ -669,7 +687,8 @@ where
                                     }
                                 };
 
-                                (header, urb_header, transfer.into_buf().unwrap_or_default())
+                                let buf = transfer.into_buf().unwrap_or_default().split_off(size_of::<ioctl::IocSetupPacket>());
+                                (header, urb_header, buf)
                             }
                             UrbType::Int => {
                                 let transfer_len =
@@ -678,7 +697,11 @@ where
                                     .split_off(size_of::<ioctl::IocSetupPacket>())
                                     .split_to(transfer_len);
                                 let mut transfer = unsafe {
-                                    InnerTransfer::new(0).into_int(&handle, urb_header.endpoint.0, buf)
+                                    InnerTransfer::new(0).into_int(
+                                        &handle,
+                                        urb_header.endpoint.0,
+                                        buf,
+                                    )
                                 };
 
                                 urb_header.status = match transfer.submit(cancel).await {
@@ -705,7 +728,8 @@ where
                                     }
                                 };
 
-                                (header, urb_header, transfer.into_buf().unwrap_or_default())
+                                let buf = transfer.into_buf().unwrap_or_default();
+                                (header, urb_header, buf)
                             }
                             UrbType::Bulk => {
                                 let transfer_len =
@@ -714,7 +738,11 @@ where
                                     .split_off(size_of::<ioctl::IocSetupPacket>())
                                     .split_to(transfer_len);
                                 let mut transfer = unsafe {
-                                    InnerTransfer::new(0).into_bulk(&handle, urb_header.endpoint.0, buf)
+                                    InnerTransfer::new(0).into_bulk(
+                                        &handle,
+                                        urb_header.endpoint.0,
+                                        buf,
+                                    )
                                 };
 
                                 urb_header.status = match transfer.submit(cancel).await {
@@ -741,16 +769,17 @@ where
                                     }
                                 };
 
-                                (header, urb_header, transfer.into_buf().unwrap_or_default())
-                            },
+                                let buf = transfer.into_buf().unwrap_or_default();
+                                (header, urb_header, buf)
+                            }
                             UrbType::Iso => todo!(),
                         }
                     });
                 }
-                LendEvent::RecvFrame(Some(LendRecv::PortReset(mut header))) => {
+                LendEvent::RecvFrame(Some(LendRecv::PortReset(header))) => {
                     trace!("got port reset");
 
-                    header.status = match device.reset() {
+                    let status = match device.reset() {
                         Ok(_) => {
                             trace!("port has been reset");
                             msg::Status::Success
@@ -761,7 +790,11 @@ where
                         }
                     };
 
-                    header.command = msg::Command::RetPort;
+                    let header = Header {
+                        command: msg::Command::RetPort,
+                        status,
+                        ..header
+                    };
 
                     let mut response = header.as_bytes();
                     trace!(
@@ -781,14 +814,23 @@ where
                     }
                 }
                 LendEvent::SendFrame((header, urb_header, mut data)) => {
-                    let scratch = [0u8; 7];
-                    let transfer = if UrbType::Ctrl == urb_header.kind {
-                        &data
-                            .get(size_of::<ioctl::IocSetupPacket>()..)
-                            .unwrap_or_default()
-                    } else {
+                    cancel_tokens.remove(&header.seqnum);
+
+                    if Dir::Out == urb_header.endpoint.direction() && data.len() == data.capacity() {
+                        data.clear();
+                    }
+                    trace!(
+                        "Seq {:?} on {:?} endpoint ({:?}/{}): {:?}, Data: {:?}",
+                        header.seqnum,
+                        urb_header.kind,
+                        urb_header.endpoint.direction(),
+                        urb_header.endpoint.0 & 0x7F,
+                        urb_header.status,
                         &data[..]
-                    };
+                    );
+
+                    let scratch = [0u8; 7];
+                    let transfer = &data[..];
                     let padding = {
                         let padded_len = align_to_usize(transfer.len()) - transfer.len();
                         &scratch[..padded_len]
@@ -813,14 +855,14 @@ where
                         vhci::Status::AllIsoPacketsFailed => todo!(),
                         vhci::Status::ShortPacket => todo!(),
                         vhci::Status::Success | _ => msg::Status::Success,
-                        // vhci::Status::Canceled => todo!(),
-                        // vhci::Status::TimedOut => todo!(),
-                        // vhci::Status::DeviceDisabled => todo!(),
-                        // vhci::Status::Stall => todo!(),
-                        // vhci::Status::BufferOverrun => todo!(),
+                        // vhci::Status::Canceled => msg::Status::Success,
+                        // vhci::Status::TimedOut => msg::Status::Success,
+                        // vhci::Status::DeviceDisabled => msg::Status::Success,
+                        // vhci::Status::Stall => msg::Status::Success,
+                        // vhci::Status::BufferOverrun => msg::Status::Success,
                     };
                     let header = Header {
-                        total_frame_len: total_frame_len as u32,
+                        total_frame_len: (total_frame_len / 8) as u16,
                         command: msg::Command::RetSubmit,
                         status,
                         ..header
@@ -872,333 +914,330 @@ where
         result
     }
 
-    #[tracing::instrument(skip_all, level = "trace")]
-    pub async fn lend(self) -> Result<()> {
-        let Self {
-            mut tx,
-            mut rx,
-            mut buf_rx,
-            id: dev_id,
-        } = self;
+    // #[tracing::instrument(skip_all, level = "trace")]
+    // pub async fn lend(self) -> Result<()> {
+    //     let Self {
+    //         mut tx,
+    //         mut rx,
+    //         mut buf_rx,
+    //         id: dev_id,
+    //     } = self;
 
-        let handle = match rusb::Context::new()
-            .and_then(|ctx| {
-                // ctx.set_log_level(LogLevel::Debug);
-                ctx.devices()
-            })
-            .and_then(|list| {
-                list.iter()
-                    .find(|dev| {
-                        dev_id.bus_number == dev.bus_number() && dev_id.device_addr == dev.address()
-                    })
-                    .ok_or(rusb::Error::NoDevice)
-            })
-            .and_then(|dev| dev.open())
-            .and_then(|handle| {
-                handle.set_auto_detach_kernel_driver(true)?;
-                for interface in 0..=16 {
-                    if let Ok(true) = handle.kernel_driver_active(interface) {
-                        handle.detach_kernel_driver(interface)?;
-                    }
-                }
-                handle.unconfigure()?;
-                Ok(handle)
-            }) {
-            Ok(handle) => {
-                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
-                tx.write_all_buf(&mut response).await?;
-                handle
-            }
-            Err(err) => {
-                let err = RusbError { kind: err, dev_id };
-                let ret_err = Error::from(err);
-                let status = msg::Status::from(err);
+    //     let handle = match rusb::Context::new()
+    //         .and_then(|ctx| {
+    //             // ctx.set_log_level(LogLevel::Debug);
+    //             ctx.devices()
+    //         })
+    //         .and_then(|list| {
+    //             list.iter()
+    //                 .find(|dev| {
+    //                     dev_id.bus_number == dev.bus_number() && dev_id.device_addr == dev.address()
+    //                 })
+    //                 .ok_or(rusb::Error::NoDevice)
+    //         })
+    //         .and_then(|dev| dev.open())
+    //         .and_then(|handle| {
+    //             handle.set_auto_detach_kernel_driver(true)?;
+    //             for interface in 0..=16 {
+    //                 if let Ok(true) = handle.kernel_driver_active(interface) {
+    //                     handle.detach_kernel_driver(interface)?;
+    //                 }
+    //             }
+    //             handle.unconfigure()?;
+    //             Ok(handle)
+    //         }) {
+    //         Ok(handle) => {
+    //             let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
+    //             tx.write_all_buf(&mut response).await?;
+    //             handle
+    //         }
+    //         Err(err) => {
+    //             let err = RusbError { kind: err, dev_id };
+    //             let ret_err = Error::from(err);
+    //             let status = msg::Status::from(err);
 
-                let mut response = status.as_bytes().chain(&[0u8; 7][..]);
+    //             let mut response = status.as_bytes().chain(&[0u8; 7][..]);
 
-                tx.write_all_buf(&mut response).await.unwrap();
-                tx.close().await.unwrap();
-                return Err(ret_err);
-            }
-        };
+    //             tx.write_all_buf(&mut response).await.unwrap();
+    //             tx.close().await.unwrap();
+    //             return Err(ret_err);
+    //         }
+    //     };
 
-        const HEADER_SIZE: usize = size_of::<Header>();
-        const MIN_URB_SUBMIT_SIZE: usize = size_of::<UrbHeader>();
+    //     const HEADER_SIZE: usize = size_of::<Header>();
+    //     const MIN_URB_SUBMIT_SIZE: usize = size_of::<UrbHeader>();
 
-        trace!("starting lender loop");
-        'outer: loop {
-            if buf_rx.fill_until(&mut rx, HEADER_SIZE).await?.is_none() {
-                break 'outer;
-            }
+    //     trace!("starting lender loop");
+    //     'outer: loop {
+    //         if buf_rx.fill_until(&mut rx, HEADER_SIZE).await?.is_none() {
+    //             break 'outer;
+    //         }
 
-            let mut header: Header = buf_rx.read().unwrap();
+    //         let mut header: Header = buf_rx.read().unwrap();
 
-            // Parse request big-time
-            match header.command {
-                msg::Command::CmdSubmit => {
-                    trace!("got urb submit");
+    //         // Parse request big-time
+    //         match header.command {
+    //             msg::Command::CmdSubmit => {
+    //                 trace!("got urb submit");
 
-                    let mut min_len = MIN_URB_SUBMIT_SIZE;
-                    let frame: &mut UrbFrame = loop {
-                        if buf_rx.fill_until(&mut rx, min_len).await?.is_none() {
-                            break 'outer;
-                        }
+    //                 let mut min_len = MIN_URB_SUBMIT_SIZE;
+    //                 let frame: &mut UrbFrame = loop {
+    //                     if buf_rx.fill_until(&mut rx, min_len).await?.is_none() {
+    //                         break 'outer;
+    //                     }
 
-                        match buf_rx.peek_mut_dst() {
-                            Ok(frame) => break frame,
-                            Err(ReadError::CorruptedData) => todo!(),
-                            Err(ReadError::BufferShort {
-                                num_bytes_needed, ..
-                            }) => {
-                                min_len = buf_rx.len() + num_bytes_needed;
-                            }
-                        }
-                    };
+    //                     match buf_rx.peek_mut_dst() {
+    //                         Ok(frame) => break frame,
+    //                         Err(ReadError::CorruptedData) => todo!(),
+    //                         Err(ReadError::BufferShort {
+    //                             num_bytes_needed, ..
+    //                         }) => {
+    //                             min_len = buf_rx.len() + num_bytes_needed;
+    //                         }
+    //                     }
+    //                 };
 
-                    let dbg = false;
-                    let urb = if dbg {
-                        dbg!(&mut frame.header)
-                    } else {
-                        &mut frame.header
-                    };
-                    let mut transfer_len = urb.transfer_actual_len as usize;
-                    let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
-                        &mut frame.data,
-                        align_to_usize(transfer_len),
-                    )
-                    .unwrap();
-                    let iso_packets = <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(
-                        rest,
-                        usize::from(urb.num_isos),
-                    )
-                    .unwrap();
-                    let (ctrl, transfer) =
-                        ioctl::IocSetupPacket::try_mut_from_prefix(transfer).unwrap();
-                    transfer_len -= size_of::<ioctl::IocSetupPacket>();
+    //                 let dbg = false;
+    //                 let urb = if dbg {
+    //                     dbg!(&mut frame.header)
+    //                 } else {
+    //                     &mut frame.header
+    //                 };
+    //                 let mut transfer_len = urb.transfer_actual_len as usize;
+    //                 let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
+    //                     &mut frame.data,
+    //                     align_to_usize(transfer_len),
+    //                 )
+    //                 .unwrap();
+    //                 let iso_packets = <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(
+    //                     rest,
+    //                     usize::from(urb.num_isos),
+    //                 )
+    //                 .unwrap();
+    //                 let (ctrl, transfer) =
+    //                     ioctl::IocSetupPacket::try_mut_from_prefix(transfer).unwrap();
+    //                 transfer_len -= size_of::<ioctl::IocSetupPacket>();
 
-                    let status = match (urb.kind, urb.endpoint.direction()) {
-                        (UrbType::Ctrl, Dir::In) => {
-                            if dbg {
-                                dbg!((ctrl.request_type(), ctrl.req()));
-                                dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
-                            }
-                            match handle.read_control(
-                                ctrl.bm_request_type,
-                                ctrl.b_request as u8,
-                                ctrl.w_value,
-                                ctrl.w_index,
-                                &mut transfer[..transfer_len],
-                                Duration::from_millis(600),
-                            ) {
-                                Ok(bytes_written) => {
-                                    urb.transfer_actual_len = bytes_written as u16;
-                                    vhci::Status::Success
-                                }
-                                Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
-                                Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
-                                Err(rusb::Error::Io) => vhci::Status::Error,
-                                Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
-                                Err(err) => {
-                                    warn! { %err, "couldn't read from ctrl" };
-                                    vhci::Status::Stall
-                                }
-                            }
-                        }
-                        (UrbType::Ctrl, Dir::Out)
-                            if STANDARD_DEVICE_SET_CONFIGURATION
-                                == (ctrl.request_type(), ctrl.req()) =>
-                        {
-                            if dbg {
-                                dbg!((ctrl.request_type(), ctrl.req()));
-                                dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
-                            }
-                            let desired = (ctrl.value() & 0xFF) as u8;
-                            if handle
-                                .device()
-                                .active_config_descriptor()
-                                .is_ok_and(|config| desired == config.number())
-                            {
-                                vhci::Status::Success
-                            } else {
-                                match handle.set_active_configuration(desired) {
-                                    Ok(_) => {
-                                        urb.transfer_actual_len = 0;
-                                        vhci::Status::Success
-                                    }
-                                    Err(err) => {
-                                        warn! { %err, "couldn't set configuration" };
-                                        vhci::Status::Stall
-                                    }
-                                }
-                            }
-                        }
-                        (UrbType::Ctrl, Dir::Out) => {
-                            if dbg {
-                                dbg!((ctrl.request_type(), ctrl.req()));
-                                dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
-                            }
-                            if Req::GetInterface == ctrl.req() {
-                                let interface = (ctrl.index() & 0xFF) as u8;
-                                let _ = handle.detach_kernel_driver(interface);
-                                handle.claim_interface(interface).unwrap();
-                                trace!("successfully claimed interface {interface}");
-                                let alternate = transfer.get(0).copied().unwrap_or_default();
-                                if interface != alternate {
-                                    let _ = handle.detach_kernel_driver(alternate);
-                                    handle.claim_interface(alternate).unwrap();
-                                    trace!("successfully claimed interface {alternate}");
-                                }
-                            }
-                            match handle.write_control(
-                                ctrl.bm_request_type,
-                                ctrl.b_request as u8,
-                                ctrl.w_value,
-                                ctrl.w_index,
-                                &mut transfer[..transfer_len],
-                                Duration::from_millis(600),
-                            ) {
-                                Ok(_) => {
-                                    urb.transfer_actual_len = 0;
-                                    vhci::Status::Success
-                                }
-                                Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
-                                Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
-                                Err(rusb::Error::Io) => vhci::Status::Error,
-                                Err(err) => {
-                                    warn! { %err, "couldn't write to control" };
-                                    vhci::Status::Stall
-                                }
-                            }
-                        }
-                        (UrbType::Iso, _) => vhci::Status::Stall,
-                        (UrbType::Int, Dir::In) => {
-                            match handle.read_interrupt(
-                                urb.endpoint.0,
-                                &mut transfer[..transfer_len],
-                                Duration::from_secs(4),
-                            ) {
-                                Ok(bytes_written) => {
-                                    urb.transfer_actual_len = bytes_written as u16;
-                                    vhci::Status::Success
-                                }
-                                Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
-                                Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
-                                Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
-                                Err(rusb::Error::Io) => vhci::Status::Error,
-                                Err(err) => {
-                                    warn! { %err, "couldn't read interrupt" };
-                                    vhci::Status::Stall
-                                }
-                            }
-                        }
-                        (UrbType::Int, Dir::Out) => todo!(),
-                        (UrbType::Bulk, Dir::In) => todo!(),
-                        (UrbType::Bulk, Dir::Out) => todo!(),
-                    };
+    //                 let status = match (urb.kind, urb.endpoint.direction()) {
+    //                     (UrbType::Ctrl, Dir::In) => {
+    //                         match handle.read_control(
+    //                             ctrl.bm_request_type,
+    //                             ctrl.b_request as u8,
+    //                             ctrl.w_value,
+    //                             ctrl.w_index,
+    //                             &mut transfer[..transfer_len],
+    //                             Duration::from_millis(600),
+    //                         ) {
+    //                             Ok(bytes_written) => {
+    //                                 urb.transfer_actual_len = bytes_written as u16;
+    //                                 vhci::Status::Success
+    //                             }
+    //                             Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
+    //                             Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+    //                             Err(rusb::Error::Io) => vhci::Status::Error,
+    //                             Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
+    //                             Err(err) => {
+    //                                 warn! { %err, "couldn't read from ctrl" };
+    //                                 vhci::Status::Stall
+    //                             }
+    //                         }
+    //                     }
+    //                     (UrbType::Ctrl, Dir::Out)
+    //                         if ctrl.req().is_some_and(|req| {
+    //                             STANDARD_DEVICE_SET_CONFIGURATION == (ctrl.request_type(), req)
+    //                         }) =>
+    //                     {
+    //                         if dbg {
+    //                             dbg!((ctrl.request_type(), ctrl.req()));
+    //                             dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
+    //                         }
+    //                         let desired = (ctrl.value() & 0xFF) as u8;
+    //                         if handle
+    //                             .device()
+    //                             .active_config_descriptor()
+    //                             .is_ok_and(|config| desired == config.number())
+    //                         {
+    //                             vhci::Status::Success
+    //                         } else {
+    //                             match handle.set_active_configuration(desired) {
+    //                                 Ok(_) => {
+    //                                     urb.transfer_actual_len = 0;
+    //                                     vhci::Status::Success
+    //                                 }
+    //                                 Err(err) => {
+    //                                     warn! { %err, "couldn't set configuration" };
+    //                                     vhci::Status::Stall
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+    //                     (UrbType::Ctrl, Dir::Out) => {
+    //                         if dbg {
+    //                             dbg!((ctrl.request_type(), ctrl.req()));
+    //                             dbg!((ctrl.value(), ctrl.index(), ctrl.length()));
+    //                         }
+    //                         if Some(Req::GetInterface) == ctrl.req() {
+    //                             let interface = (ctrl.index() & 0xFF) as u8;
+    //                             let _ = handle.detach_kernel_driver(interface);
+    //                             handle.claim_interface(interface).unwrap();
+    //                             trace!("successfully claimed interface {interface}");
+    //                             let alternate = transfer.get(0).copied().unwrap_or_default();
+    //                             if interface != alternate {
+    //                                 let _ = handle.detach_kernel_driver(alternate);
+    //                                 handle.claim_interface(alternate).unwrap();
+    //                                 trace!("successfully claimed interface {alternate}");
+    //                             }
+    //                         }
+    //                         match handle.write_control(
+    //                             ctrl.bm_request_type,
+    //                             ctrl.b_request as u8,
+    //                             ctrl.w_value,
+    //                             ctrl.w_index,
+    //                             &mut transfer[..transfer_len],
+    //                             Duration::from_millis(600),
+    //                         ) {
+    //                             Ok(_) => {
+    //                                 urb.transfer_actual_len = 0;
+    //                                 vhci::Status::Success
+    //                             }
+    //                             Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
+    //                             Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+    //                             Err(rusb::Error::Io) => vhci::Status::Error,
+    //                             Err(err) => {
+    //                                 warn! { %err, "couldn't write to control" };
+    //                                 vhci::Status::Stall
+    //                             }
+    //                         }
+    //                     }
+    //                     (UrbType::Iso, _) => vhci::Status::Stall,
+    //                     (UrbType::Int, Dir::In) => {
+    //                         match handle.read_interrupt(
+    //                             urb.endpoint.0,
+    //                             &mut transfer[..transfer_len],
+    //                             Duration::from_secs(4),
+    //                         ) {
+    //                             Ok(bytes_written) => {
+    //                                 urb.transfer_actual_len = bytes_written as u16;
+    //                                 vhci::Status::Success
+    //                             }
+    //                             Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
+    //                             Err(rusb::Error::Timeout) => vhci::Status::TimedOut,
+    //                             Err(rusb::Error::Overflow) => vhci::Status::BufferOverrun,
+    //                             Err(rusb::Error::Io) => vhci::Status::Error,
+    //                             Err(err) => {
+    //                                 warn! { %err, "couldn't read interrupt" };
+    //                                 vhci::Status::Stall
+    //                             }
+    //                         }
+    //                     }
+    //                     (UrbType::Int, Dir::Out) => todo!(),
+    //                     (UrbType::Bulk, Dir::In) => todo!(),
+    //                     (UrbType::Bulk, Dir::Out) => todo!(),
+    //                 };
 
-                    if vhci::Status::Success != status {
-                        urb.transfer_actual_len = 0;
-                    }
+    //                 if vhci::Status::Success != status {
+    //                     urb.transfer_actual_len = 0;
+    //                 }
 
-                    urb.status = status;
+    //                 urb.status = status;
 
-                    header.command = msg::Command::RetSubmit;
-                    header.status = match status {
-                        vhci::Status::Pending => todo!(),
-                        vhci::Status::Error => msg::Status::DevErr,
-                        // vhci::Status::DeviceDisabled => {
-                        //     todo!()
-                        // }
-                        vhci::Status::DeviceDisconnected => msg::Status::NoDev,
-                        vhci::Status::BitStuff => todo!(),
-                        vhci::Status::Crc => todo!(),
-                        vhci::Status::NoResponse => todo!(),
-                        vhci::Status::Babble => todo!(),
-                        vhci::Status::BufferUnderrun => todo!(),
-                        vhci::Status::AllIsoPacketsFailed => todo!(),
-                        vhci::Status::ShortPacket => todo!(),
-                        vhci::Status::Canceled => todo!(),
-                        vhci::Status::Success | _ => msg::Status::Success,
-                    };
+    //                 header.command = msg::Command::RetSubmit;
+    //                 header.status = match status {
+    //                     vhci::Status::Pending => todo!(),
+    //                     vhci::Status::Error => msg::Status::DevErr,
+    //                     // vhci::Status::DeviceDisabled => {
+    //                     //     todo!()
+    //                     // }
+    //                     vhci::Status::DeviceDisconnected => msg::Status::NoDev,
+    //                     vhci::Status::BitStuff => todo!(),
+    //                     vhci::Status::Crc => todo!(),
+    //                     vhci::Status::NoResponse => todo!(),
+    //                     vhci::Status::Babble => todo!(),
+    //                     vhci::Status::BufferUnderrun => todo!(),
+    //                     vhci::Status::AllIsoPacketsFailed => todo!(),
+    //                     vhci::Status::ShortPacket => todo!(),
+    //                     vhci::Status::Canceled => todo!(),
+    //                     vhci::Status::Success | _ => msg::Status::Success,
+    //                 };
 
-                    if msg::Status::Success == header.status {
-                        let mut response = header
-                            .as_bytes()
-                            .chain(urb.as_bytes())
-                            .chain(&transfer[..align_to_usize(urb.transfer_actual_len as usize)])
-                            .chain(iso_packets.as_bytes());
-                        trace!(
-                            "seqnum {} - response is {} bytes",
-                            header.seqnum,
-                            response.remaining()
-                        );
-                        tx.write_all_buf(&mut response).await?;
-                    } else {
-                        let _errno = dbg!(io::Error::last_os_error());
-                        let mut response = header.as_bytes();
-                        trace!(
-                            "seqnum {} - response is {} bytes",
-                            header.seqnum,
-                            response.len()
-                        );
-                        tx.write_all_buf(&mut response).await?;
-                        tx.close().await?;
-                        return Err(Error::ReqFailed);
-                    }
+    //                 if msg::Status::Success == header.status {
+    //                     let mut response = header
+    //                         .as_bytes()
+    //                         .chain(urb.as_bytes())
+    //                         .chain(&transfer[..align_to_usize(urb.transfer_actual_len as usize)])
+    //                         .chain(iso_packets.as_bytes());
+    //                     trace!(
+    //                         "seqnum {} - response is {} bytes",
+    //                         header.seqnum,
+    //                         response.remaining()
+    //                     );
+    //                     tx.write_all_buf(&mut response).await?;
+    //                 } else {
+    //                     let _errno = dbg!(io::Error::last_os_error());
+    //                     let mut response = header.as_bytes();
+    //                     trace!(
+    //                         "seqnum {} - response is {} bytes",
+    //                         header.seqnum,
+    //                         response.len()
+    //                     );
+    //                     tx.write_all_buf(&mut response).await?;
+    //                     tx.close().await?;
+    //                     return Err(Error::ReqFailed);
+    //                 }
 
-                    let size_of_frame = size_of_val(frame);
-                    buf_rx.consume(size_of_frame);
-                }
-                msg::Command::CmdUnlink => {
-                    trace!("got urb unlink");
+    //                 let size_of_frame = size_of_val(frame);
+    //                 buf_rx.consume(size_of_frame);
+    //             }
+    //             msg::Command::CmdUnlink => {
+    //                 trace!("got urb unlink");
 
-                    // TODO: If we ever figure out asynchronous transfer,
-                    //       then implement this for reals
+    //                 // TODO: If we ever figure out asynchronous transfer,
+    //                 //       then implement this for reals
 
-                    header.command = msg::Command::RetUnlink;
-                    header.status = msg::Status::Success;
-                    let mut response = header.as_bytes();
-                    trace!(
-                        "seqnum {} - response is {} bytes",
-                        header.seqnum,
-                        response.len()
-                    );
-                    tx.write_all_buf(&mut response).await?;
-                }
-                msg::Command::CmdPort => {
-                    trace!("got port reset");
+    //                 header.command = msg::Command::RetUnlink;
+    //                 header.status = msg::Status::Success;
+    //                 let mut response = header.as_bytes();
+    //                 trace!(
+    //                     "seqnum {} - response is {} bytes",
+    //                     header.seqnum,
+    //                     response.len()
+    //                 );
+    //                 tx.write_all_buf(&mut response).await?;
+    //             }
+    //             msg::Command::CmdPort => {
+    //                 trace!("got port reset");
 
-                    header.status = match handle.reset() {
-                        Ok(_) => {
-                            trace!("port has been reset");
-                            msg::Status::Success
-                        }
-                        Err(err) => {
-                            error! { %err, "error while unconfiguring device {dev_id:?}" };
-                            msg::Status::DevErr
-                        }
-                    };
+    //                 header.status = match handle.reset() {
+    //                     Ok(_) => {
+    //                         trace!("port has been reset");
+    //                         msg::Status::Success
+    //                     }
+    //                     Err(err) => {
+    //                         error! { %err, "error while unconfiguring device {dev_id:?}" };
+    //                         msg::Status::DevErr
+    //                     }
+    //                 };
 
-                    header.command = msg::Command::RetPort;
+    //                 header.command = msg::Command::RetPort;
 
-                    // let mut response = dbg!(&header).as_bytes();
-                    let mut response = header.as_bytes();
-                    trace!(
-                        "seqnum {} - response is {} bytes",
-                        header.seqnum,
-                        response.len()
-                    );
-                    tx.write_all_buf(&mut response).await?;
-                    if msg::Status::Success != header.status {
-                        tx.close().await?;
-                        return Err(Error::ReqFailed);
-                    }
-                }
-                _ => unreachable!("smh smh client"),
-            }
-        }
-        todo!()
-    }
+    //                 // let mut response = dbg!(&header).as_bytes();
+    //                 let mut response = header.as_bytes();
+    //                 trace!(
+    //                     "seqnum {} - response is {} bytes",
+    //                     header.seqnum,
+    //                     response.len()
+    //                 );
+    //                 tx.write_all_buf(&mut response).await?;
+    //                 if msg::Status::Success != header.status {
+    //                     tx.close().await?;
+    //                     return Err(Error::ReqFailed);
+    //                 }
+    //             }
+    //             _ => unreachable!("smh smh client"),
+    //         }
+    //     }
+    //     todo!()
+    // }
 }
 
 pub struct SendDevices<W> {

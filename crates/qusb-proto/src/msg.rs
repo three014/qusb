@@ -324,11 +324,10 @@ pub enum Command {
 #[derive(Debug, Clone, KnownLayout, Immutable, FromZeros, IntoBytes)]
 #[repr(C, align(8))]
 pub struct Header {
-    pub total_frame_len: u32,
-    pub dev_id: UsbDeviceId,
+    pub total_frame_len: u16,
     pub command: Command,
     pub status: Status,
-    pub seqnum: u64,
+    pub seqnum: u32,
 }
 
 #[derive(Debug, Clone, KnownLayout, Immutable, IntoBytes, FromZeros)]
@@ -535,12 +534,12 @@ impl GetSliceLen for QusbFrame {
         const BASE_LEN: usize = size_of::<Header>();
 
         let (frame_len, _) =
-            u32::read_from_prefix(buf).map_err(|_| GetSliceLenErr::BufferShort {
+            u16::read_from_prefix(buf).map_err(|_| GetSliceLenErr::BufferShort {
                 num_bytes_needed: BASE_LEN - buf.len(),
                 buf_len: buf.len(),
             })?;
 
-        let frame_len = frame_len as usize;
+        let frame_len = (frame_len * 8) as usize;
 
         if frame_len > buf.len() {
             Err(GetSliceLenErr::BufferShort {

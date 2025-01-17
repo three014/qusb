@@ -1,16 +1,15 @@
 use std::{
-    borrow::Cow,
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 use vhci::{
     ioctl::{Address, UrbHandle},
-    usbfs::STANDARD_DEVICE_SET_ADDRESS,
+    usbfs::Request,
     utils::{BoundedI16, BoundedU8, TimeoutMillis},
     DataRate, Port, PortChange, PortStatus,
 };
@@ -220,11 +219,7 @@ impl Demuxer {
                                     vhci::ioctl::UrbType::Ctrl
                                         if urb.endpoint.is_anycast()
                                             && !queue.is_empty()
-                                            && STANDARD_DEVICE_SET_ADDRESS
-                                                == (
-                                                    urb.setup_packet.request_type(),
-                                                    urb.setup_packet.req(),
-                                                ) =>
+                                            && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                                     {
                                         // TODO: The logic around here is all messed up lmao
                                         let address = Address::new(urb.setup_packet.value() as u8)
@@ -323,8 +318,7 @@ impl Demuxer {
                 }
                 Event::Task(Some(Err(_err))) => todo!(),
                 Event::Register(None) | Event::Disconnect(None) | Event::GivebackUrb(None) => break,
-                Event::Task(Some(Ok(Continuation::Other)))
-                | Event::Task(None) => (),
+                Event::Task(Some(Ok(Continuation::Other))) | Event::Task(None) => (),
             };
         }
 
@@ -474,7 +468,7 @@ fn recv_work(
 
 #[cfg(test)]
 mod tests {
-    use tracing::warn;
+    use tracing::{debug, warn};
     use vhci::{libc, PortChange, PortFlag, PortStatus, UrbWithData};
 
     use super::*;
@@ -569,13 +563,9 @@ mod tests {
                         }
                     }
 
-                    let urb_ctrl_req = (
-                        urb.control_packet().request_type(),
-                        urb.control_packet().req(),
-                    );
                     if vhci::ioctl::UrbType::Ctrl == urb.kind()
                         && urb.endpoint().is_anycast()
-                        && STANDARD_DEVICE_SET_ADDRESS == urb_ctrl_req
+                        && Request::STANDARD_DEVICE_SET_ADDRESS == urb.control_packet().req()
                     {
                         if let Some(new_addr) =
                             Address::new(urb.control_packet().value().try_into().unwrap())
