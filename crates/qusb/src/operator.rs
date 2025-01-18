@@ -687,7 +687,10 @@ where
                                     }
                                 };
 
-                                let buf = transfer.into_buf().unwrap_or_default().split_off(size_of::<ioctl::IocSetupPacket>());
+                                let buf = transfer
+                                    .into_buf()
+                                    .unwrap_or_default()
+                                    .split_off(size_of::<ioctl::IocSetupPacket>());
                                 (header, urb_header, buf)
                             }
                             UrbType::Int => {
@@ -816,7 +819,8 @@ where
                 LendEvent::SendFrame((header, urb_header, mut data)) => {
                     cancel_tokens.remove(&header.seqnum);
 
-                    if Dir::Out == urb_header.endpoint.direction() && data.len() == data.capacity() {
+                    if Dir::Out == urb_header.endpoint.direction() && data.len() == data.capacity()
+                    {
                         data.clear();
                     }
                     trace!(

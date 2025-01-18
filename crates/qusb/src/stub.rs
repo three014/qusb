@@ -109,17 +109,8 @@ impl Demuxer {
         });
 
         let mut set = tokio::task::JoinSet::new();
-
-        async fn check_for_completed_task(
-            set: &mut tokio::task::JoinSet<Continuation>,
-        ) -> Option<Result<Continuation, tokio::task::JoinError>> {
-            if set.is_empty() {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            set.join_next().await
-        }
-
         loop {
+            let events_in_progress = !set.is_empty();
             let event = tokio::select! {
                 req = register_rx.recv() => {
                     Event::Register(req)
@@ -133,7 +124,7 @@ impl Demuxer {
                 work = work_rx.recv() => {
                     Event::Work(work.expect("we can only get here if we shutdown in the wrong order"))
                 }
-                task = check_for_completed_task(&mut set) => {
+                task = set.join_next(), if events_in_progress => {
                     Event::Task(task)
                 }
             };
@@ -197,7 +188,7 @@ impl Demuxer {
                     let ctx = Arc::clone(&ctx);
                     set.spawn(async move {
                         // SAFETY: Per the function's safety contract,
-                        //         the work item is unalterned from the
+                        //         the work item is unaltered from the
                         //         ioctl call.
                         let work = unsafe { ioc_work.into_inner() };
                         let tx = {
@@ -409,13 +400,7 @@ impl Controller {
 
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
-        if let Ok(tokio::runtime::RuntimeFlavor::MultiThread) =
-            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor())
-        {
-            tokio::task::block_in_place(|| self.remote.port_reset_done(port, enable))
-        } else {
-            self.remote.port_reset_done(port, enable)
-        }
+        self.remote.port_reset_done(port, enable)
     }
 
     // #[tracing::instrument(level = "trace", skip_all)]

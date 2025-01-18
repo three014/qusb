@@ -2,22 +2,24 @@ use core::fmt;
 use std::{
     collections::HashMap,
     fs,
-    hash::{BuildHasherDefault, Hash},
+    hash::Hash,
     io,
     num::ParseIntError,
     path::Path,
     str::FromStr,
 };
 
-use nohash_hasher::{BuildNoHashHasher, IsEnabled};
+use nohash_hasher::IsEnabled;
+
+use crate::utils::SimpleMap;
 
 #[derive(Debug, Clone)]
 struct Inner {
-    vendor: HashMap<VendorKey, Box<str>, BuildNoHashHasher<VendorKey>>,
-    product: HashMap<ProductKey, Box<str>, BuildNoHashHasher<ProductKey>>,
-    class: HashMap<ClassKey, Box<str>, BuildNoHashHasher<ClassKey>>,
-    subclass: HashMap<SubclassKey, Box<str>, BuildNoHashHasher<SubclassKey>>,
-    protocol: HashMap<ProtocolKey, Box<str>, BuildNoHashHasher<ProtocolKey>>,
+    vendor: SimpleMap<VendorKey, Box<str>>,
+    product: SimpleMap<ProductKey, Box<str>>,
+    class: SimpleMap<ClassKey, Box<str>>,
+    subclass: SimpleMap<SubclassKey, Box<str>>,
+    protocol: SimpleMap<ProtocolKey, Box<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +29,7 @@ pub struct UsbIds {
 
 impl UsbIds {
     fn parse(buf: &str) -> UsbIds {
-        let mut names = Inner::new();
+        let mut names = Inner::with_capacity(64);
         let mut last_state = LastState::Start;
 
         for (line, _num) in buf.lines().zip(1usize..) {
@@ -191,13 +193,13 @@ impl fmt::Display for Product<'_> {
 }
 
 impl Inner {
-    pub fn new() -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            vendor: HashMap::with_hasher(BuildHasherDefault::default()),
-            product: HashMap::with_hasher(BuildHasherDefault::default()),
-            class: HashMap::with_hasher(BuildHasherDefault::default()),
-            subclass: HashMap::with_hasher(BuildHasherDefault::default()),
-            protocol: HashMap::with_hasher(BuildHasherDefault::default()),
+            vendor: SimpleMap::with_capacity_and_hasher(capacity, Default::default()),
+            product: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            class: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            subclass: SimpleMap::with_capacity_and_hasher(capacity, Default::default()),
+            protocol: SimpleMap::with_capacity_and_hasher(capacity, Default::default()),
         }
     }
 

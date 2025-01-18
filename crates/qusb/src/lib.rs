@@ -17,7 +17,7 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, trace, warn};
 use usb_ids::UsbIds;
-use utils::CloseStream;
+use utils::{align_to_usize, CloseStream};
 use vhci::utils::BoundedU8;
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -236,9 +236,7 @@ impl Session {
         let mut buf = Ring::with_capacity(32);
 
         const SIZE_OF_REQUEST: usize = size_of::<msg::Version>() + size_of::<msg::Request>();
-        while SIZE_OF_REQUEST > buf.len() {
-            buf.fill_with_reader(&mut rx).await?;
-        }
+        buf.fill_until(&mut rx, SIZE_OF_REQUEST).await?;
 
         let version: msg::Version = match buf.read() {
             Ok(version) => version,
@@ -296,17 +294,10 @@ impl Session {
         let req = msg::Request::ListDevices;
 
         let mut request = version.as_bytes().chain(req.as_bytes());
-        tx.write_all_buf(&mut request)
-            .await
-            .inspect_err(|err| error!("{err}"))?;
+        tx.write_all_buf(&mut request).await?;
         drop(tx);
 
-        while 0
-            == buf
-                .fill_with_reader(&mut rx)
-                .await
-                .inspect_err(|err| error!("{err}"))?
-        {}
+        while 0 == buf.fill_with_reader(&mut rx).await? {}
         trace!("finished reading from remote stream");
         let status = match buf.read() {
             Ok(status) => status,
@@ -318,15 +309,15 @@ impl Session {
         buf.consume(7);
         match status {
             msg::Status::Success => {}
-            msg::Status::Failed => return Err(Error::ReqFailed),
-            msg::Status::DevBusy => todo!(),
-            msg::Status::DevErr => todo!(),
-            msg::Status::NoDev => todo!(),
-            msg::Status::Unexpected => {
+            msg::Status::NoDev | msg::Status::DevBusy | msg::Status::DevErr => unreachable!(),
+            msg::Status::Unexpected | msg::Status::Failed => {
                 return Err(Error::ReqFailed);
             }
             msg::Status::VersionMismatch => {
-                return Err(Error::VersionMismatch(version));
+                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Version>()))
+                    .await?;
+                let their_version = buf.read::<msg::Version>().unwrap();
+                return Err(Error::VersionMismatch(their_version));
             }
             msg::Status::Timeout => todo!(),
             msg::Status::Proto => todo!(),
@@ -367,9 +358,8 @@ impl Session {
             self.conn.remote_address()
         );
 
-        while size_of::<msg::Status>() + 7 > buf.len() {
-            buf.fill_with_reader(&mut rx).await?;
-        }
+        buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
+            .await?;
 
         trace!("received enough bytes for a status from peer");
 
@@ -395,9 +385,8 @@ impl Session {
                 return Err(io::Error::from(io::ErrorKind::InvalidData).into())
             }
             msg::Status::VersionMismatch => {
-                if size_of::<msg::Version>() + 4 > buf.len() {
-                    buf.fill_with_reader(&mut rx).await?;
-                }
+                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Version>()))
+                    .await?;
                 let their_version = buf.read::<msg::Version>().unwrap();
                 return Err(Error::VersionMismatch(their_version));
             }
