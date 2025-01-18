@@ -1,10 +1,8 @@
-pub use lstr;
 use thiserror::Error;
 use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
 pub mod data;
 pub mod msg;
-pub mod urb;
 
 pub const QUSB_VER: msg::Version = msg::Version {
     major: 0,
@@ -65,13 +63,6 @@ where
     ///   the DST and its trailing slice.
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr>;
 }
-
-/*
-I want to send ISO packets using QUIC
-datagrams, not with QUIC streams.
-ISO packets are best effort and unreliable
-so I might as well do the same thing.
-*/
 
 #[cfg(test)]
 mod tests {}

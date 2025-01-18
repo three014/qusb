@@ -1,5 +1,4 @@
 use std::fmt::Debug;
-use std::time::{Duration, Instant};
 use std::{io, marker::PhantomData};
 
 use bytes::Buf;
@@ -98,6 +97,9 @@ where
         self.buf.is_empty()
     }
 
+    /// Splits the internal slice at `size_of::<<T as GetSliceLen>::Header>()`,
+    /// so that the first `Data` contains the header, and the second `Data`
+    /// contains the remainder of the data interpreted as type `U`.
     pub fn split<U>(mut self) -> (Data<T::Header>, Data<U>)
     where
         T: GetSliceLen,
@@ -110,6 +112,8 @@ where
 }
 
 impl Data<[u8]> {
+    /// Consumes the `Data` and returns the underlying
+    /// slice as a `BytesMut`.
     pub fn into_bytes_mut(mut self) -> BytesMut {
         std::mem::replace(&mut self.buf, BytesMut::new())
     }
@@ -153,6 +157,11 @@ pub struct Ring {
 }
 
 impl Ring {
+    /// Creates a new `Ring` with the specified
+    /// capacity.
+    ///
+    /// A call to this function with a `cap` of 0
+    /// does not allocate from the heap.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             buf: BytesMut::with_capacity(cap),
@@ -211,6 +220,14 @@ impl Ring {
             .map(|(item, _)| item)
     }
 
+    /// Copies out `size_of::<T>()` bytes from the buffer
+    /// as a pointer read operation, then consumes 
+    /// `size_of::<T>()` bytes from `Ring`.
+    ///
+    /// # Error
+    /// 
+    /// `Ring` uses `zerocopy` internally, so
+    /// this function fails if [`TryFromBytes`] fails.
     pub fn read<T>(&mut self) -> Result<T, ReadError>
     where
         T: TryFromBytes + KnownLayout + Immutable,
@@ -228,6 +245,19 @@ impl Ring {
         Ok(item)
     }
 
+    /// Advances the internal buffer by `num_bytes`.
+    ///
+    /// This does not affect the starting place to
+    /// a future call to [`Ring::fill_with_reader`].
+    ///
+    /// However, future calls to any of the reading
+    /// functions ([`Ring::peek`], [`Ring::claim_dst`],
+    /// [`Ring::read`], etc.) will start `num_bytes`
+    /// after the current start of the buffer.
+    /// 
+    /// # Panics
+    ///
+    /// This function panics if `num_bytes > self.remaining()`.
     pub fn consume(&mut self, num_bytes: usize) {
         self.buf.advance(num_bytes);
     }
@@ -247,6 +277,17 @@ impl Ring {
     //     Ok(Data::new(buf))
     // }
 
+    /// Takes ownership of the next value `T`.
+    ///
+    /// Does not copy the data, but claims a mutable portion
+    /// of the internal buffer. Therefore, if T has a custom
+    /// `Drop` implementation, then the caller must know that
+    /// dropping `Data<T>` does not call `T::drop`
+    ///
+    /// # Error
+    /// 
+    /// `Ring` uses `zerocopy` internally, so
+    /// this function fails if [`TryFromBytes`] fails.
     pub fn claim_dst<T>(&mut self) -> Result<Data<T>, ReadError>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
@@ -257,8 +298,12 @@ impl Ring {
         Ok(Data::new(buf))
     }
 
-    pub fn giveback_chunk<T: ?Sized>(&mut self, _data: Data<T>) {}
-
+    /// Returns a lazy iterator into the ring's internal
+    /// buffer that provides a `&T` for each successfully
+    /// converted `&[u8]`.
+    ///
+    /// The iterator yields `None` for the first slice that
+    /// [`TryFromBytes`] returns an error.
     pub fn iter<'a, T>(&'a self) -> impl Iterator<Item = &'a T>
     where
         T: TryFromBytes + KnownLayout + Immutable + 'a,
@@ -268,6 +313,15 @@ impl Ring {
             .map_while(|chunk| T::try_ref_from_bytes(chunk).ok())
     }
 
+    /// Returns a lazy iterator into the ring's internal
+    /// buffer that provides a `&T` for each successfully
+    /// converted `&[u8]`.
+    ///
+    /// The iterator yields `None` for the first slice that
+    /// [`TryFromBytes`] returns an error.
+    ///
+    /// This version of the function allows for DST's, and
+    /// does not require that each slice be the same size.
     pub fn iter_dst<T>(&self) -> IterDst<'_, T>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
@@ -278,6 +332,12 @@ impl Ring {
         }
     }
 
+    /// Returns a lazy iterator into the ring's internal
+    /// buffer that provides a `&mut T` for each successfully
+    /// converted `&mut [u8]`.
+    ///
+    /// The iterator yields `None` for the first slice that
+    /// [`TryFromBytes`] returns an error.
     pub fn iter_mut<'a, T>(&'a mut self) -> impl Iterator<Item = &'a mut T>
     where
         T: TryFromBytes + KnownLayout + Immutable + 'a,
@@ -287,6 +347,15 @@ impl Ring {
             .map_while(|chunk| T::try_mut_from_bytes(chunk).ok())
     }
 
+    /// Returns a lazy iterator into the ring's internal
+    /// buffer that provides a `&mut T` for each successfully
+    /// converted `&mut [u8]`.
+    ///
+    /// The iterator yields `None` for the first slice that
+    /// [`TryFromBytes`] returns an error.
+    ///
+    /// This version of the function allows for DST's, and
+    /// does not require that each slice be the same size.
     pub fn iter_mut_dst<T>(&mut self) -> IterMutDst<'_, T>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
@@ -297,6 +366,11 @@ impl Ring {
         }
     }
 
+    /// Pulls some bytes from the specified reader into `self`,
+    /// advancing the ring's internal buffer.
+    ///
+    /// On success, returns the number of bytes read into
+    /// the internal buffer.
     pub async fn fill_with_reader<R>(&mut self, mut rx: R) -> io::Result<usize>
     where
         R: AsyncRead + Unpin,
@@ -304,31 +378,38 @@ impl Ring {
         rx.read_buf(&mut self.buf).await
     }
 
+    /// Attempts to cheaply reclaim the already allocated
+    /// capacity by shifting the current data to the front
+    /// of the `Ring`. Does not indicate to the user whether
+    /// the transaction failed or succeeded.
     pub fn try_consolidate(&mut self) {
         let size = self.buf.capacity() - self.buf.len();
         let _ = self.buf.try_reclaim(size);
     }
 
+    /// Returns the number of bytes contained in this `Ring`.
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
+    /// Returns true if the `Ring` has a length of 0.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+
+    /// Returns the number of bytes between the current position 
+    /// and the end of the buffer.
+    pub fn remaining(&self) -> usize {
+        self.buf.remaining()
     }
 
     pub async fn fill_until<R>(&mut self, mut rx: R, num_bytes: usize) -> io::Result<Option<()>>
     where
         R: AsyncRead + Unpin,
     {
-        let mut now = Instant::now();
         while num_bytes > self.len() {
-            if 0 == tokio::task::unconstrained(self.fill_with_reader(&mut rx)).await? {
+            if 0 == self.fill_with_reader(&mut rx).await? {
                 return Ok(None);
-            }
-            if Duration::from_micros(50) < now.elapsed() {
-                tokio::task::yield_now().await;
-                now = Instant::now();
             }
         }
 

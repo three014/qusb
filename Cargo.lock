@@ -337,11 +337,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "limited_str"
-version = "0.1.0"
-source = "git+https://github.com/three014/limited_str.git#8c5bec6f34c9d27c525286f4edac36e9023ec8c4"
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -684,7 +679,6 @@ name = "qusb-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "limited_str",
  "thiserror 2.0.11",
  "tokio",
  "usb_vhci",

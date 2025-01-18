@@ -41,30 +41,9 @@
 //! | Offset                    | Length   | Value      | Description                                                   |
 //! |---------------------------|----------|------------|---------------------------------------------------------------|
 //! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
-//! | 1                         | 7        | 0          | zeroed bytes for align(8)                                     |
-//! |                           |          |            | From now on the devices are described, if any.                |
-//! | 4                         | 2        | P          | len(path): The length of the next field in bytes.             |
-//! |                           | 256      |            | path: Path of the device on the peer.                         |
-//! |                           | 1        | I          | len(busid): The length of the next field in bytes.            |
-//! |                           | 32       |            | busid: Bus ID of the USB device.                              |
-//! |                           | 1        |            | busnum                                                        |
-//! |                           | 1        |            | devnum                                                        |
-//! |                           | 4        |            | speed                                                         |
-//! |                           | 2        |            | idVendor                                                      |
-//! |                           | 2        |            | idProduct                                                     |
-//! |                           | 2        |            | bcdDevice                                                     |
-//! |                           | 1        |            | bDeviceClass                                                  |
-//! |                           | 1        |            | bDeviceSubClass                                               |
-//! |                           | 1        |            | bDeviceProtocol                                               |
-//! |                           | 1        |            | bConfigurationValue                                           |
-//! |                           | 1        |            | bNumConfigurations                                            |
-//! |                           | 1        | T          | bNumInterfaces                                                |
-//! |                           |          | m_0        | From now on each interface is described T times:              |
-//! |                           | 1        |            | bInterfaceNumber
-//! |                           | 1        |            | bInterfaceClass                                               |
-//! |                           | 1        |            | bInterfaceSubClass                                            |
-//! |                           | 1        |            | bInterfaceProtocol                                            |
-//! |                           |          |            | The second USB device starts at i=1 with the len(path) field. |
+//! | 1                         | 7        | 0          | Padding for align(8)                                          |
+//! | 8                         |          |            | UsbDeviceInfoHeader                                           |
+//! |                           |          |            | UsbInterfaceInfo * padded_num_interfaces                      |
 //!
 //! Non-zero status response:
 //!
