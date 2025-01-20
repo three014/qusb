@@ -75,17 +75,18 @@ async fn send_usb_data() {
 
         let devices = session.req_list_devices().await.unwrap();
 
-        // Sandisk Flash Drive: idVendor=0781, idProduct=5575
-        // Drop Keyboard: idVendor=0c45, idProduct=7016
-        let keyboard = devices
-            .iter()
-            .find(|&dev| 0x0c45 == dev.header.id_vendor && 0x7016 == dev.header.id_product)
-            .unwrap();
+        // Sandisk Flash Drive: 0781:5575
+        // Drop Keyboard: 0c45:7016
+        // Fingerprint Sensor: 27c6:63ac
+        // let keyboard = devices
+        //     .iter()
+        //     .find(|&dev| 0x27c6 == dev.header.id_vendor && 0x63ac == dev.header.id_product)
+        //     .unwrap();
 
         let usb = session
             .borrow_device(proto::msg::UsbDeviceId {
-                bus_number: keyboard.header.busnum,
-                device_addr: keyboard.header.devnum,
+                bus_number: 0x003,
+                device_addr: 0x002,
             })
             .await
             .unwrap();
