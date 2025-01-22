@@ -56,7 +56,7 @@ impl Demuxer {
         }
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn run(self) -> io::Result<()> {
         let Self {
             mut register_rx,
@@ -203,6 +203,8 @@ impl Demuxer {
                                         if !queue.contains(&stat.index()) {
                                             queue.push_back(stat.index());
                                         }
+                                        // TODO: Unlink previous address if linked
+                                        //       to this port's inbox
                                     }
                                     mailer.get_by_key1(&stat.index()).cloned()
                                 }
@@ -215,11 +217,11 @@ impl Demuxer {
                                         // TODO: The logic around here is all messed up lmao
                                         let address = Address::new(urb.setup_packet.value() as u8)
                                             .expect("host should've assigned value address");
-                                        let port = Port::new(address.get() - 1)
-                                            .expect("host should've assigned valid address");
-                                        assert_eq!(port, queue.pop_front().unwrap(), "wouldn't the new address correspond to the port currently registering its device?");
+                                        let port = queue.pop_front().unwrap();
 
                                         mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
+                                        // TODO: Alternate idea to line 206 - Allow linking operation
+                                        //       to push out old keys
                                         mailer.link_key2_to_key1(NoHash(address), &port);
                                         // assert_eq!(
                                         //     LinkResult::Success,

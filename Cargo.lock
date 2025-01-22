@@ -265,9 +265,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.7.0"
+version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62f822373a4fe84d4bb149bf54e584a7f4abec90e072ed49cda0edea5b95471f"
+checksum = "8c9c992b02b5b4c94ea26e32fe5bccb7aa7d9f390ab5c1221ff895bc7ea8b652"
 dependencies = [
  "equivalent",
  "hashbrown",
@@ -799,8 +799,8 @@ dependencies = [
 
 [[package]]
 name = "rusb_async"
-version = "0.1.0"
-source = "git+https://github.com/three014/rusb-async.git#b05ffd3adf60fc2cb591e42bc3b7f3bfe17342d0"
+version = "0.1.2"
+source = "git+https://github.com/three014/rusb-async.git#8c5c831f4162e034036e9797375cdbcdc0025794"
 dependencies = [
  "bytes",
  "rusb",

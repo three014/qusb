@@ -73,20 +73,10 @@ async fn send_usb_data() {
         let session = client.connect(addr, "localhost").await.unwrap();
         tracing::info!("Connected to {}", session.remote_address());
 
-        let devices = session.req_list_devices().await.unwrap();
-
-        // Sandisk Flash Drive: 0781:5575
-        // Drop Keyboard: 0c45:7016
-        // Fingerprint Sensor: 27c6:63ac
-        // let keyboard = devices
-        //     .iter()
-        //     .find(|&dev| 0x27c6 == dev.header.id_vendor && 0x63ac == dev.header.id_product)
-        //     .unwrap();
-
         let usb = session
             .borrow_device(proto::msg::UsbDeviceId {
-                bus_number: 0x003,
-                device_addr: 0x002,
+                bus_number: 3,
+                device_addr: 16,
             })
             .await
             .unwrap();
@@ -116,8 +106,7 @@ async fn server_with_keyboard() {
         .with_writer(log_file)
         .try_init();
 
-    let addr = common::addr(7003);
-    let server = common::dummy_server(addr);
+    let server = common::dummy_server("0.0.0.0:7400".parse().unwrap());
     let handle = server.serve();
 
     tokio::time::sleep(Duration::from_secs(120)).await;
@@ -144,9 +133,8 @@ async fn client_wants_keyboard() {
         .with_writer(log_file)
         .try_init();
 
-    let addr = common::addr(7003);
-    let client = common::dummy_trusting_client(addr);
-    let session = client.connect("10.4.31.230:7003".parse().unwrap(), "pan1.garden.lan").await.unwrap();
+    let client = common::dummy_trusting_client("0.0.0.0:7400".parse().unwrap());
+    let session = client.connect("10.4.31.230:7400".parse().unwrap(), "pan1.test.bed").await.unwrap();
     tracing::info!("Connected to {}", session.remote_address());
 
     let devices = session.req_list_devices().await.unwrap();

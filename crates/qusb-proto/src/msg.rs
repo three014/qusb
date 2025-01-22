@@ -531,61 +531,47 @@ impl GetSliceLen for QusbFrame {
     }
 }
 
-// #[derive(KnownLayout, Immutable, IntoBytes, FromBytes)]
-// #[repr(C)]
-// pub struct DeviceDescriptor {
-//     pub b_length: u8,
-//     pub b_descriptor_type: u8,
-//     pub bcd_usb: u16,
-//     pub b_device_class: u8,
-//     pub b_device_subclass: u8,
-//     pub b_device_protocol: u8,
-//     pub b_max_packet_size0: u8,
-//     pub id_vendor: u16,
-//     pub id_product: u16,
-//     pub bcd_device: u16,
-//     pub i_manufacturer: u8,
-//     pub i_product: u8,
-//     pub i_serial_number: u8,
-//     pub b_num_configurations: u8,
-// }
+#[derive(KnownLayout, Immutable, IntoBytes, FromBytes)]
+#[repr(C)]
+pub struct DeviceDescriptor {
+    pub b_length: u8,
+    pub b_descriptor_type: u8,
+    pub bcd_usb: u16,
+    pub b_device_class: u8,
+    pub b_device_subclass: u8,
+    pub b_device_protocol: u8,
+    pub b_max_packet_size0: u8,
+    pub id_vendor: u16,
+    pub id_product: u16,
+    pub bcd_device: u16,
+    pub i_manufacturer: u8,
+    pub i_product: u8,
+    pub i_serial_number: u8,
+    pub b_num_configurations: u8,
+}
 
-// pub trait SendUrb {
-//     fn urb(&self) -> &UrbHeader;
-//     fn transfer(&self) -> &Transfer;
-//     fn transfer_mut(&mut self) -> &mut Transfer;
-//     fn iso_packets_tx(&self) -> &IsoPacketData;
-//     fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData;
-//     fn iso_packets_rx(&self) -> &IsoPacketGiveback;
-//     fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback;
-// }
+pub mod mass_storage {
+    use zerocopy::little_endian::U32;
+    use zerocopy_derive::*;
 
-// impl<T: SendUrb> SendUrb for &mut T {
-//     fn urb(&self) -> &UrbHeader {
-//         T::urb(self)
-//     }
+    #[derive(Debug, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
+    #[repr(C)]
+    pub struct CommandBlockWrapper {
+        pub d_cbw_signature: [u8; 4],
+        pub d_cbw_tag: U32,
+        pub d_cbw_data_transfer_length: U32,
+        pub bm_cbw_flags: u8,
+        pub b_cbw_lun: u8,
+        pub b_cbw_cb_length: u8,
+        pub cbw_cb: [u8; 16],
+    }
 
-//     fn transfer(&self) -> &Transfer {
-//         T::transfer(self)
-//     }
-
-//     fn transfer_mut(&mut self) -> &mut Transfer {
-//         T::transfer_mut(self)
-//     }
-
-//     fn iso_packets_tx(&self) -> &IsoPacketData {
-//         T::iso_packets_tx(self)
-//     }
-
-//     fn iso_packets_tx_mut(&mut self) -> &mut IsoPacketData {
-//         T::iso_packets_tx_mut(self)
-//     }
-
-//     fn iso_packets_rx(&self) -> &IsoPacketGiveback {
-//         T::iso_packets_rx(self)
-//     }
-
-//     fn iso_packets_rx_mut(&mut self) -> &mut IsoPacketGiveback {
-//         T::iso_packets_rx_mut(self)
-//     }
-// }
+    #[derive(Debug, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
+    #[repr(C)]
+    pub struct CommandStatusWrapper {
+        pub d_cbw_signature: [u8; 4],
+        pub d_cbw_tag: U32,
+        pub d_cbw_data_residue: U32,
+        pub bm_cbw_status: u8,
+    }
+}

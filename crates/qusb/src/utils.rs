@@ -655,4 +655,19 @@ mod tests {
         let index = mailer.key1_map.get(&Port::new(5).unwrap()).unwrap();
         assert_eq!(*index, 0);
     }
+
+    #[test]
+    fn align_zero_to_zero() {
+        assert_eq!(align_to_usize(0), 0);
+    }
+
+    #[test]
+    fn align_seven_to_eight() {
+        assert_eq!(align_to_usize(7), 8);
+    }
+
+    #[test]
+    fn align_eight_to_eight() {
+        assert_eq!(align_to_usize(8), 8);
+    }
 }
