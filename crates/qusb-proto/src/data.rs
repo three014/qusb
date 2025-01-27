@@ -129,10 +129,9 @@ impl<T: ?Sized> Drop for Data<T> {
 pub enum ReadError {
     #[error("data doesn't match the type")]
     CorruptedData,
-    #[error("buffer is too short to read the provided type (missing >{num_bytes_needed} bytes, buf.len() == {buf_len})")]
+    #[error("buffer is too short to read the provided type (missing >{num_bytes_needed} bytes)")]
     BufferShort {
         num_bytes_needed: usize,
-        buf_len: usize,
     },
 }
 
@@ -142,10 +141,8 @@ impl From<GetSliceLenErr> for ReadError {
             GetSliceLenErr::NoConfidence => ReadError::CorruptedData,
             GetSliceLenErr::BufferShort {
                 num_bytes_needed,
-                buf_len,
             } => ReadError::BufferShort {
                 num_bytes_needed,
-                buf_len,
             },
         }
     }
@@ -180,7 +177,6 @@ impl Ring {
         if self.buf.len() < size_of_t {
             return Err(ReadError::BufferShort {
                 num_bytes_needed: size_of_t - self.buf.len(),
-                buf_len: self.buf.len(),
             });
         }
         T::try_ref_from_bytes(&self.buf[..size_of_t]).map_err(|_| ReadError::CorruptedData)
@@ -204,7 +200,6 @@ impl Ring {
         if self.buf.len() < size_of {
             return Err(ReadError::BufferShort {
                 num_bytes_needed: size_of - self.buf.len(),
-                buf_len: self.buf.len(),
             });
         }
         T::try_mut_from_bytes(&mut self.buf[..size_of]).map_err(|_| ReadError::CorruptedData)
@@ -236,7 +231,6 @@ impl Ring {
         if self.buf.len() < size_of {
             return Err(ReadError::BufferShort {
                 num_bytes_needed: size_of - self.buf.len(),
-                buf_len: self.buf.len(),
             });
         }
         let item =

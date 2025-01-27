@@ -14,3 +14,7 @@ version of this crate by the end of January 2025.
 **Update 01/15/2025**: Control and Interrupt transfers work! With some modifications to the
 `rusb` crate and the addition of my own `rusb-async` crate, I took advantage of libusb's
 asynchronous transfer api. 
+
+**Update 01/27/2025**: Mass storage devices work! However I haven't figured out how to smoothly
+allow the OS to unmount the drives, so for now I believe unmounting a drive may slightly corrupt
+the data on the drive. :D

@@ -17,10 +17,9 @@ pub enum GetSliceLenErr {
     #[error("impl is not confident that the obtained length is valid for the slice")]
     NoConfidence,
     /// Buffer is too short to read the slice length.
-    #[error("buffer is too short to read the slice length (missing >{num_bytes_needed} bytes, buf.len() == {buf_len})")]
+    #[error("buffer is too short to read the slice length (missing >{num_bytes_needed} bytes")]
     BufferShort {
         num_bytes_needed: usize,
-        buf_len: usize
     },
 }
 
@@ -58,7 +57,7 @@ where
     ///
     /// # Assumptions
     ///
-    /// - The bytes of `buf` are in network endian
+    /// - The bytes of `buf` are in little endian
     /// - `buf` may not be exactly the length of
     ///   the DST and its trailing slice.
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr>;

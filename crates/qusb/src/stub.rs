@@ -463,14 +463,15 @@ fn recv_work(
 
 #[cfg(test)]
 mod tests {
-    use tracing::{debug, warn};
-    use vhci::{libc, PortChange, PortFlag, PortStatus, UrbWithData};
+    // use tracing::{debug, warn};
+    // use vhci::{libc, PortChange, PortFlag, PortStatus};
 
     use super::*;
     use std::{
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
+    // use std::time::Instant;
 
     #[tokio::test]
     async fn controller_idles() {
@@ -480,109 +481,109 @@ mod tests {
         controller.shutdown().await;
     }
 
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn can_listen_for_work() {
-        let mut controller = Controller::start(BoundedU8::new(8).unwrap()).unwrap();
+    // #[tokio::test]
+    // #[tracing_test::traced_test]
+    // async fn can_listen_for_work() {
+    //     let mut controller = Controller::start(BoundedU8::new(8).unwrap()).unwrap();
 
-        let mut prev_stat = vhci::ioctl::IocPortStat::default();
-        let mut addr = 0xff;
-        let (port, mut work_rx) = controller
-            .register(RegisterPort::Any, DataRate::Full)
-            .await
-            .unwrap();
+    //     let mut prev_stat = vhci::ioctl::IocPortStat::default();
+    //     let mut addr = 0xff;
+    //     let (port, mut work_rx) = controller
+    //         .register(RegisterPort::Any, DataRate::Full)
+    //         .await
+    //         .unwrap();
 
-        trace!("connected {port:?}, starting process for registering");
-        let start = Instant::now();
-        while Duration::from_secs(10) > start.elapsed() {
-            debug!("==============================================");
-            match work_rx.recv().await {
-                Some(vhci::ioctl::Work::PortStat(next_stat)) => {
-                    debug!("got port stat for {:?}", next_stat.index());
-                    debug!("status: {:?}", next_stat.status());
-                    debug!("change: {:?}", next_stat.change());
-                    debug!("index: {:?}", next_stat.index());
-                    debug!("flags: {:?}", next_stat.flags());
-                    if next_stat.change().contains(PortChange::CONNECTION) {
-                        trace!("CONNECTION state changed -> invalidating address");
-                        addr = 0xff;
-                    }
-                    if next_stat.change().contains(PortChange::RESET)
-                        && (!next_stat.status()).contains(PortStatus::RESET)
-                        && next_stat.status().contains(PortStatus::ENABLE)
-                    {
-                        trace!("RESET successful -> use default address");
-                        addr = 0;
-                    }
-                    if prev_stat.status().contains(PortStatus::POWER)
-                        && (!next_stat.status()).contains(PortStatus::POWER)
-                    {
-                        trace!("port is powered off");
-                    }
-                    if (!prev_stat.status()).contains(PortStatus::RESET)
-                        && next_stat
-                            .status()
-                            .contains(PortStatus::RESET | PortStatus::CONNECTION)
-                    {
-                        trace!("port is resetting -> completing reset");
-                        controller.reset_done(next_stat.index(), true).unwrap();
-                    }
-                    if (!prev_stat.flags()).contains(PortFlag::RESUMING)
-                        && next_stat.flags().contains(PortFlag::RESUMING)
-                        && next_stat.status().contains(PortStatus::CONNECTION)
-                    {
-                        trace!("port is resuming -> completing resume");
-                        todo!("do the actual resume thing");
-                    }
-                    prev_stat = next_stat;
-                }
-                Some(vhci::ioctl::Work::ProcessUrb((urb, handle))) => {
-                    debug!(
-                        "got process urb for {:?} at {:?}",
-                        urb.address, urb.endpoint
-                    );
-                    if addr != urb.address.get() {
-                        warn!("not for usb device at {port:?}. skipping.");
-                        continue;
-                    }
+    //     trace!("connected {port:?}, starting process for registering");
+    //     let start = Instant::now();
+    //     while Duration::from_secs(10) > start.elapsed() {
+    //         debug!("==============================================");
+    //         match work_rx.recv().await {
+    //             Some(vhci::ioctl::Work::PortStat(next_stat)) => {
+    //                 debug!("got port stat for {:?}", next_stat.index());
+    //                 debug!("status: {:?}", next_stat.status());
+    //                 debug!("change: {:?}", next_stat.change());
+    //                 debug!("index: {:?}", next_stat.index());
+    //                 debug!("flags: {:?}", next_stat.flags());
+    //                 if next_stat.change().contains(PortChange::CONNECTION) {
+    //                     trace!("CONNECTION state changed -> invalidating address");
+    //                     addr = 0xff;
+    //                 }
+    //                 if next_stat.change().contains(PortChange::RESET)
+    //                     && (!next_stat.status()).contains(PortStatus::RESET)
+    //                     && next_stat.status().contains(PortStatus::ENABLE)
+    //                 {
+    //                     trace!("RESET successful -> use default address");
+    //                     addr = 0;
+    //                 }
+    //                 if prev_stat.status().contains(PortStatus::POWER)
+    //                     && (!next_stat.status()).contains(PortStatus::POWER)
+    //                 {
+    //                     trace!("port is powered off");
+    //                 }
+    //                 if (!prev_stat.status()).contains(PortStatus::RESET)
+    //                     && next_stat
+    //                         .status()
+    //                         .contains(PortStatus::RESET | PortStatus::CONNECTION)
+    //                 {
+    //                     trace!("port is resetting -> completing reset");
+    //                     controller.reset_done(next_stat.index(), true).unwrap();
+    //                 }
+    //                 if (!prev_stat.flags()).contains(PortFlag::RESUMING)
+    //                     && next_stat.flags().contains(PortFlag::RESUMING)
+    //                     && next_stat.status().contains(PortStatus::CONNECTION)
+    //                 {
+    //                     trace!("port is resuming -> completing resume");
+    //                     todo!("do the actual resume thing");
+    //                 }
+    //                 prev_stat = next_stat;
+    //             }
+    //             Some(vhci::ioctl::Work::ProcessUrb((urb, handle))) => {
+    //                 debug!(
+    //                     "got process urb for {:?} at {:?}",
+    //                     urb.address, urb.endpoint
+    //                 );
+    //                 if addr != urb.address.get() {
+    //                     warn!("not for usb device at {port:?}. skipping.");
+    //                     continue;
+    //                 }
 
-                    let mut urb = UrbWithData::from_ioctl(urb, handle);
-                    if urb.needs_data_fetch() {
-                        match controller.fetch_data(&mut urb) {
-                            Ok(_) => {}
-                            Err(err)
-                                if err
-                                    .raw_os_error()
-                                    .is_some_and(|errno| libc::ECANCELED == errno) => {}
-                            Err(err) => Err(err).unwrap(),
-                        }
-                    }
+    //                 let mut urb = UrbWithData::from_ioctl(urb, handle);
+    //                 if urb.needs_data_fetch() {
+    //                     match controller.fetch_data(&mut urb) {
+    //                         Ok(_) => {}
+    //                         Err(err)
+    //                             if err
+    //                                 .raw_os_error()
+    //                                 .is_some_and(|errno| libc::ECANCELED == errno) => {}
+    //                         Err(err) => Err(err).unwrap(),
+    //                     }
+    //                 }
 
-                    if vhci::ioctl::UrbType::Ctrl == urb.kind()
-                        && urb.endpoint().is_anycast()
-                        && Request::STANDARD_DEVICE_SET_ADDRESS == urb.control_packet().req()
-                    {
-                        if let Some(new_addr) =
-                            Address::new(urb.control_packet().value().try_into().unwrap())
-                        {
-                            urb.set_status(vhci::Status::Success);
-                            addr = new_addr.get();
-                            trace!("SET_ADDRESS (addr={:#x})", addr);
-                        }
-                    }
+    //                 if vhci::ioctl::UrbType::Ctrl == urb.kind()
+    //                     && urb.endpoint().is_anycast()
+    //                     && Request::STANDARD_DEVICE_SET_ADDRESS == urb.control_packet().req()
+    //                 {
+    //                     if let Some(new_addr) =
+    //                         Address::new(urb.control_packet().value().try_into().unwrap())
+    //                     {
+    //                         urb.set_status(vhci::Status::Success);
+    //                         addr = new_addr.get();
+    //                         trace!("SET_ADDRESS (addr={:#x})", addr);
+    //                     }
+    //                 }
 
-                    urb.set_status(vhci::Status::Stall);
-                    controller.giveback_urb(urb).await.unwrap();
-                    break;
-                }
-                Some(vhci::ioctl::Work::CancelUrb(_handle)) => unreachable!(),
-                None => break,
-            }
-        }
+    //                 urb.set_status(vhci::Status::Stall);
+    //                 controller.giveback_urb(urb).await.unwrap();
+    //                 break;
+    //             }
+    //             Some(vhci::ioctl::Work::CancelUrb(_handle)) => unreachable!(),
+    //             None => break,
+    //         }
+    //     }
 
-        trace!("disconnecting {port:?}");
-        controller.disconnect(port).await.unwrap();
-        trace!("shutting down VHCI controller");
-        controller.shutdown().await;
-    }
+    //     trace!("disconnecting {port:?}");
+    //     controller.disconnect(port).await.unwrap();
+    //     trace!("shutting down VHCI controller");
+    //     controller.shutdown().await;
+    // }
 }

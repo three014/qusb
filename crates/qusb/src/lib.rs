@@ -143,8 +143,16 @@ impl vhci::Urb for UrbWithIsoData<'_> {
         self.header.status
     }
 
-    fn endpoint(&self) -> vhci::ioctl::Endpoint {
-        self.header.endpoint
+    fn dir(&self) -> vhci::usbfs::Dir {
+        if vhci::ioctl::UrbType::Ctrl == self.kind() {
+            self.header.ctrl_packet.req().dir()
+        } else {
+            self.header.endpoint.direction()
+        }
+    }
+
+    fn bytes_transferred(&self) -> u16 {
+        self.header.actual_transfer_len
     }
 }
 
@@ -181,8 +189,16 @@ impl vhci::Urb for UrbWithIsoGiveback<'_> {
         self.header.status
     }
 
-    fn endpoint(&self) -> vhci::ioctl::Endpoint {
-        self.header.endpoint
+    fn dir(&self) -> vhci::usbfs::Dir {
+        if vhci::ioctl::UrbType::Ctrl == self.kind() {
+            self.header.ctrl_packet.req().dir()
+        } else {
+            self.header.endpoint.direction()
+        }
+    }
+
+    fn bytes_transferred(&self) -> u16 {
+        self.header.actual_transfer_len
     }
 }
 

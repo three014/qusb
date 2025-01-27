@@ -1288,8 +1288,8 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "usb_vhci"
-version = "0.1.0"
-source = "git+https://github.com/three014/usb_vhci#d4b836dbf689f2b1020368d8dc324759c5a91f57"
+version = "0.2.0"
+source = "git+https://github.com/three014/usb_vhci#adc9a7c6ec3fdaa019b40a39f5ab8db02169bfb1"
 dependencies = [
  "bit-vec",
  "bitflags",
