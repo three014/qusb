@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::Instant,
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -187,6 +187,7 @@ impl Demuxer {
                 Event::Work(ioc_work) => {
                     let ctx = Arc::clone(&ctx);
                     set.spawn(async move {
+                        let now = Instant::now();
                         // SAFETY: Per the function's safety contract,
                         //         the work item is unaltered from the
                         //         ioctl call.
@@ -208,11 +209,14 @@ impl Demuxer {
                                     }
                                     mailer.get_by_key1(&stat.index()).cloned()
                                 }
-                                vhci::ioctl::Work::ProcessUrb((ref urb, ref handle)) => match urb.typ {
+                                vhci::ioctl::Work::ProcessUrb((ref urb, ref handle)) => match urb
+                                    .typ
+                                {
                                     vhci::ioctl::UrbType::Ctrl
                                         if urb.endpoint.is_anycast()
                                             && !queue.is_empty()
-                                            && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
+                                            && Request::STANDARD_DEVICE_SET_ADDRESS
+                                                == urb.setup_packet.req() =>
                                     {
                                         // TODO: The logic around here is all messed up lmao
                                         let address = Address::new(urb.setup_packet.value() as u8)
@@ -283,10 +287,14 @@ impl Demuxer {
                             }
                         };
 
+                        let elapsed = now.elapsed();
+                        trace!("took {elapsed:?} to route work item");
                         if let Some(tx) = tx {
                             if tx.send(work).await.is_err() {
                                 // TODO: Remove by which key? By the value itself?
                             }
+                        } else {
+                            trace!("received work item that belonged to no port");
                         }
                         Continuation::Other
                     });

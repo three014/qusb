@@ -1,13 +1,5 @@
 use core::fmt;
-use std::{
-    collections::HashMap,
-    fs,
-    hash::Hash,
-    io,
-    num::ParseIntError,
-    path::Path,
-    str::FromStr,
-};
+use std::{collections::HashMap, fs, hash::Hash, io, num::ParseIntError, path::Path, str::FromStr};
 
 use nohash_hasher::IsEnabled;
 

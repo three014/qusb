@@ -150,7 +150,7 @@ impl vhci::Urb for UrbWithIsoData<'_> {
 
 impl vhci::TransferMut for UrbWithIsoData<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
-        &mut self.transfer[..self.header.transfer_actual_len as usize]
+        self.transfer
     }
 }
 
@@ -188,7 +188,7 @@ impl vhci::Urb for UrbWithIsoGiveback<'_> {
 
 impl vhci::TransferMut for UrbWithIsoGiveback<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
-        &mut self.transfer[..self.header.transfer_actual_len as usize]
+        self.transfer
     }
 }
 

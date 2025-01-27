@@ -46,7 +46,7 @@ async fn list_devices_works() {
 }
 
 #[tokio::test]
-async fn send_usb_data() {
+async fn borrow_self_dev() {
     let log_path = "log.txt";
     let log_file = std::fs::File::options()
         .create(true)
@@ -56,11 +56,7 @@ async fn send_usb_data() {
         .open(log_path)
         .unwrap();
     _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .parse("none,qusb=trace")
-                .unwrap(),
-        )
+        .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
         .with_line_number(true)
         .with_writer(log_file)
         .try_init();
@@ -75,8 +71,8 @@ async fn send_usb_data() {
 
         let usb = session
             .borrow_device(proto::msg::UsbDeviceId {
-                bus_number: 3,
-                device_addr: 16,
+                bus_number: 1,
+                device_addr: 2,
             })
             .await
             .unwrap();
@@ -97,11 +93,7 @@ async fn server_with_keyboard() {
         .open(log_path)
         .unwrap();
     _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .parse("none,qusb=trace")
-                .unwrap(),
-        )
+        .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
         .with_line_number(true)
         .with_writer(log_file)
         .try_init();
@@ -124,17 +116,16 @@ async fn client_wants_keyboard() {
         .open(log_path)
         .unwrap();
     _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .parse("none,qusb=trace")
-                .unwrap(),
-        )
+        .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
         .with_line_number(true)
         .with_writer(log_file)
         .try_init();
 
     let client = common::dummy_trusting_client("0.0.0.0:7400".parse().unwrap());
-    let session = client.connect("10.4.31.230:7400".parse().unwrap(), "pan1.test.bed").await.unwrap();
+    let session = client
+        .connect("10.4.31.230:7400".parse().unwrap(), "pan1.test.bed")
+        .await
+        .unwrap();
     tracing::info!("Connected to {}", session.remote_address());
 
     let devices = session.req_list_devices().await.unwrap();
