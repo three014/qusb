@@ -50,14 +50,23 @@ sudo modprobe ./usb-vhci-iocifc.ko
 ```
 
 Now back to this repo. The `crates/qusb/` folder is where the main project code is, and
-`cargo build` should be all you need to get it working. Once you have the project built, then 
-take a look at the "integration tests" in the `tests/` folder.
+`cargo build` should be all you need to get it working. 
+
+```
+git clone https://github.com/three014/qusb.git
+cd qusb/crates/qusb
+cargo build
+```
+
+Once you have the project built, then 
+take a look at the integration tests in the `tests/` folder.
 
 To run a test, you need root privleges for now, unless you change the permissions
 on `/dev/vhci` (I believe) and change the udev rules for USB device access.
 
-Here's an example test run for sharing a USB device on the same machine. Before running
-this though, use `lsusb` to choose a device to test, then edit the test
+Here's an example test run for sharing a USB device on the same machine. 
+
+Before running this test, use `lsusb` to choose a device to test, then edit the test
 `borrow_self_dev()` in `tests/integration_test.rs` to use the correct `bus_number` 
 and `device_addr`.
 
