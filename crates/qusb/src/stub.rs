@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::Duration,
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -14,7 +14,7 @@ use vhci::{
     DataRate, Port, PortChange, PortStatus,
 };
 
-use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap};
+use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, Timer};
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -174,6 +174,7 @@ impl Demuxer {
                     let ctx = Arc::clone(&ctx);
                     set.spawn_blocking(move || {
                         let mut mailer = ctx.mailer.lock().unwrap();
+                        // BUG: Why would this be None?
                         assert!(mailer.remove_by_key1(&port).is_some(), "{port:?}");
                         let mut queue = ctx.register_queue.lock().unwrap();
                         if let Some(index) = queue.iter().position(|queue_port| port == *queue_port)
@@ -185,129 +186,118 @@ impl Demuxer {
                     });
                 }
                 Event::Work(ioc_work) => {
-                    let ctx = Arc::clone(&ctx);
-                    set.spawn(async move {
-                        let now = Instant::now();
-                        // SAFETY: Per the function's safety contract,
-                        //         the work item is unaltered from the
-                        //         ioctl call.
-                        let work = unsafe { ioc_work.into_inner() };
-                        let tx = {
-                            let mut queue = ctx.register_queue.lock().unwrap();
-                            let mut mailer = ctx.mailer.lock().unwrap();
-                            match work {
-                                vhci::ioctl::Work::PortStat(ref stat) => {
-                                    if stat.change().contains(PortChange::RESET)
-                                        && (!stat.status()).contains(PortStatus::RESET)
-                                        && stat.status().contains(PortStatus::ENABLE)
-                                    {
-                                        if !queue.contains(&stat.index()) {
-                                            queue.push_back(stat.index());
-                                        }
-                                        // TODO: Unlink previous address if linked
-                                        //       to this port's inbox
-                                    }
-                                    mailer.get_by_key1(&stat.index()).cloned()
-                                }
-                                vhci::ioctl::Work::ProcessUrb((ref urb, ref handle)) => match urb
-                                    .typ
+                    let timer = Timer::start();
+                    // SAFETY: Per the function's safety contract,
+                    //         the work item is unaltered from the
+                    //         ioctl call.
+                    let work = unsafe { ioc_work.into_inner() };
+                    let tx = {
+                        let mut queue = ctx.register_queue.lock().unwrap();
+                        let mut mailer = ctx.mailer.lock().unwrap();
+                        match work {
+                            vhci::ioctl::Work::PortStat(ref stat) => {
+                                if stat.change().contains(PortChange::RESET)
+                                    && (!stat.status()).contains(PortStatus::RESET)
+                                    && stat.status().contains(PortStatus::ENABLE)
                                 {
-                                    vhci::ioctl::UrbType::Ctrl
-                                        if urb.endpoint.is_anycast()
-                                            && !queue.is_empty()
-                                            && Request::STANDARD_DEVICE_SET_ADDRESS
-                                                == urb.setup_packet.req() =>
-                                    {
-                                        // TODO: The logic around here is all messed up lmao
-                                        let address = Address::new(urb.setup_packet.value() as u8)
-                                            .expect("host should've assigned value address");
-                                        let port = queue.pop_front().unwrap();
+                                    if !queue.contains(&stat.index()) {
+                                        queue.push_back(stat.index());
+                                        mailer.unlink_all_but_key1(&stat.index());
+                                    }
+                                }
+                                mailer.get_by_key1(&stat.index()).cloned()
+                            }
+                            vhci::ioctl::Work::ProcessUrb((ref urb, ref handle)) => match urb.typ {
+                                vhci::ioctl::UrbType::Ctrl
+                                    if urb.address.is_for_unassigned()
+                                        && urb.endpoint.is_anycast()
+                                        && !queue.is_empty()
+                                        && Request::STANDARD_DEVICE_SET_ADDRESS
+                                            == urb.setup_packet.req() =>
+                                {
+                                    // TODO: The logic around here is all messed up lmao
+                                    let address = Address::new(urb.setup_packet.value() as u8)
+                                        .expect("host should've assigned value address");
+                                    let port = queue.pop_front().unwrap();
 
-                                        mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
-                                        // TODO: Alternate idea to line 206 - Allow linking operation
-                                        //       to push out old keys
-                                        mailer.link_key2_to_key1(NoHash(address), &port);
-                                        // assert_eq!(
-                                        //     LinkResult::Success,
-                                        //     ctx.mailer.link_key2_to_key1(NoHash(address), &port),
-                                        //     "{address:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                        //     dbg_register_inprogress_bucket,
-                                        //     dbg_register_complete_bucket,
-                                        //     dbg_urb_bucket
-                                        // );
-                                        assert_eq!(
-                                            LinkResult::Success,
-                                            mailer.link_key3_to_key1(*handle, &port),
-                                            // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                            // dbg_register_inprogress_bucket,
-                                            // dbg_register_complete_bucket,
-                                            // dbg_urb_bucket
-                                        );
-                                        // dbg_register_complete_bucket.insert(handle);
-                                        // dbg_register_inprogress_bucket.remove(&handle);
-                                        mailer.get_by_key1(&port).cloned()
-                                    }
-                                    vhci::ioctl::UrbType::Ctrl
-                                        if urb.endpoint.is_anycast() && !queue.is_empty() =>
-                                    {
-                                        let port = queue.front().copied().unwrap();
-                                        assert_eq!(
-                                            LinkResult::Success,
-                                            mailer.link_key3_to_key1(*handle, &port),
-                                            // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                            // dbg_register_inprogress_bucket,
-                                            // dbg_register_complete_bucket,
-                                            // dbg_urb_bucket
-                                        );
-                                        // dbg_register_inprogress_bucket.insert(handle);
-                                        mailer.get_by_key1(&port).cloned()
-                                    }
-                                    _ => {
-                                        let address = NoHash(urb.address);
-                                        match mailer.link_key3_to_key2(*handle, &address) {
-                                            LinkResult::Success => {
+                                    mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
+                                    // TODO: Alternate idea to line 206 - Allow linking operation
+                                    //       to push out old keys
+                                    mailer.link_key2_to_key1(NoHash(address), &port);
+                                    // assert_eq!(
+                                    //     LinkResult::Success,
+                                    //     ctx.mailer.link_key2_to_key1(NoHash(address), &port),
+                                    //     "{address:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                    //     dbg_register_inprogress_bucket,
+                                    //     dbg_register_complete_bucket,
+                                    //     dbg_urb_bucket
+                                    // );
+                                    assert_eq!(
+                                        LinkResult::Success,
+                                        mailer.link_key3_to_key1(*handle, &port),
+                                        // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                        // dbg_register_inprogress_bucket,
+                                        // dbg_register_complete_bucket,
+                                        // dbg_urb_bucket
+                                    );
+                                    // dbg_register_complete_bucket.insert(handle);
+                                    // dbg_register_inprogress_bucket.remove(&handle);
+                                    mailer.get_by_key1(&port).cloned()
+                                }
+                                vhci::ioctl::UrbType::Ctrl
+                                    if urb.address.is_for_unassigned() && !queue.is_empty() =>
+                                {
+                                    let port = queue.front().copied().unwrap();
+                                    assert_eq!(
+                                        LinkResult::Success,
+                                        mailer.link_key3_to_key1(*handle, &port),
+                                        // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
+                                        // dbg_register_inprogress_bucket,
+                                        // dbg_register_complete_bucket,
+                                        // dbg_urb_bucket
+                                    );
+                                    // dbg_register_inprogress_bucket.insert(handle);
+                                    mailer.get_by_key1(&port).cloned()
+                                }
+                                _ => {
+                                    let address = NoHash(urb.address);
+                                    match mailer.link_key3_to_key2(*handle, &address) {
+                                            LinkResult::Success | LinkResult::NewKeyAlreadyExists => {
                                                 // dbg_urb_bucket.insert(handle);
                                                 mailer.get_by_key2(&address).cloned()
                                             }
-                                            LinkResult::NewKeyAlreadyExists => None,
                                             LinkResult::ExistingKeyDoesNotExist => panic!(
+                                                "key {address:?} does not exist, was trying to link {handle:?}"
                                                 // "LinkResult::ExistingKeyDoesNotExist\nurb: {urb:?}\n{handle:?}/{address:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
                                                 // dbg_register_inprogress_bucket,
                                                 // dbg_register_complete_bucket,
                                                 // dbg_urb_bucket
                                             ),
                                         }
-                                    }
-                                },
-                                vhci::ioctl::Work::CancelUrb(ref handle) => {
-                                    let tx = mailer.get_by_key3(handle).cloned();
-                                    mailer.remove_by_key3(handle);
-                                    tx
                                 }
+                            },
+                            vhci::ioctl::Work::CancelUrb(ref handle) => {
+                                let tx = mailer.get_by_key3(handle).cloned();
+                                mailer.remove_by_key3(handle);
+                                tx
                             }
-                        };
-
-                        let elapsed = now.elapsed();
-                        trace!("took {elapsed:?} to route work item");
-                        if let Some(tx) = tx {
-                            if tx.send(work).await.is_err() {
-                                // TODO: Remove by which key? By the value itself?
-                            }
-                        } else {
-                            trace!("received work item that belonged to no port");
                         }
-                        Continuation::Other
-                    });
+                    };
+
+                    timer.stop_and_report(Some(Duration::from_micros(5)), "routing work item");
+                    if let Some(tx) = tx {
+                        if tx.send(work).await.is_err() {
+                            // TODO: Remove by which key? By the value itself?
+                        }
+                    } else {
+                        trace!("received work item that belonged to no port: {work:?}");
+                    }
                 }
                 Event::Task(Some(Ok(Continuation::Register((Ok(port), tx))))) => {
                     let (work_tx, work_rx) = mpsc::channel(32);
-                    // TODO: Remove queue stuff because the work_queue task handles this now
-                    let mut queue = ctx.register_queue.lock().unwrap();
-                    queue.push_back(port);
                     let mut mailer = ctx.mailer.lock().unwrap();
                     assert!(mailer.insert_by_key1(port, work_tx).is_none(), "{port:?}");
                     if tx.send(Ok((port, work_rx))).is_err() {
-                        queue.pop_back();
                         mailer.remove_by_key1(&port);
                     }
                 }
@@ -467,10 +457,7 @@ mod tests {
     // use vhci::{libc, PortChange, PortFlag, PortStatus};
 
     use super::*;
-    use std::{
-        thread,
-        time::Duration,
-    };
+    use std::{thread, time::Duration};
     // use std::time::Instant;
 
     #[tokio::test]

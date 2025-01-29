@@ -72,7 +72,7 @@ async fn borrow_self_dev() {
         let usb = session
             .borrow_device(proto::msg::UsbDeviceId {
                 bus_number: 3,
-                device_addr: 3,
+                device_addr: 55,
             })
             .await
             .unwrap();

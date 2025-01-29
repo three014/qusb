@@ -130,20 +130,16 @@ pub enum ReadError {
     #[error("data doesn't match the type")]
     CorruptedData,
     #[error("buffer is too short to read the provided type (missing >{num_bytes_needed} bytes)")]
-    BufferShort {
-        num_bytes_needed: usize,
-    },
+    BufferShort { num_bytes_needed: usize },
 }
 
 impl From<GetSliceLenErr> for ReadError {
     fn from(value: GetSliceLenErr) -> Self {
         match value {
             GetSliceLenErr::NoConfidence => ReadError::CorruptedData,
-            GetSliceLenErr::BufferShort {
-                num_bytes_needed,
-            } => ReadError::BufferShort {
-                num_bytes_needed,
-            },
+            GetSliceLenErr::BufferShort { num_bytes_needed } => {
+                ReadError::BufferShort { num_bytes_needed }
+            }
         }
     }
 }
@@ -216,11 +212,11 @@ impl Ring {
     }
 
     /// Copies out `size_of::<T>()` bytes from the buffer
-    /// as a pointer read operation, then consumes 
+    /// as a pointer read operation, then consumes
     /// `size_of::<T>()` bytes from `Ring`.
     ///
     /// # Error
-    /// 
+    ///
     /// `Ring` uses `zerocopy` internally, so
     /// this function fails if [`TryFromBytes`] fails.
     pub fn read<T>(&mut self) -> Result<T, ReadError>
@@ -248,7 +244,7 @@ impl Ring {
     /// functions ([`Ring::peek`], [`Ring::claim_dst`],
     /// [`Ring::read`], etc.) will start `num_bytes`
     /// after the current start of the buffer.
-    /// 
+    ///
     /// # Panics
     ///
     /// This function panics if `num_bytes > self.remaining()`.
@@ -279,7 +275,7 @@ impl Ring {
     /// dropping `Data<T>` does not call `T::drop`
     ///
     /// # Error
-    /// 
+    ///
     /// `Ring` uses `zerocopy` internally, so
     /// this function fails if [`TryFromBytes`] fails.
     pub fn claim_dst<T>(&mut self) -> Result<Data<T>, ReadError>
@@ -391,7 +387,7 @@ impl Ring {
         self.buf.is_empty()
     }
 
-    /// Returns the number of bytes between the current position 
+    /// Returns the number of bytes between the current position
     /// and the end of the buffer.
     pub fn remaining(&self) -> usize {
         self.buf.remaining()

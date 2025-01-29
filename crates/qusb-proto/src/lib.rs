@@ -18,9 +18,7 @@ pub enum GetSliceLenErr {
     NoConfidence,
     /// Buffer is too short to read the slice length.
     #[error("buffer is too short to read the slice length (missing >{num_bytes_needed} bytes")]
-    BufferShort {
-        num_bytes_needed: usize,
-    },
+    BufferShort { num_bytes_needed: usize },
 }
 
 /// You received a DST from the internet in the

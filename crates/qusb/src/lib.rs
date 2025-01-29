@@ -12,10 +12,9 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument};
 use usb_ids::UsbIds;
 use utils::{align_to_usize, CloseStream};
 use vhci::utils::BoundedU8;
@@ -538,7 +537,7 @@ impl ReqHandler {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn run(self) -> Result<()> {
+    async fn handle_req(self) -> Result<()> {
         let conn = self.incoming.await.inspect_err(|err| warn! { %err })?;
         trace!(
             "established new session with {} - RTT {:?}",
@@ -573,65 +572,60 @@ impl Server {
     pub fn serve(self) -> ServerHandle {
         let cancel_for_handle = tokio_util::sync::CancellationToken::new();
         let cancel_for_serve = cancel_for_handle.clone();
-        let handle = tokio::spawn(async move {
-            let mut set = tokio::task::JoinSet::new();
-            info!("Server ready to accept new connections");
+        let handle = tokio::spawn(
+            async move {
+                let mut set = tokio::task::JoinSet::new();
+                info!("Server ready to accept new connections");
 
-            async fn check_for_completed_task(
-                set: &mut tokio::task::JoinSet<Result<()>>,
-            ) -> Option<ServerTaskResult> {
-                if set.is_empty() {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                enum Event {
+                    Incoming(Option<quinn::Incoming>),
+                    Cancel,
+                    MaybeCompletedTask(Option<ServerTaskResult>),
                 }
-                set.join_next_with_id().await
-            }
 
-            enum Event {
-                Incoming(Option<quinn::Incoming>),
-                Cancel,
-                MaybeCompletedTask(Option<ServerTaskResult>),
-            }
+                loop {
+                    let is_empty = set.is_empty();
+                    let event = tokio::select! {
+                        incoming = self.endpoint.accept() => {
+                            Event::Incoming(incoming)
+                        },
+                        _ = cancel_for_serve.cancelled() => {
+                            Event::Cancel
+                        },
+                        maybe_complete = set.join_next_with_id(), if !is_empty => {
+                            Event::MaybeCompletedTask(maybe_complete)
+                        }
+                    };
 
-            loop {
-                let event = tokio::select! {
-                    incoming = self.endpoint.accept() => {
-                        Event::Incoming(incoming)
-                    },
-                    _ = cancel_for_serve.cancelled() => {
-                        Event::Cancel
-                    },
-                    maybe_complete = check_for_completed_task(&mut set) => {
-                        Event::MaybeCompletedTask(maybe_complete)
+                    match event {
+                        Event::Incoming(Some(incoming)) => {
+                            debug!("Incoming connection from {}", incoming.remote_address());
+                            set.spawn(ReqHandler::new(self.dev.clone(), incoming).handle_req());
+                        }
+                        Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
+                            info!("session {id} completed successfully")
+                        }
+                        Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
+                            warn! { %cause, "session {id} failed" }
+                        }
+                        Event::MaybeCompletedTask(Some(Err(cause))) => error! { %cause },
+                        Event::Incoming(None) | Event::Cancel => break,
+                        _ => (),
                     }
-                };
-
-                match event {
-                    Event::Incoming(Some(incoming)) => {
-                        debug!("Incoming connection from {}", incoming.remote_address());
-                        set.spawn(ReqHandler::new(self.dev.clone(), incoming).run());
-                    }
-                    Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
-                        info!("session {id} completed successfully")
-                    }
-                    Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
-                        warn! { %cause, "session {id} failed" }
-                    }
-                    Event::MaybeCompletedTask(Some(Err(cause))) => error! { %cause },
-                    Event::Incoming(None) | Event::Cancel => break,
-                    _ => (),
                 }
-            }
 
-            while let Some(result) = set.join_next_with_id().await {
-                match result {
-                    Ok((id, Ok(_))) => info!("session {id} completed successfully"),
-                    Ok((id, Err(cause))) => warn! { %cause, "session {id} failed" },
-                    Err(cause) => error! { %cause },
+                while let Some(result) = set.join_next_with_id().await {
+                    match result {
+                        Ok((id, Ok(_))) => info!("session {id} completed successfully"),
+                        Ok((id, Err(cause))) => warn! { %cause, "session {id} failed" },
+                        Err(cause) => error! { %cause },
+                    }
                 }
-            }
 
-            Ok(())
-        });
+                Ok(())
+            }
+            .in_current_span(),
+        );
         ServerHandle {
             handle,
             cancel_token: cancel_for_handle,

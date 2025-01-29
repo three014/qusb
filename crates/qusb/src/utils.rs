@@ -2,7 +2,14 @@ use crate::rustls;
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
 use std::{
-    borrow::Borrow, collections::HashMap, fmt::Debug, future::Future, hash::Hash, io, sync::Arc,
+    borrow::Borrow,
+    collections::HashMap,
+    fmt::Debug,
+    future::Future,
+    hash::Hash,
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 
@@ -70,6 +77,18 @@ impl<K1, K2, K3, V> ThreeKeyMap<K1, K2, K3, V> {
             .for_each(|value| *value = index);
 
         Some(value)
+    }
+
+    pub fn unlink_all_but_key1<Q>(&mut self, k: &Q)
+    where
+        Q: ?Sized + Hash + Eq,
+        K1: Borrow<Q> + Hash + Eq + IsEnabled,
+    {
+        if let Some(&index) = self.key1_map.get(k) {
+            self.key1_map.retain(|q, v| q.borrow() == k || *v != index);
+            self.key2_map.retain(|_, v| *v != index);
+            self.key3_map.retain(|_, v| *v != index);
+        }
     }
 
     pub fn link_key1_to_key2<Q>(&mut self, new_k: K1, existing_k: &Q) -> LinkResult
@@ -529,6 +548,23 @@ pub const fn align_to_usize(val: usize) -> usize {
 //     buf.clear();
 //     Ok(Some(recv))
 // }
+
+pub struct Timer(Instant);
+
+impl Timer {
+    #[inline]
+    pub fn start() -> Timer {
+        Self(Instant::now())
+    }
+
+    #[inline]
+    pub fn stop_and_report(self, threshold: Option<Duration>, msg: &str) {
+        let elapsed = self.0.elapsed();
+        if threshold.unwrap_or(Duration::ZERO) < elapsed {
+            tracing::trace!("{msg} took {elapsed:?}");
+        }
+    }
+}
 
 /// A custom certificate that accepts any and all certificates it sees.
 ///
