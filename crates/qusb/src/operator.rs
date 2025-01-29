@@ -741,7 +741,10 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
                 // Encourage callers to use the same memory handle
                 // as much as possible
                 lock.push_front(dma);
-                timer.stop_and_report(Some(Duration::from_nanos(200)), "reserving direct-access memory for transfer");
+                timer.stop_and_report(
+                    Some(Duration::from_nanos(200)),
+                    "reserving direct-access memory for transfer",
+                );
                 return mem;
             } else {
                 // Okay this one's probably too empty, let callers
@@ -762,6 +765,36 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
         lock.push_front(dma);
         timer.stop_and_report(None, "allocating direct-access memory for transfer");
         mem
+    }
+}
+
+#[inline]
+fn convert_libusb_to_vhci(
+    status: rusb::Result<TransferStatus>,
+    kind: UrbType,
+    seqnum: u32,
+    dev_id: msg::UsbDeviceId,
+) -> vhci::Status {
+    match status {
+        Ok(TransferStatus::Completed) => vhci::Status::Success,
+        Ok(TransferStatus::Error) => vhci::Status::Error,
+        Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
+        Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
+        Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => vhci::Status::Stall,
+        Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
+            vhci::Status::DeviceDisconnected
+        }
+        Ok(TransferStatus::Overflow) => vhci::Status::Babble,
+        Err(rusb::Error::Busy) => {
+            unreachable!("for now, no transfer can be resubmitted")
+        }
+        Err(rusb::Error::NotSupported) => {
+            unreachable!("will we ever mess with the transfer flags?")
+        }
+        Err(err) => {
+            warn! { %err, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
+            vhci::Status::Error
+        }
     }
 }
 
@@ -888,7 +921,6 @@ where
             } {
                 Event::RecvFrame(Some(Recv::Urb((header, urb_frame)))) => {
                     debug!("({}) received new URB", header.seqnum);
-                    let timer = Timer::start();
                     let cancel = CancellationToken::new();
                     cancel_tokens.insert(header.seqnum, cancel.clone());
 
@@ -898,6 +930,7 @@ where
                     let scratch_dma = scratch_dma.clone();
                     let cache = Arc::clone(&cached_transfers);
                     active_transfers.spawn(async move {
+                        let timer = Timer::start();
                         let (urb_header, data) = urb_frame.split::<[u8]>();
                         let mut urb_header = urb_header.read();
                         let ctrl = urb_header.ctrl_packet;
@@ -1017,29 +1050,8 @@ where
                                 };
 
                                 timer.stop_and_report(None, "setting up iso transfer");
-                                let status = match transfer.submit(cancel).await {
-                                    Ok(TransferStatus::Completed) => vhci::Status::Success,
-                                    Ok(TransferStatus::Error) => vhci::Status::Error,
-                                    Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
-                                    Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
-                                    Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => {
-                                        vhci::Status::Stall
-                                    }
-                                    Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
-                                        vhci::Status::DeviceDisconnected
-                                    }
-                                    Ok(TransferStatus::Overflow) => vhci::Status::Babble,
-                                    Err(rusb::Error::Busy) => {
-                                        unreachable!("for now, no transfer can be resubmitted")
-                                    }
-                                    Err(rusb::Error::NotSupported) => {
-                                        unreachable!("will we ever mess with the transfer flags?")
-                                    }
-                                    Err(err) => {
-                                        warn! { %err, "({}) iso transfer failed on {dev_id:?}", header.seqnum };
-                                        vhci::Status::Error
-                                    }
-                                };
+                                let result = transfer.submit(cancel).await;
+                                let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 // let _errno = dbg!(io::Error::last_os_error());
 
@@ -1071,29 +1083,8 @@ where
                                 };
 
                                 timer.stop_and_report(None, "setting up int transfer");
-                                let status = match transfer.submit(cancel).await {
-                                    Ok(TransferStatus::Completed) => vhci::Status::Success,
-                                    Ok(TransferStatus::Error) => vhci::Status::Error,
-                                    Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
-                                    Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
-                                    Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => {
-                                        vhci::Status::Stall
-                                    }
-                                    Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
-                                        vhci::Status::DeviceDisconnected
-                                    }
-                                    Ok(TransferStatus::Overflow) => vhci::Status::Babble,
-                                    Err(rusb::Error::Busy) => {
-                                        unreachable!("for now, no transfer can be resubmitted")
-                                    }
-                                    Err(rusb::Error::NotSupported) => {
-                                        unreachable!("will we ever mess with the transfer flags?")
-                                    }
-                                    Err(err) => {
-                                        warn! { %err, "({}) int transfer failed on {dev_id:?}", header.seqnum };
-                                        vhci::Status::Error
-                                    }
-                                };
+                                let result = transfer.submit(cancel).await;
+                                let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
                                 insert_spare_transfer(cache.lock().unwrap(), transfer);
@@ -1155,31 +1146,8 @@ where
                                 };
 
                                 timer.stop_and_report(None, "setting up ctrl transfer");
-                                let status = match transfer.submit(cancel).await {
-                                    Ok(TransferStatus::Completed) => vhci::Status::Success,
-                                    Ok(TransferStatus::Error) => vhci::Status::Error,
-                                    Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
-                                    Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
-                                    Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => {
-                                        debug!("({}) {ctrl:?}", header.seqnum);
-                                        vhci::Status::Stall
-                                    }
-                                    Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
-                                        vhci::Status::DeviceDisconnected
-                                    }
-                                    Ok(TransferStatus::Overflow) => vhci::Status::Babble,
-                                    Err(rusb::Error::Busy) => {
-                                        unreachable!("for now, no transfer can be resubmitted")
-                                    }
-                                    Err(rusb::Error::NotSupported) => {
-                                        unreachable!("will we ever mess with the transfer flags?")
-                                    }
-                                    Err(err) => {
-                                        debug!("({}) {ctrl:?}", header.seqnum);
-                                        warn! { %err, "({}) ctrl transfer failed on {dev_id:?}", header.seqnum };
-                                        vhci::Status::Error
-                                    }
-                                };
+                                let result = transfer.submit(cancel).await;
+                                let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let mut buf = {
                                     let (transfer, mut buf) = transfer.into_parts().unwrap();
@@ -1213,29 +1181,8 @@ where
                                 };
 
                                 timer.stop_and_report(Some(Duration::from_micros(15)), "setting up bulk transfer");
-                                let status = match transfer.submit(cancel.clone()).await {
-                                    Ok(TransferStatus::Completed) => vhci::Status::Success,
-                                    Ok(TransferStatus::Error) => vhci::Status::Error,
-                                    Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
-                                    Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
-                                    Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => {
-                                        vhci::Status::Stall
-                                    }
-                                    Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
-                                        vhci::Status::DeviceDisconnected
-                                    }
-                                    Ok(TransferStatus::Overflow) => vhci::Status::Babble,
-                                    Err(rusb::Error::Busy) => {
-                                        unreachable!("for now, no transfer can be resubmitted")
-                                    }
-                                    Err(rusb::Error::NotSupported) => {
-                                        unreachable!("will we ever mess with the transfer flags?")
-                                    }
-                                    Err(err) => {
-                                        warn! { %err, "({}) bulk transfer failed on {dev_id:?}", header.seqnum };
-                                        vhci::Status::Error
-                                    }
-                                };
+                                let result = transfer.submit(cancel).await;
+                                let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
                                 insert_spare_transfer(cache.lock().unwrap(), transfer);
