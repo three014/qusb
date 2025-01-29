@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -691,6 +691,80 @@ fn insert_spare_transfer(
     );
 }
 
+/// An allocation strategy for direct memory access regions.
+///
+/// The motivation behind this struct is that setting up and tearing down DMA
+/// regions on modern systems is slower than compared to normal memory
+/// allocation. This is why [`UsbMemMut`] does not allocate more memory
+/// when it doesn't have the space to fit more data.
+///
+/// To get around this, we reserve a cluster of small DMA regions upfront,
+/// then handle reservations by trying to reclaim enough space for the requested
+/// memory block in each region until one succeeds.
+///
+/// Is it fast? For the purpose of this project, yeah!
+///
+/// [`UsbMemMut`]: rusb_async::UsbMemMut
+#[derive(Clone)]
+struct DmaAllocator<C: rusb::UsbContext> {
+    queue: Arc<Mutex<VecDeque<UsbMemMut>>>,
+    handle: Arc<rusb::DeviceHandle<C>>,
+}
+
+const DMA_LEN: usize = 16 << 11;
+
+impl<C: rusb::UsbContext> DmaAllocator<C> {
+    pub fn with_capacity(capacity: usize, handle: Arc<rusb::DeviceHandle<C>>) -> Self {
+        let mut queue = VecDeque::with_capacity(capacity);
+        queue.resize_with(capacity, || unsafe { handle.new_usb_mem(DMA_LEN).unwrap() });
+
+        Self {
+            queue: Arc::new(Mutex::new(queue)),
+            handle,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub fn reserve(&self, num_bytes: usize) -> UsbMemMut {
+        let timer = Timer::start();
+        assert!(num_bytes <= DMA_LEN);
+        let mut lock = self.queue.lock().unwrap();
+        for _ in 0..lock.len() {
+            let mut dma = lock.pop_front().unwrap();
+            let additional = num_bytes.saturating_sub(dma.len());
+            if dma.try_reclaim(additional) {
+                // SAFETY: We won't go over the capacity due to the
+                //         assertion at the beginning of the function
+                unsafe { dma.set_len(num_bytes) };
+                let mem = dma.split_to(num_bytes);
+
+                // Encourage callers to use the same memory handle
+                // as much as possible
+                lock.push_front(dma);
+                timer.stop_and_report(Some(Duration::from_nanos(200)), "reserving direct-access memory for transfer");
+                return mem;
+            } else {
+                // Okay this one's probably too empty, let callers
+                // use the next memory handle.
+                lock.push_back(dma);
+            }
+        }
+        // Map a new memory zone or die trying!
+        // SAFETY: Our device handle is valid and we promise not
+        //         to use the memory if the USB device is working
+        //         with it.
+        let mut dma = unsafe { self.handle.new_usb_mem(DMA_LEN).unwrap() };
+
+        // SAFETY: We won't go over the capacity due to the
+        //         assertion at the beginning of the function
+        unsafe { dma.set_len(num_bytes) };
+        let mem = dma.split_to(num_bytes);
+        lock.push_front(dma);
+        timer.stop_and_report(None, "allocating direct-access memory for transfer");
+        mem
+    }
+}
+
 // struct TransferData {
 //     header: Header,
 //     urb: Data<UrbFrame>,
@@ -794,10 +868,9 @@ where
             IntSet::with_capacity_and_hasher(16, Default::default()),
         ));
 
-        const DMA_LEN: usize = 16 << 16;
         const BUF_LEN: usize = 16 << 10;
         buf_rx.reserve(BUF_LEN);
-        let scratch_dma = Arc::new(Mutex::new(unsafe { device.new_usb_mem(DMA_LEN).unwrap() }));
+        let scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
         let scratch_buf = Arc::new(Mutex::new(BytesMut::with_capacity(BUF_LEN)));
         let cached_transfers: Arc<Mutex<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
@@ -822,7 +895,7 @@ where
                     let claimed = Arc::clone(&claimed_interfaces);
                     let handle = Arc::clone(&device);
                     let scratch_buf = Arc::clone(&scratch_buf);
-                    let scratch_dma = Arc::clone(&scratch_dma);
+                    let scratch_dma = scratch_dma.clone();
                     let cache = Arc::clone(&cached_transfers);
                     active_transfers.spawn(async move {
                         let (urb_header, data) = urb_frame.split::<[u8]>();
@@ -836,19 +909,10 @@ where
                         // Otherwise, reserve space to write data.
                         let (transfer_buf, mut iso_raw_buf) = if UrbType::Ctrl == urb_header.kind {
                             let mut transfer = {
-                                let mut scratch = scratch_dma.lock().unwrap();
-                                let len = scratch.len();
                                 let w_length = ctrl.length() as usize;
                                 assert_eq!(w_length, transfer_len);
                                 let needed = size_of::<ioctl::IocSetupPacket>() + align_to_usize(transfer_len);
-                                let additional = needed.saturating_sub(len);
-                                assert!(scratch.try_reclaim(additional), "needed: {needed}, capacity: {}", scratch.capacity());
-                                // SAFETY: None of this buf is read, only written to at first.
-                                //         Plus we just ensured that we have capacity for this.
-                                unsafe {
-                                    scratch.set_len(needed);
-                                }
-                                scratch.split_to(needed)
+                                scratch_dma.reserve(needed)
                             };
                             ctrl.write_to_prefix(&mut transfer).unwrap();
                             if Dir::Out == ctrl.req().dir() {
@@ -860,34 +924,16 @@ where
                                 Dir::Out => {
                                     let transfer = data.split_to(align_to_usize(transfer_len)).split_to(transfer_len);
                                     let mut dma = {
-                                        let mut scratch = scratch_dma.lock().unwrap();
-                                        let len = scratch.len();
                                         let needed = align_to_usize(transfer_len);
-                                        let additional = needed.saturating_sub(len);
-                                        assert!(scratch.try_reclaim(additional), "needed: {needed}, capacity: {}", scratch.capacity());
-                                        // SAFETY: None of this buf is read, only written to at first.
-                                        //         Plus we just ensured that we have capacity for this.
-                                        unsafe {
-                                            scratch.set_len(needed);
-                                        }
-                                        scratch.split_to(needed)
-                                    }.split_to(transfer_len);
+                                        scratch_dma.reserve(needed).split_to(transfer_len)
+                                    };
                                     transfer.as_ref().write_to(dma.as_mut()).unwrap();
                                     (dma, data)
                                 },
                                 Dir::In => {
-                                    let mut dma = {
-                                        let mut scratch = scratch_dma.lock().unwrap();
-                                        let len = scratch.len();
+                                    let dma = {
                                         let needed = align_to_usize(transfer_len);
-                                        let additional = needed.saturating_sub(len);
-                                        assert!(scratch.try_reclaim(additional), "needed: {needed}, capacity: {}", scratch.capacity());
-                                        // SAFETY: None of this buf is read, only written to at first.
-                                        //         Plus we just ensured that we have capacity for this.
-                                        unsafe {
-                                            scratch.set_len(needed);
-                                        }
-                                        scratch.split_to(needed)
+                                        scratch_dma.reserve(needed).split_to(transfer_len)
                                     };
                                     let iso_buf = {
                                         let mut scratch = scratch_buf.lock().unwrap();
@@ -902,7 +948,7 @@ where
                                         }
                                         scratch.split_to(needed)
                                     };
-                                    (dma.split_to(transfer_len), iso_buf)
+                                    (dma, iso_buf)
                                 },
                             }
                         };
