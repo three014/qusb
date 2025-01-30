@@ -114,6 +114,7 @@ where
 impl Data<[u8]> {
     /// Consumes the `Data` and returns the underlying
     /// slice as a `BytesMut`.
+    #[inline]
     pub fn into_bytes_mut(mut self) -> BytesMut {
         std::mem::replace(&mut self.buf, BytesMut::new())
     }

@@ -45,8 +45,8 @@ async fn list_devices_works() {
     handle.shutdown().await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn borrow_self_dev() {
+#[test]
+fn borrow_self_dev() {
     let log_path = "log.txt";
     let log_file = std::fs::File::options()
         .create(true)
@@ -60,7 +60,14 @@ async fn borrow_self_dev() {
         .with_line_number(true)
         .with_writer(log_file)
         .try_init();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(borrow_self_dev_inner());
+}
 
+async fn borrow_self_dev_inner() {
     let addr = common::addr(7002);
     let (client, server) = common::localhost(addr);
     let handle = server.serve();
@@ -72,7 +79,7 @@ async fn borrow_self_dev() {
         let usb = session
             .borrow_device(proto::msg::UsbDeviceId {
                 bus_number: 3,
-                device_addr: 62,
+                device_addr: 78,
             })
             .await
             .unwrap();
@@ -83,7 +90,7 @@ async fn borrow_self_dev() {
 }
 
 #[tokio::test]
-async fn server_with_keyboard() {
+async fn server_lends_usb() {
     let log_path = "log.txt";
     let log_file = std::fs::File::options()
         .create(true)
@@ -98,7 +105,7 @@ async fn server_with_keyboard() {
         .with_writer(log_file)
         .try_init();
 
-    let server = common::dummy_server("0.0.0.0:7400".parse().unwrap());
+    let server = common::dummy_server("[::]:7400".parse().unwrap());
     let handle = server.serve();
 
     tokio::time::sleep(Duration::from_secs(120)).await;
@@ -121,7 +128,7 @@ async fn client_wants_keyboard() {
         .with_writer(log_file)
         .try_init();
 
-    let client = common::dummy_trusting_client("0.0.0.0:7400".parse().unwrap());
+    let client = common::dummy_trusting_client("[::]:7400".parse().unwrap());
     let session = client
         .connect("10.4.31.230:7400".parse().unwrap(), "pan1.test.bed")
         .await
