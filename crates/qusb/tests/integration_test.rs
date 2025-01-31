@@ -47,7 +47,7 @@ async fn list_devices_works() {
 
 #[test]
 fn borrow_self_dev() {
-    let log_path = "log.txt";
+    let log_path = "borrow_self_dev.log";
     let log_file = std::fs::File::options()
         .create(true)
         .read(true)
@@ -90,8 +90,8 @@ async fn borrow_self_dev_inner() {
 }
 
 #[tokio::test]
-async fn server_lends_usb() {
-    let log_path = "log.txt";
+async fn server() {
+    let log_path = "server.log";
     let log_file = std::fs::File::options()
         .create(true)
         .read(true)
@@ -113,8 +113,8 @@ async fn server_lends_usb() {
 }
 
 #[tokio::test]
-async fn client_wants_keyboard() {
-    let log_path = "log.txt";
+async fn client_borrows_usb() {
+    let log_path = "client_borrows_usb.log";
     let log_file = std::fs::File::options()
         .create(true)
         .read(true)
@@ -135,18 +135,10 @@ async fn client_wants_keyboard() {
         .unwrap();
     tracing::info!("Connected to {}", session.remote_address());
 
-    let devices = session.req_list_devices().await.unwrap();
-
-    // Drop Keyboard: idVendor=0c45, idProduct=7016
-    let keyboard = devices
-        .iter()
-        .find(|&dev| 0x0c45 == dev.header.id_vendor && 0x7016 == dev.header.id_product)
-        .unwrap();
-
     let usb = session
         .req_borrow(proto::msg::UsbDeviceId {
-            bus_number: keyboard.header.busnum,
-            device_addr: keyboard.header.devnum,
+            bus_number: 3,
+            device_addr: 48,
         })
         .await
         .unwrap();
