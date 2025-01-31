@@ -1,5 +1,5 @@
 use bytes::Buf;
-use operator::{ClientBorrowDevice, ClientReq, LendDevice, SendDevices, ServerResp};
+use operator::{BorrowDevice, ClientReq, LendDevice, SendDevices, ServerResp};
 use proto::{
     data::{IterDst, IterMutDst, ReadError, Ring},
     msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
@@ -246,6 +246,7 @@ impl Session {
     }
 
     #[tracing::instrument(skip_all, level = "trace")]
+    #[must_use]
     pub async fn accept_stream(&self) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>> {
         let (mut tx, mut rx) = self.conn.accept_bi().await?;
         let mut buf = Ring::with_capacity(32);
@@ -276,6 +277,7 @@ impl Session {
         let req = match buf.read::<msg::Request>().and_then(|req| match req {
             msg::Request::ListDevices => Ok::<_, ReadError>(ClientReq::ListDevices),
             msg::Request::BorrowDevice => Ok(ClientReq::BorrowDevice(buf.read()?)),
+            msg::Request::LendDevice => Ok(ClientReq::LendDevice(buf.read()?)),
         }) {
             Ok(ClientReq::ListDevices) => ServerResp::ListDevices(SendDevices::new(tx)),
             Ok(ClientReq::BorrowDevice(device)) => {
@@ -283,13 +285,22 @@ impl Session {
 
                 ServerResp::BorrowDevice(LendDevice::new(tx, rx, buf, device))
             }
+            Ok(ClientReq::LendDevice(device)) => {
+                buf.consume(6);
+
+                ServerResp::LendDevice(BorrowDevice::new(tx, rx, buf, self.dev.clone(), device))
+            }
             Err(ReadError::CorruptedData) => {
                 let mut response = msg::Status::Proto.as_bytes().chain(&[0u8; 7][..]);
                 tx.write_all_buf(&mut response).await?;
                 tx.close().await?;
                 return Err(Error::Unknown);
             }
-            Err(ReadError::BufferShort { .. }) => todo!(),
+            Err(ReadError::BufferShort { .. }) => {
+                unimplemented!(
+                    "this could definitely happen, but its not likely for now (famous last words)"
+                )
+            }
         };
 
         Ok(req)
@@ -342,10 +353,11 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn borrow_device(
+    #[must_use]
+    pub async fn req_borrow(
         &self,
         id: msg::UsbDeviceId,
-    ) -> Result<ClientBorrowDevice<quinn::SendStream, quinn::RecvStream>> {
+    ) -> Result<BorrowDevice<quinn::SendStream, quinn::RecvStream>> {
         let (mut tx, mut rx) = self.conn.open_bi().await.inspect_err(|err| {
             warn! {
                 %err,
@@ -409,7 +421,80 @@ impl Session {
             msg::Status::Proto => todo!(),
         }
 
-        let client = ClientBorrowDevice::new(tx, rx, buf, self.dev.clone(), id);
+        let client = BorrowDevice::new(tx, rx, buf, self.dev.clone(), id);
+        Ok(client)
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    #[must_use]
+    pub async fn req_lend(
+        &self,
+        id: msg::UsbDeviceId,
+    ) -> Result<LendDevice<quinn::SendStream, quinn::RecvStream>> {
+        let (mut tx, mut rx) = self.conn.open_bi().await.inspect_err(|err| {
+            warn! {
+                %err,
+                "err while opening new request with peer"
+            }
+        })?;
+        let mut buf = Ring::with_capacity(1024);
+
+        trace!("established stream with stream id {:?}", tx.id());
+
+        let version = proto::QUSB_VER;
+        let req = msg::Request::LendDevice;
+
+        let mut req = version
+            .as_bytes()
+            .chain(req.as_bytes())
+            .chain(id.as_bytes())
+            .chain(&[0u8; 6][..]);
+
+        debug_assert_eq!(req.remaining() % size_of::<u64>(), 0);
+
+        tx.write_all_buf(&mut req).await?;
+        trace!(
+            "sent request to lend device {id:?} to peer @ {:?}",
+            self.conn.remote_address()
+        );
+
+        buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
+            .await?;
+
+        trace!("received enough bytes for a status from peer");
+
+        let status = match buf.read() {
+            Ok(status) => status,
+            Err(ReadError::CorruptedData) => {
+                unreachable!("msg::Status is FromBytes, and should be aligned")
+            }
+            Err(ReadError::BufferShort { .. }) => {
+                unreachable!("we should have read enough bytes to read status")
+            }
+        };
+        buf.consume(7);
+        match status {
+            msg::Status::Success => (),
+            msg::Status::Failed => return Err(Error::ReqFailed),
+            msg::Status::DevBusy => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
+            msg::Status::DevErr => todo!(),
+            msg::Status::NoDev => {
+                return Err(Error::DevNotFound(id));
+            }
+            msg::Status::Unexpected => {
+                return Err(io::Error::from(io::ErrorKind::InvalidData).into())
+            }
+            msg::Status::VersionMismatch => {
+                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Version>()))
+                    .await?;
+                let their_version = buf.read::<msg::Version>().unwrap();
+                return Err(Error::VersionMismatch(their_version));
+            }
+            msg::Status::Timeout => todo!(),
+            msg::Status::Proto => todo!(),
+        }
+
+        let client = LendDevice::new(tx, rx, buf, id);
         Ok(client)
     }
 }
@@ -548,9 +633,10 @@ impl ReqHandler {
         while conn.close_reason().is_none() {
             match session.accept_stream().await? {
                 ServerResp::ListDevices(operator) => {
-                    operator.resp_list_devices(get_usb_devices).await?;
+                    operator.send_device_list(get_usb_devices).await?;
                 }
-                ServerResp::BorrowDevice(operator) => operator.lend2().await?,
+                ServerResp::BorrowDevice(operator) => operator.lend().await?,
+                ServerResp::LendDevice(operator) => operator.borrow().await?,
             }
         }
 

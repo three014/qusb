@@ -105,6 +105,7 @@ impl std::fmt::Display for Version {
 pub enum Request {
     ListDevices,
     BorrowDevice,
+    LendDevice,
 }
 
 #[derive(

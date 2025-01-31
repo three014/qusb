@@ -14,7 +14,6 @@ use proto::{
     data::{Data, ReadError, Ring},
     msg::{self, Header, QusbFrame, UrbFrame, UrbHeader},
 };
-use rand::Rng;
 use rusb::UsbContext;
 use rusb_async::{
     DeviceHandleExt, InnerTransfer, IsoPacket, TransferFlags, TransferStatus, UsbMemMut,
@@ -42,6 +41,7 @@ use crate::{
 pub enum ClientReq {
     ListDevices,
     BorrowDevice(msg::UsbDeviceId),
+    LendDevice(msg::UsbDeviceId),
 }
 
 const HEADER_SIZE: usize = size_of::<Header>();
@@ -88,9 +88,97 @@ async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Resu
     }
 }
 
+#[tracing::instrument(level = "trace", skip_all)]
+async fn handle_port_stat<W: AsyncWrite + Unpin>(
+    next: ioctl::IocPortStat,
+    prev: ioctl::IocPortStat,
+    addr: &mut u8,
+    seqnum: &AtomicU32,
+    seqnums: &mut SimpleMap<ioctl::UrbHandle, u32>,
+    handles: &mut SimpleMap<u32, ioctl::UrbHandle>,
+    mut tx: W,
+) {
+    let timer = Timer::start();
+    let status = next.status();
+    let change = next.change();
+    let flags = next.flags();
+    if change.contains(PortChange::CONNECTION) {
+        debug!("CONNECTION state changed -> invalidating address");
+        *addr = 0xff;
+    } else if change.contains(PortChange::RESET)
+        && (!status).contains(PortStatus::RESET)
+        && status.contains(PortStatus::ENABLE)
+    {
+        debug!("RESET successful -> use default address");
+        *addr = 0;
+    } else if prev.status().contains(PortStatus::POWER) && (!status).contains(PortStatus::POWER) {
+        debug!("port is powered off");
+    } else if (!prev.status()).contains(PortStatus::RESET)
+        && status.contains(PortStatus::RESET | PortStatus::CONNECTION)
+    {
+        let next_seqnum = seqnum.fetch_add(1, Ordering::Relaxed);
+        // We pray that we don't run into another handle
+        let handle = ioctl::UrbHandle(rand::random());
+        seqnums.insert(handle, next_seqnum);
+        handles.insert(next_seqnum, handle);
+        debug!("({next_seqnum}) port is resetting");
+
+        let header = Header {
+            total_frame_len: (size_of::<Header>() / 8) as u16,
+            seqnum: next_seqnum,
+            command: msg::Command::CmdPort,
+            status: msg::Status::Success,
+        };
+
+        timer.stop_and_report(
+            Some(Duration::from_nanos(100)),
+            "setting up port reset frame",
+        );
+        let mut request = header.as_bytes();
+        tx.write_all_buf(&mut request).await.unwrap();
+    } else if (!prev.flags()).contains(PortFlag::RESUMING)
+        && flags.contains(PortFlag::RESUMING)
+        && status.contains(PortStatus::CONNECTION)
+    {
+        debug!("port is resuming -> completing resume");
+    } else {
+        debug!("status: {:?}", next.status());
+        debug!("change: {:?}", next.change());
+        debug!("index: {:?}", next.index());
+        debug!("flags: {:?}", next.flags());
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct BorrowId {
+    remote_dev: msg::UsbDeviceId,
+    local_port: vhci::Port,
+}
+
+impl std::fmt::Debug for BorrowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Id")
+            .field("remove_dev", &self.remote_dev)
+            .field("local_port", &self.local_port.get())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BorrowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Remote Dev {:03}/{:03}, Local Port {}",
+            self.remote_dev.bus_number,
+            self.remote_dev.device_addr,
+            self.local_port.get()
+        )
+    }
+}
+
 /// A struct containing the logic for
 /// borrowing a USB device from a lender.
-pub struct ClientBorrowDevice<W, R> {
+pub struct BorrowDevice<W, R> {
     tx: W,
     rx: R,
     buf_rx: Ring,
@@ -98,7 +186,7 @@ pub struct ClientBorrowDevice<W, R> {
     id: msg::UsbDeviceId,
 }
 
-impl<W, R> ClientBorrowDevice<W, R> {
+impl<W, R> BorrowDevice<W, R> {
     pub fn new(tx: W, rx: R, buf_rx: Ring, vhci: stub::Controller, id: msg::UsbDeviceId) -> Self {
         Self {
             tx,
@@ -110,7 +198,7 @@ impl<W, R> ClientBorrowDevice<W, R> {
     }
 }
 
-impl<W, R> ClientBorrowDevice<W, R>
+impl<W, R> BorrowDevice<W, R>
 where
     W: AsyncWrite + utils::CloseStream + Unpin,
     R: AsyncRead + Unpin,
@@ -137,6 +225,7 @@ where
             mut vhci,
             id: _dev_id,
         } = self;
+        
         const BUF_LEN: usize = 16 << 10;
         let mut scratch_buf = [0u8; BUF_LEN];
         buf_rx.reserve(8192);
@@ -146,6 +235,11 @@ where
             .await
             .unwrap();
 
+        let id = BorrowId {
+            remote_dev: _dev_id,
+            local_port: port,
+        };
+
         enum Event {
             Work(Option<ioctl::Work>),
             Frame(io::Result<Option<Recv>>),
@@ -154,16 +248,14 @@ where
         let seqnum = AtomicU32::new(0);
         let mut addr: u8 = 0xff;
         let mut prev = ioctl::IocPortStat::default();
-        let mut handles =
-            SimpleMap::<u32, ioctl::UrbHandle>::with_capacity_and_hasher(32, Default::default());
-        let mut seqnums =
-            SimpleMap::<ioctl::UrbHandle, u32>::with_capacity_and_hasher(32, Default::default());
-        let mut handle_rng = rand::thread_rng();
+        let mut handles: SimpleMap<u32, ioctl::UrbHandle> =
+            SimpleMap::with_capacity_and_hasher(32, Default::default());
+        let mut seqnums: SimpleMap<ioctl::UrbHandle, u32> =
+            SimpleMap::with_capacity_and_hasher(32, Default::default());
 
-        info!("starting event loop");
+        info!("({id}) starting event loop");
 
         let result: Result<()> = loop {
-            debug!("==============================================");
             let event = tokio::select! {
                 maybe_work = work_rx.recv() => {
                     Event::Work(maybe_work)
@@ -175,58 +267,17 @@ where
 
             match event {
                 Event::Work(Some(ioctl::Work::PortStat(next))) => {
-                    debug!("got port stat for {:?}", port);
-                    let timer = Timer::start();
-                    let status = next.status();
-                    let change = next.change();
-                    let flags = next.flags();
-                    if change.contains(PortChange::CONNECTION) {
-                        debug!("CONNECTION state changed -> invalidating address");
-                        addr = 0xff;
-                    } else if change.contains(PortChange::RESET)
-                        && (!status).contains(PortStatus::RESET)
-                        && status.contains(PortStatus::ENABLE)
-                    {
-                        debug!("RESET successful -> use default address");
-                        addr = 0;
-                    } else if prev.status().contains(PortStatus::POWER)
-                        && (!status).contains(PortStatus::POWER)
-                    {
-                        debug!("port is powered off");
-                    } else if (!prev.status()).contains(PortStatus::RESET)
-                        && status.contains(PortStatus::RESET | PortStatus::CONNECTION)
-                    {
-                        let next_seqnum = seqnum.fetch_add(1, Ordering::Relaxed);
-                        // We pray that we don't run into another handle
-                        let handle = ioctl::UrbHandle(handle_rng.gen());
-                        seqnums.insert(handle, next_seqnum);
-                        handles.insert(next_seqnum, handle);
-                        debug!("({next_seqnum}) port is resetting");
-
-                        let header = Header {
-                            total_frame_len: (size_of::<Header>() / 8) as u16,
-                            seqnum: next_seqnum,
-                            command: msg::Command::CmdPort,
-                            status: msg::Status::Success,
-                        };
-
-                        timer.stop_and_report(
-                            Some(Duration::from_nanos(100)),
-                            "setting up port reset frame",
-                        );
-                        let mut request = header.as_bytes();
-                        tx.write_all_buf(&mut request).await.unwrap();
-                    } else if (!prev.flags()).contains(PortFlag::RESUMING)
-                        && flags.contains(PortFlag::RESUMING)
-                        && status.contains(PortStatus::CONNECTION)
-                    {
-                        debug!("port is resuming -> completing resume");
-                    } else {
-                        debug!("status: {:?}", next.status());
-                        debug!("change: {:?}", next.change());
-                        debug!("index: {:?}", next.index());
-                        debug!("flags: {:?}", next.flags());
-                    }
+                    debug!("({id}) got port stat");
+                    handle_port_stat(
+                        next,
+                        prev,
+                        &mut addr,
+                        &seqnum,
+                        &mut seqnums,
+                        &mut handles,
+                        &mut tx,
+                    )
+                    .await;
                     prev = next;
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle))))
@@ -234,8 +285,8 @@ where
                         && urb.address.is_for_unassigned()
                         && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                 {
-                    addr = urb.setup_packet.value().try_into().unwrap();
-                    debug!("set address to {addr:#x}");
+                    addr = urb.setup_packet.value() as u8;
+                    debug!("({id}) set local dev address to {addr:03}");
 
                     struct EmptyUrb {
                         handle: ioctl::UrbHandle,
@@ -295,7 +346,7 @@ where
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle)))) => {
                     assert_eq!(addr, urb.address.get());
-                    debug!("got urb with {addr:#x}");
+                    debug!("({id}) got urb (DevAddr({addr:03}))");
                     let timer = Timer::start();
 
                     let next_seqnum = seqnum.fetch_add(1, Ordering::Relaxed);
@@ -341,11 +392,6 @@ where
 
                     match urb.endpoint.direction() {
                         Dir::Out if actual_transfer_len > 0 || packet_count > 0 => {
-                            debug!(
-                                "fetching data (transfer_len: {}, iso_packet_len: {})",
-                                actual_transfer_len, packet_count
-                            );
-
                             let data = &mut scratch_buf[..data_len];
 
                             // Grab mutable references for each part of our frame
@@ -386,7 +432,7 @@ where
                     }
                 }
                 Event::Work(Some(ioctl::Work::CancelUrb(handle))) => {
-                    debug!("got cancel urb with {handle:?}");
+                    debug!("({id}) got cancel urb ({handle:?})");
                     if let Some(&seqnum) = seqnums.get(&handle) {
                         let header = Header {
                             total_frame_len: (size_of::<Header>() / 8) as u16,
@@ -398,7 +444,7 @@ where
                         let mut request = header.as_bytes();
                         tx.write_all_buf(&mut request).await.unwrap();
                     } else {
-                        debug!("URB with {handle:?} had already been returned");
+                        debug!("{handle:?} had already been returned");
                     }
                 }
                 Event::Frame(Ok(Some(Recv::Urb((
@@ -416,7 +462,7 @@ where
                     let urb = &mut frame.header;
 
                     if vhci::Status::Success != urb.status {
-                        warn!("transfer {} failed: {:?}", seqnum, urb.status);
+                        warn!("({id}) transfer {} failed: {:?}", seqnum, urb.status);
                     }
                     let transfer_len = urb.actual_transfer_len as usize;
 
@@ -460,7 +506,7 @@ where
                 })))) => {
                     let handle = handles.remove(&seqnum).unwrap();
                     let _ = seqnums.remove(&handle).unwrap();
-                    debug!("port has been reset");
+                    debug!("({id}) port has been reset");
                     vhci.reset_done(port, true).unwrap();
                 }
                 Event::Frame(Ok(Some(Recv::Urb((Header { status, .. }, _)))))
@@ -492,6 +538,7 @@ where
 pub enum ServerResp<W, R> {
     ListDevices(SendDevices<W>),
     BorrowDevice(LendDevice<W, R>),
+    LendDevice(BorrowDevice<W, R>),
 }
 
 fn is_config_active<C: rusb::UsbContext>(handle: &rusb::DeviceHandle<C>, config: u8) -> bool {
@@ -542,7 +589,7 @@ fn open_device(dev_id: msg::UsbDeviceId) -> rusb::Result<Arc<rusb::DeviceHandle<
         .and_then(|dev| dev.open())
         .and_then(|handle| {
             handle.set_auto_detach_kernel_driver(true)?;
-            for interface in 0..=16 {
+            for interface in 0..16 {
                 if let Ok(true) = handle.kernel_driver_active(interface) {
                     handle.detach_kernel_driver(interface)?;
                 }
@@ -836,7 +883,7 @@ where
     R: AsyncRead + Unpin,
 {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn lend2(self) -> Result<()> {
+    pub async fn lend(self) -> Result<()> {
         let Self {
             mut tx,
             mut rx,
@@ -965,7 +1012,7 @@ where
                                     let needed = align_to_usize(transfer_len);
                                     scratch_dma.reserve(needed).split_to(transfer_len)
                                 };
-                                let iso_buf = {
+                                let iso_buf = if UrbType::Iso == urb_header.kind {
                                     let scratch = &mut scratch_buf;
                                     let len = scratch.len();
                                     let needed =
@@ -978,6 +1025,8 @@ where
                                         scratch.set_len(needed);
                                     }
                                     scratch.split_to(needed)
+                                } else {
+                                    BytesMut::new()
                                 };
                                 time_to_reserve_buffers
                                     .stop_and_report(None, "reserving buffer space for transfer");
@@ -1336,7 +1385,10 @@ where
                             .chain(transfer)
                             .chain(padding)
                             .chain(iso_pkts.as_bytes());
-                        timer.stop_and_report(Some(Duration::from_nanos(500)), "setting up response frame");
+                        timer.stop_and_report(
+                            Some(Duration::from_nanos(500)),
+                            "setting up response frame",
+                        );
                         tx.write_all_buf(&mut response).await?;
                         // trace!(
                         //     "({}) {:?} endpoint ({:?}/{}): {:?}, Transfer: {:?}, Iso: {:?}",
@@ -1384,12 +1436,11 @@ where
     W: AsyncWrite + utils::CloseStream + Unpin,
 {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn resp_list_devices<'a, I, T>(self, iter: impl Fn() -> io::Result<I>) -> Result<()>
+    pub async fn send_device_list<'a, I, T>(self, iter: impl Fn() -> io::Result<I>) -> Result<()>
     where
         I: Iterator<Item = T>,
         T: msg::SendUsbDeviceInfo,
     {
-        use tokio::io::AsyncWriteExt;
         let mut tx = self.tx;
 
         trace!("getting available devices to send to peer");

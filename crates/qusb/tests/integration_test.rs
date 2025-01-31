@@ -77,7 +77,7 @@ async fn borrow_self_dev_inner() {
         tracing::info!("Connected to {}", session.remote_address());
 
         let usb = session
-            .borrow_device(proto::msg::UsbDeviceId {
+            .req_borrow(proto::msg::UsbDeviceId {
                 bus_number: 3,
                 device_addr: 78,
             })
@@ -144,7 +144,7 @@ async fn client_wants_keyboard() {
         .unwrap();
 
     let usb = session
-        .borrow_device(proto::msg::UsbDeviceId {
+        .req_borrow(proto::msg::UsbDeviceId {
             bus_number: keyboard.header.busnum,
             device_addr: keyboard.header.devnum,
         })
