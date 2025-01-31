@@ -754,13 +754,13 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
         Self { queue, handle }
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn reserve(&mut self, num_bytes: usize) -> UsbMemMut {
         let timer = Timer::start();
         assert!(num_bytes <= DMA_LEN, "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {DMA_LEN} bytes)");
         let queue = &mut self.queue;
         for _ in 0..queue.len() {
-            let mut dma = queue.pop_front().unwrap();
+            let dma = queue.front_mut().unwrap();
             let additional = num_bytes.saturating_sub(dma.len());
             if dma.try_reclaim(additional) {
                 // SAFETY: We won't go over the capacity due to the
@@ -768,22 +768,17 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
                 unsafe { dma.set_len(num_bytes) };
                 let mem = dma.split_to(num_bytes);
 
-                // Encourage callers to use the same memory handle
-                // as much as possible
-                queue.push_front(dma);
                 timer.stop_and_report(
                     Some(Duration::from_micros(2)),
                     "reserving direct-access memory for transfer",
                 );
                 return mem;
             } else {
-                // Okay this one's probably too empty, let callers
-                // use the next memory handle.
-                // By pushing this handle to the end of the queue,
+                // By rotating the current handle to the end,
                 // we reduce the chances of a transfer not being
                 // complete by the time we come back around. This
                 // will allow us to reclaim the entire buffer later.
-                queue.push_back(dma);
+                queue.rotate_left(1);
             }
         }
         // Map a new memory zone or die trying!
