@@ -90,7 +90,7 @@ async fn borrow_self_dev_inner() {
 }
 
 #[tokio::test]
-async fn server() {
+async fn server_works() {
     let log_path = "server.log";
     let log_file = std::fs::File::options()
         .create(true)

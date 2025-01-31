@@ -288,6 +288,11 @@ impl Session {
             Ok(ClientReq::LendDevice(device)) => {
                 buf.consume(6);
 
+                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
+                    .await?;
+                buf.read::<msg::Status>().unwrap();
+                buf.consume(7);
+
                 ServerResp::LendDevice(BorrowDevice::new(tx, rx, buf, self.dev.clone(), device))
             }
             Err(ReadError::CorruptedData) => {
