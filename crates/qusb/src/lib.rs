@@ -288,6 +288,9 @@ impl Session {
             Ok(ClientReq::LendDevice(device)) => {
                 buf.consume(6);
 
+                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
+                tx.write_all_buf(&mut response).await?;
+
                 buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
                     .await?;
                 buf.read::<msg::Status>().unwrap();

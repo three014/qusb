@@ -90,7 +90,6 @@ impl Demuxer {
 
         enum Continuation {
             Register(RegisterResult),
-            Other,
             Disconnect(DisconnectResult),
         }
 
@@ -173,9 +172,11 @@ impl Demuxer {
                 Event::Disconnect(Some(Ctrl { data: port, tx })) => {
                     let ctx = Arc::clone(&ctx);
                     set.spawn_blocking(move || {
-                        let mut mailer = ctx.mailer.lock().unwrap();
-                        // BUG: Why would this be None?
-                        assert!(mailer.remove_by_key1(&port).is_some(), "{port:?}");
+                        {
+                            let mut mailer = ctx.mailer.lock().unwrap();
+                            mailer.unlink_all_but_key1(&port);
+                            mailer.remove_by_key1(&port);
+                        }
                         let mut queue = ctx.register_queue.lock().unwrap();
                         if let Some(index) = queue.iter().position(|queue_port| port == *queue_port)
                         {
@@ -309,7 +310,7 @@ impl Demuxer {
                 }
                 Event::Task(Some(Err(_err))) => todo!(),
                 Event::Register(None) | Event::Disconnect(None) | Event::GivebackUrb(None) => break,
-                Event::Task(Some(Ok(Continuation::Other))) | Event::Task(None) => (),
+                Event::Task(None) => (),
             };
         }
 
