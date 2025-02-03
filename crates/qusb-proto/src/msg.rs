@@ -66,13 +66,14 @@
 
 use std::{
     ffi::OsStr,
+    io,
     mem::{offset_of, size_of},
     os::unix::ffi::OsStrExt,
     path::Path,
 };
 
 use thiserror::Error;
-use zerocopy::{try_transmute, FromBytes, TryFromBytes};
+use zerocopy::{try_transmute, FromBytes, IntoBytes, TryFromBytes};
 use zerocopy_derive::*;
 
 use crate::{GetSliceLen, GetSliceLenErr};
@@ -150,6 +151,71 @@ pub enum Status {
 pub struct UsbDeviceId {
     pub bus_number: u8,
     pub device_addr: u8,
+}
+
+#[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
+#[repr(C, align(8))]
+struct ReqListDevices {
+    version: Version,
+    req: Request,
+}
+
+#[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
+#[repr(C, align(8))]
+struct ReqBorrowDevice {
+    version: Version,
+    req: Request,
+    id: UsbDeviceId,
+    _padding: [u8; 6],
+}
+
+#[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
+#[repr(C, align(8))]
+struct ReqLendDevice {
+    version: Version,
+    req: Request,
+    id: UsbDeviceId,
+    _padding: [u8; 6],
+}
+
+#[inline]
+pub async fn req_list_devices<W: tokio::io::AsyncWrite + Unpin>(mut tx: W) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let request = ReqListDevices {
+        version: crate::QUSB_VER,
+        req: Request::ListDevices,
+    };
+    tx.write_all_buf(&mut request.as_bytes()).await
+}
+
+#[inline]
+pub async fn req_borrow<W: tokio::io::AsyncWrite + Unpin>(
+    mut tx: W,
+    id: UsbDeviceId,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let request = ReqBorrowDevice {
+        version: crate::QUSB_VER,
+        req: Request::BorrowDevice,
+        id,
+        _padding: Default::default(),
+    };
+    tx.write_all_buf(&mut request.as_bytes()).await
+}
+
+#[inline]
+pub async fn req_lend<W: tokio::io::AsyncWrite + Unpin>(
+    mut tx: W,
+    id: UsbDeviceId,
+) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let request = ReqLendDevice {
+        version: crate::QUSB_VER,
+        req: Request::LendDevice,
+        id,
+        _padding: Default::default(),
+    };
+    tx.write_all_buf(&mut request.as_bytes()).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -460,3 +526,24 @@ pub mod mass_storage {
         pub bm_cbw_status: u8,
     }
 }
+
+// CONST TESTS FOR ALIGNMENT
+// All complete messages must be aligned to 8 bytes.
+
+const fn _size_of_req_list_devices() -> usize {
+    size_of::<Version>() + size_of::<Request>()
+}
+
+const _: [u8; ((_size_of_req_list_devices() % 8 == 0) as usize) - 1] = [];
+
+const fn _size_of_req_borrow_device() -> usize {
+    size_of::<Version>() + size_of::<Request>() + size_of::<UsbDeviceId>() + size_of::<[u8; 6]>()
+}
+
+const _: [u8; ((_size_of_req_borrow_device() % 8 == 0) as usize) - 1] = [];
+
+const fn _size_of_req_lend_device() -> usize {
+    size_of::<Version>() + size_of::<Request>() + size_of::<UsbDeviceId>() + size_of::<[u8; 6]>()
+}
+
+const _: [u8; ((_size_of_req_lend_device() % 8 == 0) as usize) - 1] = [];

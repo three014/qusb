@@ -316,7 +316,7 @@ impl Session {
 
     #[tracing::instrument(skip_all, level = "trace")]
     pub async fn req_list_devices(&self) -> Result<UsbDevices> {
-        let (mut tx, mut rx) = self
+        let (tx, mut rx) = self
             .conn
             .open_bi()
             .await
@@ -324,14 +324,11 @@ impl Session {
         trace!("established stream with stream id {:?}", tx.id());
         let mut buf = Ring::with_capacity(1024);
 
-        let version = proto::QUSB_VER;
-        let req = msg::Request::ListDevices;
+        msg::req_list_devices(tx).await?;
 
-        let mut request = version.as_bytes().chain(req.as_bytes());
-        tx.write_all_buf(&mut request).await?;
-        drop(tx);
-
-        while 0 == buf.fill_with_reader(&mut rx).await? {}
+        // Arbitrary number that's probably more than what's needed for the
+        // number of usb devices the other machine has connected.
+        buf.fill_until(&mut rx, 8192).await?;
         trace!("finished reading from remote stream");
         let status = match buf.read() {
             Ok(status) => status,
@@ -375,19 +372,9 @@ impl Session {
         let mut buf = Ring::with_capacity(1024);
 
         trace!("established stream with stream id {:?}", tx.id());
+        
+        msg::req_borrow(&mut tx, id).await?;
 
-        let version = proto::QUSB_VER;
-        let req = msg::Request::BorrowDevice;
-
-        let mut req = version
-            .as_bytes()
-            .chain(req.as_bytes())
-            .chain(id.as_bytes())
-            .chain(&[0u8; 6][..]);
-
-        debug_assert_eq!(req.remaining() % size_of::<u64>(), 0);
-
-        tx.write_all_buf(&mut req).await?;
         trace!(
             "sent request to borrow device {id:?} from peer @ {:?}",
             self.conn.remote_address()
@@ -449,18 +436,8 @@ impl Session {
 
         trace!("established stream with stream id {:?}", tx.id());
 
-        let version = proto::QUSB_VER;
-        let req = msg::Request::LendDevice;
+        msg::req_lend(&mut tx, id).await?;
 
-        let mut req = version
-            .as_bytes()
-            .chain(req.as_bytes())
-            .chain(id.as_bytes())
-            .chain(&[0u8; 6][..]);
-
-        debug_assert_eq!(req.remaining() % size_of::<u64>(), 0);
-
-        tx.write_all_buf(&mut req).await?;
         trace!(
             "sent request to lend device {id:?} to peer @ {:?}",
             self.conn.remote_address()
