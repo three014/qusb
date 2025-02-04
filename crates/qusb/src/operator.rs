@@ -34,17 +34,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::{
     stub::{self, RegisterPort},
     utils::{self, align_to_usize, SimpleMap},
-    Error, Result, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
+    Error, Result, UrbWithIsoData, UrbWithIsoGiveback,
 };
-
-/// Rust-representation of a peer request
-pub enum ClientReq {
-    ListDevices,
-    BorrowDevice(msg::UsbDeviceId),
-    LendDevice(msg::UsbDeviceId),
-}
-
-const HEADER_SIZE: usize = size_of::<Header>();
 
 enum Recv {
     Urb((Header, Data<UrbFrame>)),
@@ -53,7 +44,7 @@ enum Recv {
 }
 
 async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Result<Option<Recv>> {
-    let mut min_len = HEADER_SIZE;
+    let mut min_len = size_of::<Header>();
     let frame: Data<QusbFrame> = loop {
         if buf.fill_until(&mut rx, min_len).await?.is_none() {
             return Ok(None);
@@ -178,16 +169,18 @@ pub struct BorrowDevice<W, R> {
     rx: R,
     buf_rx: Ring,
     vhci: stub::Controller,
+    data_rate: msg::DataRate,
     id: msg::UsbDeviceId,
 }
 
 impl<W, R> BorrowDevice<W, R> {
-    pub fn new(tx: W, rx: R, buf_rx: Ring, vhci: stub::Controller, id: msg::UsbDeviceId) -> Self {
+    pub fn new(tx: W, rx: R, buf_rx: Ring, vhci: stub::Controller, data_rate: msg::DataRate, id: msg::UsbDeviceId) -> Self {
         Self {
             tx,
             rx,
             buf_rx,
             vhci,
+            data_rate,
             id,
         }
     }
@@ -212,12 +205,13 @@ where
     /// Due to the reasons above, this function is not cancel
     /// safe.
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn borrow(self) -> Result<()> {
+    pub async fn borrow(self, cancel_token: CancellationToken) -> Result<()> {
         let Self {
             mut tx,
             mut rx,
             mut buf_rx,
             mut vhci,
+            data_rate,
             id: _dev_id,
         } = self;
 
@@ -225,8 +219,13 @@ where
         let mut scratch_buf = [0u8; BUF_LEN];
         buf_rx.reserve(8192);
 
+        let data_rate = match data_rate {
+            msg::DataRate::Low => DataRate::Low,
+            msg::DataRate::Full => DataRate::Full,
+            msg::DataRate::High => DataRate::High,
+        };
         let (port, mut work_rx) = vhci
-            .register(RegisterPort::Any, DataRate::High)
+            .register(RegisterPort::Any, data_rate)
             .await
             .unwrap();
 
@@ -238,6 +237,7 @@ where
         enum Event {
             Work(Option<ioctl::Work>),
             Frame(io::Result<Option<Recv>>),
+            Cancelled
         }
 
         let seqnum = AtomicU32::new(0);
@@ -257,6 +257,9 @@ where
                 }
                 maybe_frame = recv_frame(&mut rx, &mut buf_rx) => {
                     Event::Frame(maybe_frame)
+                }
+                _ = cancel_token.cancelled() => {
+                    Event::Cancelled
                 }
             };
 
@@ -503,7 +506,7 @@ where
                     msg::Status::Proto => todo!(),
                     msg::Status::Success => unreachable!(),
                 },
-                Event::Frame(Ok(None)) => break Ok(()),
+                Event::Frame(Ok(None)) | Event::Cancelled => break Ok(()),
                 Event::Frame(Err(err)) => break Err(err.into()),
                 Event::Work(None) => todo!("how did we get here? should we shutdown here?"),
                 Event::Frame(Ok(Some(Recv::Unlink(_)))) => unreachable!("smh smh server"),
@@ -556,7 +559,7 @@ fn set_config<C: rusb::UsbContext>(
     }
 }
 
-fn open_device(dev_id: msg::UsbDeviceId) -> rusb::Result<Arc<rusb::DeviceHandle<rusb::Context>>> {
+pub(crate) fn open_device(dev_id: msg::UsbDeviceId) -> rusb::Result<rusb::DeviceHandle<rusb::Context>> {
     rusb::Context::new()
         .and_then(|ctx| ctx.devices())
         .and_then(|list| {
@@ -575,7 +578,7 @@ fn open_device(dev_id: msg::UsbDeviceId) -> rusb::Result<Arc<rusb::DeviceHandle<
                 }
             }
             handle.unconfigure()?;
-            Ok(Arc::new(handle))
+            Ok(handle)
         })
 }
 
@@ -818,12 +821,13 @@ pub struct LendDevice<W, R> {
     tx: W,
     rx: R,
     buf_rx: Ring,
+    device: rusb::DeviceHandle<rusb::Context>,
     id: msg::UsbDeviceId,
 }
 
 impl<W, R> LendDevice<W, R> {
-    pub fn new(tx: W, rx: R, buf_rx: Ring, id: msg::UsbDeviceId) -> Self {
-        Self { tx, rx, buf_rx, id }
+    pub fn new(tx: W, rx: R, buf_rx: Ring, device: rusb::DeviceHandle<rusb::Context>, id: msg::UsbDeviceId) -> Self {
+        Self { tx, rx, buf_rx, device, id }
     }
 }
 
@@ -833,39 +837,22 @@ where
     R: AsyncRead + Unpin,
 {
     #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn lend(self) -> Result<()> {
+    pub async fn lend(self, cancel_token: CancellationToken) -> Result<()> {
         let Self {
             mut tx,
             mut rx,
             mut buf_rx,
+            device,
             id: dev_id,
         } = self;
 
         enum Event {
             RecvFrame(Option<Recv>),
             SendFrame((Header, UrbHeader, Option<UsbMemMut>, BytesMut)),
+            Cancelled
         }
 
-        // TODO: Use global context instead
-        let device = match open_device(dev_id) {
-            Ok(handle) => {
-                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
-                tx.write_all_buf(&mut response).await?;
-                handle
-            }
-            Err(err) => {
-                let err = RusbError { kind: err, dev_id };
-                let ret_err = Error::from(err);
-                let status = msg::Status::from(err);
-
-                let mut response = status.as_bytes().chain(&[0u8; 7][..]);
-
-                tx.write_all_buf(&mut response).await.unwrap();
-                tx.close().await.unwrap();
-                return Err(ret_err);
-            }
-        };
-
+        let device = Arc::new(device);
         let event_handler = CancellationToken::new();
         let runtime = event_handler.clone();
         let ctx = device.context().clone();
@@ -902,6 +889,9 @@ where
                 }
                 result = active_transfers.join_next(), if check_transfer => {
                     Event::SendFrame(result.unwrap().unwrap())
+                }
+                _ = cancel_token.cancelled() => {
+                    Event::Cancelled
                 }
             } {
                 Event::RecvFrame(Some(Recv::Urb((header, urb_frame)))) => {
@@ -1340,7 +1330,7 @@ where
                         break Err(Error::ReqFailed);
                     }
                 }
-                Event::RecvFrame(None) => break Ok(()),
+                Event::RecvFrame(None) | Event::Cancelled => break Ok(()),
             }
         };
 
@@ -1381,13 +1371,13 @@ where
 
         let devices = match iter() {
             Ok(devices) => {
-                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
-                tx.write_all_buf(&mut response).await?;
+                let response = msg::Resp::ListDevices { _padding: Default::default() };
+                msg::send_resp(&mut tx, response).await?;
                 devices
             }
             Err(err) => {
-                let mut response = msg::Status::Failed.as_bytes().chain(&[0u8; 7][..]);
-                tx.write_all_buf(&mut response).await?;
+                let response = msg::Resp::Failure { stat: msg::Status::Failed, ver: msg::VersionOpt::None(Default::default())  };
+                msg::send_resp(&mut tx, response).await?;
                 tx.close().await?;
                 return Err(err.into());
             }

@@ -1,5 +1,4 @@
-use bytes::Buf;
-use operator::{BorrowDevice, ClientReq, LendDevice, SendDevices, ServerResp};
+use operator::{BorrowDevice, LendDevice, SendDevices, ServerResp};
 use proto::{
     data::{IterDst, IterMutDst, ReadError, Ring},
     msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
@@ -13,20 +12,21 @@ use std::{
     path::Path,
     sync::{Arc, LazyLock},
 };
-use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn, Instrument};
 use usb_ids::UsbIds;
-use utils::{align_to_usize, CloseStream};
-use vhci::utils::BoundedU8;
-use zerocopy::{FromZeros, IntoBytes};
+use utils::CloseStream;
+use zerocopy::FromZeros;
 
+pub use quinn;
 pub use quinn::rustls;
 pub use rcgen;
+pub use vhci::utils::BoundedU8;
 
 mod operator;
 mod stub;
 mod usb_ids;
-pub mod utils;
+mod utils;
 
 static USB_IDS: LazyLock<UsbIds> =
     LazyLock::new(|| usb_ids::parse(Path::new("./usb-ids")).unwrap());
@@ -122,7 +122,7 @@ impl From<RusbError> for msg::Status {
     }
 }
 
-pub struct UrbWithIsoData<'a> {
+pub(crate) struct UrbWithIsoData<'a> {
     pub handle: vhci::ioctl::UrbHandle,
     pub header: &'a msg::UrbHeader,
     pub transfer: &'a mut [u8],
@@ -168,7 +168,7 @@ impl vhci::IsoPacketDataMut for UrbWithIsoData<'_> {
 }
 
 #[derive(Debug)]
-pub struct UrbWithIsoGiveback<'a> {
+pub(crate) struct UrbWithIsoGiveback<'a> {
     pub handle: vhci::ioctl::UrbHandle,
     pub header: &'a msg::UrbHeader,
     pub transfer: &'a mut [u8],
@@ -251,63 +251,86 @@ impl Session {
         let (mut tx, mut rx) = self.conn.accept_bi().await?;
         let mut buf = Ring::with_capacity(32);
 
-        const SIZE_OF_REQUEST: usize = size_of::<msg::Version>() + size_of::<msg::Request>();
-        buf.fill_until(&mut rx, SIZE_OF_REQUEST).await?;
+        buf.fill_until(&mut rx, size_of::<msg::ReqFrame>()).await?;
 
-        let version: msg::Version = match buf.read() {
-            Ok(version) => version,
+        let msg::ReqFrame { version, req } = match buf.read() {
+            Ok(frame) => frame,
             Err(ReadError::CorruptedData) => {
-                unreachable!("msg::Version has FromBytes impl, and should be aligned")
+                let response = msg::Resp::Failure {
+                    stat: msg::Status::Proto,
+                    ver: msg::VersionOpt::Some(proto::QUSB_VER),
+                };
+                msg::send_resp(&mut tx, response).await?;
+                tx.close().await?;
+                return Err(Error::Unknown);
             }
             Err(ReadError::BufferShort { .. }) => {
                 unreachable!("we should have read enough data to get the version")
             }
         };
         if !version.is_compat(&proto::QUSB_VER) {
-            let mut response = msg::Status::VersionMismatch
-                .as_bytes()
-                .chain(&[0u8; 7][..])
-                .chain(proto::QUSB_VER.as_bytes())
-                .chain(&[0u8; 4][..]);
-            tx.write_all_buf(&mut response).await?;
+            let response = msg::Resp::Failure {
+                stat: msg::Status::VersionMismatch,
+                ver: msg::VersionOpt::Some(proto::QUSB_VER),
+            };
+            msg::send_resp(&mut tx, response).await?;
             tx.close().await?;
             return Err(Error::VersionMismatch(version));
         }
 
-        let req = match buf.read::<msg::Request>().and_then(|req| match req {
-            msg::Request::ListDevices => Ok::<_, ReadError>(ClientReq::ListDevices),
-            msg::Request::BorrowDevice => Ok(ClientReq::BorrowDevice(buf.read()?)),
-            msg::Request::LendDevice => Ok(ClientReq::LendDevice(buf.read()?)),
-        }) {
-            Ok(ClientReq::ListDevices) => ServerResp::ListDevices(SendDevices::new(tx)),
-            Ok(ClientReq::BorrowDevice(device)) => {
-                buf.consume(6);
+        let req = match req {
+            msg::Req::ListDevices { .. } => ServerResp::ListDevices(SendDevices::new(tx)),
+            msg::Req::BorrowDevice { dev_id, .. } => {
+                // TODO: Use global context instead
+                let device = match operator::open_device(dev_id) {
+                    Ok(handle) => {
+                        let data_rate = match handle.device().speed() {
+                            rusb::Speed::Unknown | rusb::Speed::Low => msg::DataRate::Low,
+                            rusb::Speed::Full => msg::DataRate::Full,
+                            rusb::Speed::High | rusb::Speed::Super | rusb::Speed::SuperPlus => {
+                                msg::DataRate::High
+                            }
+                            _ => unimplemented!(),
+                        };
 
-                ServerResp::BorrowDevice(LendDevice::new(tx, rx, buf, device))
+                        let response = msg::Resp::BorrowDevice {
+                            data_rate,
+                            _padding: Default::default(),
+                        };
+                        msg::send_resp(&mut tx, response).await?;
+
+                        handle
+                    }
+                    Err(err) => {
+                        let err = RusbError { kind: err, dev_id };
+                        let ret_err = Error::from(err);
+                        let status = msg::Status::from(err);
+                        let response = msg::Resp::Failure {
+                            stat: status,
+                            ver: msg::VersionOpt::None(Default::default()),
+                        };
+
+                        msg::send_resp(&mut tx, response).await?;
+                        tx.close().await?;
+                        return Err(ret_err);
+                    }
+                };
+                ServerResp::BorrowDevice(LendDevice::new(tx, rx, buf, device, dev_id))
             }
-            Ok(ClientReq::LendDevice(device)) => {
-                buf.consume(6);
+            msg::Req::LendDevice { dev_id, data_rate } => {
+                let response = msg::Resp::LendDevice {
+                    _padding: Default::default(),
+                };
+                msg::send_resp(&mut tx, response).await?;
 
-                let mut response = msg::Status::Success.as_bytes().chain(&[0u8; 7][..]);
-                tx.write_all_buf(&mut response).await?;
-
-                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
-                    .await?;
-                buf.read::<msg::Status>().unwrap();
-                buf.consume(7);
-
-                ServerResp::LendDevice(BorrowDevice::new(tx, rx, buf, self.dev.clone(), device))
-            }
-            Err(ReadError::CorruptedData) => {
-                let mut response = msg::Status::Proto.as_bytes().chain(&[0u8; 7][..]);
-                tx.write_all_buf(&mut response).await?;
-                tx.close().await?;
-                return Err(Error::Unknown);
-            }
-            Err(ReadError::BufferShort { .. }) => {
-                unimplemented!(
-                    "this could definitely happen, but its not likely for now (famous last words)"
-                )
+                ServerResp::LendDevice(BorrowDevice::new(
+                    tx,
+                    rx,
+                    buf,
+                    self.dev.clone(),
+                    data_rate,
+                    dev_id,
+                ))
             }
         };
 
@@ -324,34 +347,32 @@ impl Session {
         trace!("established stream with stream id {:?}", tx.id());
         let mut buf = Ring::with_capacity(1024);
 
-        msg::req_list_devices(tx).await?;
+        let req = msg::Req::ListDevices {
+            _padding: Default::default(),
+        };
+        msg::send_req(tx, req).await?;
 
         // Arbitrary number that's probably more than what's needed for the
         // number of usb devices the other machine has connected.
         buf.fill_until(&mut rx, 8192).await?;
         trace!("finished reading from remote stream");
-        let status = match buf.read() {
-            Ok(status) => status,
+        let resp = match buf.read() {
+            Ok(resp) => resp,
             Err(ReadError::CorruptedData) => {
-                unreachable!("msg::Status is FromBytes, and should be aligned")
+                unimplemented!()
             }
             Err(ReadError::BufferShort { .. }) => return Err(Error::Unknown),
         };
-        buf.consume(7);
-        match status {
-            msg::Status::Success => {}
-            msg::Status::NoDev | msg::Status::DevBusy | msg::Status::DevErr => unreachable!(),
-            msg::Status::Unexpected | msg::Status::Failed => {
-                return Err(Error::ReqFailed);
+
+        match resp {
+            msg::Resp::ListDevices { .. } => (),
+            msg::Resp::Failure {
+                stat: msg::Status::VersionMismatch,
+                ver: msg::VersionOpt::Some(theirs),
+            } => {
+                return Err(Error::VersionMismatch(theirs));
             }
-            msg::Status::VersionMismatch => {
-                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Version>()))
-                    .await?;
-                let their_version = buf.read::<msg::Version>().unwrap();
-                return Err(Error::VersionMismatch(their_version));
-            }
-            msg::Status::Timeout => todo!(),
-            msg::Status::Proto => todo!(),
+            _ => unimplemented!(),
         }
 
         Ok(UsbDevices(buf))
@@ -372,51 +393,49 @@ impl Session {
         let mut buf = Ring::with_capacity(1024);
 
         trace!("established stream with stream id {:?}", tx.id());
-        
-        msg::req_borrow(&mut tx, id).await?;
+
+        let req = msg::Req::BorrowDevice {
+            dev_id: id,
+            _padding: Default::default(),
+        };
+        msg::send_req(&mut tx, req).await?;
 
         trace!(
             "sent request to borrow device {id:?} from peer @ {:?}",
             self.conn.remote_address()
         );
 
-        buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
-            .await?;
+        buf.fill_until(&mut rx, size_of::<msg::Resp>()).await?;
 
         trace!("received enough bytes for a status from peer");
 
-        let status = match buf.read() {
-            Ok(status) => status,
+        let resp = match buf.read() {
+            Ok(resp) => resp,
             Err(ReadError::CorruptedData) => {
-                unreachable!("msg::Status is FromBytes, and should be aligned")
+                unimplemented!()
             }
             Err(ReadError::BufferShort { .. }) => {
-                unreachable!("we should have read enough bytes to read status")
+                unimplemented!()
             }
         };
-        buf.consume(7);
-        match status {
-            msg::Status::Success => (),
-            msg::Status::Failed => return Err(Error::ReqFailed),
-            msg::Status::DevBusy => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
-            msg::Status::DevErr => todo!(),
-            msg::Status::NoDev => {
-                return Err(Error::DevNotFound(id));
-            }
-            msg::Status::Unexpected => {
-                return Err(io::Error::from(io::ErrorKind::InvalidData).into())
-            }
-            msg::Status::VersionMismatch => {
-                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Version>()))
-                    .await?;
-                let their_version = buf.read::<msg::Version>().unwrap();
-                return Err(Error::VersionMismatch(their_version));
-            }
-            msg::Status::Timeout => todo!(),
-            msg::Status::Proto => todo!(),
-        }
+        let data_rate = match resp {
+            msg::Resp::BorrowDevice { data_rate, .. } => data_rate,
+            msg::Resp::Failure {
+                stat: msg::Status::VersionMismatch | msg::Status::Proto,
+                ver: msg::VersionOpt::Some(theirs),
+            } => return Err(Error::VersionMismatch(theirs)),
+            msg::Resp::Failure {
+                stat: msg::Status::DevBusy,
+                ..
+            } => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
+            msg::Resp::Failure {
+                stat: msg::Status::NoDev,
+                ..
+            } => return Err(Error::DevNotFound(id)),
+            _ => unimplemented!(),
+        };
 
-        let client = BorrowDevice::new(tx, rx, buf, self.dev.clone(), id);
+        let client = BorrowDevice::new(tx, rx, buf, self.dev.clone(), data_rate, id);
         Ok(client)
     }
 
@@ -433,53 +452,75 @@ impl Session {
             }
         })?;
         let mut buf = Ring::with_capacity(1024);
-
         trace!("established stream with stream id {:?}", tx.id());
 
-        msg::req_lend(&mut tx, id).await?;
+        // TODO: Use global context instead
+        let device = match operator::open_device(id) {
+            Ok(handle) => {
+                let data_rate = match handle.device().speed() {
+                    rusb::Speed::Unknown | rusb::Speed::Low => msg::DataRate::Low,
+                    rusb::Speed::Full => msg::DataRate::Full,
+                    rusb::Speed::High | rusb::Speed::Super | rusb::Speed::SuperPlus => {
+                        msg::DataRate::High
+                    }
+                    _ => unimplemented!(),
+                };
+
+                let req = msg::Req::LendDevice {
+                    dev_id: id,
+                    data_rate,
+                };
+                msg::send_req(&mut tx, req).await?;
+
+                handle
+            }
+            Err(err) => {
+                let err = RusbError {
+                    kind: err,
+                    dev_id: id,
+                };
+                tx.close().await?;
+                return Err(Error::from(err));
+            }
+        };
 
         trace!(
             "sent request to lend device {id:?} to peer @ {:?}",
             self.conn.remote_address()
         );
 
-        buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Status>()))
-            .await?;
+        buf.fill_until(&mut rx, size_of::<msg::Resp>()).await?;
 
         trace!("received enough bytes for a status from peer");
 
-        let status = match buf.read() {
-            Ok(status) => status,
+        let resp = match buf.read() {
+            Ok(resp) => resp,
             Err(ReadError::CorruptedData) => {
-                unreachable!("msg::Status is FromBytes, and should be aligned")
+                unimplemented!()
             }
             Err(ReadError::BufferShort { .. }) => {
-                unreachable!("we should have read enough bytes to read status")
+                unimplemented!()
             }
         };
-        buf.consume(7);
-        match status {
-            msg::Status::Success => (),
-            msg::Status::Failed => return Err(Error::ReqFailed),
-            msg::Status::DevBusy => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
-            msg::Status::DevErr => todo!(),
-            msg::Status::NoDev => {
-                return Err(Error::DevNotFound(id));
-            }
-            msg::Status::Unexpected => {
-                return Err(io::Error::from(io::ErrorKind::InvalidData).into())
-            }
-            msg::Status::VersionMismatch => {
-                buf.fill_until(&mut rx, align_to_usize(size_of::<msg::Version>()))
-                    .await?;
-                let their_version = buf.read::<msg::Version>().unwrap();
-                return Err(Error::VersionMismatch(their_version));
-            }
-            msg::Status::Timeout => todo!(),
-            msg::Status::Proto => todo!(),
+
+        match resp {
+            msg::Resp::LendDevice { .. } => (),
+            msg::Resp::Failure {
+                stat: msg::Status::VersionMismatch | msg::Status::Proto,
+                ver: msg::VersionOpt::Some(theirs),
+            } => return Err(Error::VersionMismatch(theirs)),
+            msg::Resp::Failure {
+                stat: msg::Status::DevBusy,
+                ..
+            } => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
+            msg::Resp::Failure {
+                stat: msg::Status::NoDev,
+                ..
+            } => return Err(Error::DevNotFound(id)),
+            _ => unimplemented!(),
         }
 
-        let client = LendDevice::new(tx, rx, buf, id);
+        let client = LendDevice::new(tx, rx, buf, device, id);
         Ok(client)
     }
 }
@@ -499,7 +540,7 @@ impl Client {
 }
 
 #[derive(Debug)]
-pub struct UsbDeviceWrapper {
+pub(crate) struct UsbDeviceWrapper {
     info: msg::UsbDeviceInfoHeader,
     interfaces: Box<[msg::UsbInterfaceInfo]>,
 }
@@ -599,29 +640,50 @@ fn get_usb_devices() -> io::Result<
 struct ReqHandler {
     vhci: stub::Controller,
     incoming: quinn::Incoming,
+    cancel_token: CancellationToken,
 }
 
 impl ReqHandler {
-    const fn new(vhci: stub::Controller, incoming: quinn::Incoming) -> Self {
-        Self { vhci, incoming }
+    const fn new(
+        vhci: stub::Controller,
+        incoming: quinn::Incoming,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            vhci,
+            incoming,
+            cancel_token,
+        }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn handle_req(self) -> Result<()> {
-        let conn = self.incoming.await.inspect_err(|err| warn! { %err })?;
+    async fn open_session(self) -> Result<()> {
+        let conn = tokio::select! {
+            biased;
+            conn = self.incoming => {
+                conn.inspect_err(|err| warn! { %err })?
+            }
+            _ = self.cancel_token.cancelled() => {
+                return Ok(())
+            }
+        };
         trace!(
             "established new session with {} - RTT {:?}",
             conn.remote_address(),
             conn.rtt()
         );
         let session = Session::new(conn.clone(), self.vhci);
-        while conn.close_reason().is_none() {
+        while conn.close_reason().is_none() && !self.cancel_token.is_cancelled() {
             match session.accept_stream().await? {
                 ServerResp::ListDevices(operator) => {
                     operator.send_device_list(get_usb_devices).await?;
                 }
-                ServerResp::BorrowDevice(operator) => operator.lend().await?,
-                ServerResp::LendDevice(operator) => operator.borrow().await?,
+                ServerResp::BorrowDevice(operator) => {
+                    operator.lend(self.cancel_token.clone()).await?
+                }
+                ServerResp::LendDevice(operator) => {
+                    operator.borrow(self.cancel_token.clone()).await?
+                }
             }
         }
 
@@ -629,7 +691,7 @@ impl ReqHandler {
     }
 }
 
-pub type ServerTaskResult =
+pub(crate) type ServerTaskResult =
     std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>;
 
 #[derive(Debug)]
@@ -641,7 +703,7 @@ pub struct Server {
 impl Server {
     #[tracing::instrument(skip_all, level = "trace")]
     pub fn serve(self) -> ServerHandle {
-        let cancel_for_handle = tokio_util::sync::CancellationToken::new();
+        let cancel_for_handle = CancellationToken::new();
         let cancel_for_serve = cancel_for_handle.clone();
         let handle = tokio::spawn(
             async move {
@@ -671,7 +733,14 @@ impl Server {
                     match event {
                         Event::Incoming(Some(incoming)) => {
                             debug!("Incoming connection from {}", incoming.remote_address());
-                            set.spawn(ReqHandler::new(self.dev.clone(), incoming).handle_req());
+                            set.spawn(
+                                ReqHandler::new(
+                                    self.dev.clone(),
+                                    incoming,
+                                    cancel_for_serve.clone(),
+                                )
+                                .open_session(),
+                            );
                         }
                         Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
                             info!("session {id} completed successfully")
@@ -706,7 +775,7 @@ impl Server {
 
 pub struct ServerHandle {
     handle: tokio::task::JoinHandle<Result<()>>,
-    cancel_token: tokio_util::sync::CancellationToken,
+    cancel_token: CancellationToken,
 }
 
 impl ServerHandle {

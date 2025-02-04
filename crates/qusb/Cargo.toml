@@ -12,7 +12,6 @@ tokio = { version = "1.41.1", features = [
     "sync",
     "macros",
     "rt",
-    "rt-multi-thread",
 ] }
 proto = { package = "qusb-proto", path = "../qusb-proto" }
 nohash-hasher = "0.2.0"

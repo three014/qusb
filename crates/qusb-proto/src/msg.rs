@@ -101,14 +101,6 @@ impl std::fmt::Display for Version {
     }
 }
 
-#[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
-#[repr(C)]
-pub enum Request {
-    ListDevices,
-    BorrowDevice,
-    LendDevice,
-}
-
 #[derive(
     Debug,
     Error,
@@ -154,68 +146,78 @@ pub struct UsbDeviceId {
 }
 
 #[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
-#[repr(C, align(8))]
-struct ReqListDevices {
-    version: Version,
-    req: Request,
+#[repr(u8)]
+pub enum Req {
+    ListDevices {
+        _padding: [u8; 3],
+    } = 0,
+    BorrowDevice {
+        _padding: [u8; 1],
+        dev_id: UsbDeviceId,
+    } = 1,
+    LendDevice {
+        data_rate: DataRate,
+        dev_id: UsbDeviceId,
+    } = 2,
 }
 
 #[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
-#[repr(C, align(8))]
-struct ReqBorrowDevice {
-    version: Version,
-    req: Request,
-    id: UsbDeviceId,
-    _padding: [u8; 6],
+pub struct ReqFrame {
+    pub version: Version,
+    pub req: Req,
 }
 
 #[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
-#[repr(C, align(8))]
-struct ReqLendDevice {
-    version: Version,
-    req: Request,
-    id: UsbDeviceId,
-    _padding: [u8; 6],
+#[repr(u16)]
+pub enum VersionOpt {
+    Some(Version),
+    None([u8; 4])
+}
+
+#[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(u8)]
+pub enum DataRate {
+    Low = 0,
+    Full,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
+#[repr(u8)]
+pub enum Resp {
+    ListDevices {
+        _padding: [u8; 7],
+    } = 0,
+    BorrowDevice {
+        data_rate: DataRate,
+        _padding: [u8; 6],
+    } = 1,
+    LendDevice {
+        _padding: [u8; 7],
+    },
+    Failure {
+        stat: Status,
+        ver: VersionOpt,
+    } = 3,
 }
 
 #[inline]
-pub async fn req_list_devices<W: tokio::io::AsyncWrite + Unpin>(mut tx: W) -> io::Result<()> {
+pub async fn send_req<W: tokio::io::AsyncWrite + Unpin>(mut tx: W, req: Req) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let request = ReqListDevices {
-        version: crate::QUSB_VER,
-        req: Request::ListDevices,
-    };
-    tx.write_all_buf(&mut request.as_bytes()).await
+    tx.write_all_buf(
+        &mut ReqFrame {
+            version: crate::QUSB_VER,
+            req,
+        }
+        .as_bytes(),
+    )
+    .await
 }
 
 #[inline]
-pub async fn req_borrow<W: tokio::io::AsyncWrite + Unpin>(
-    mut tx: W,
-    id: UsbDeviceId,
-) -> io::Result<()> {
+pub async fn send_resp<W: tokio::io::AsyncWrite + Unpin>(mut tx: W, resp: Resp) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let request = ReqBorrowDevice {
-        version: crate::QUSB_VER,
-        req: Request::BorrowDevice,
-        id,
-        _padding: Default::default(),
-    };
-    tx.write_all_buf(&mut request.as_bytes()).await
-}
-
-#[inline]
-pub async fn req_lend<W: tokio::io::AsyncWrite + Unpin>(
-    mut tx: W,
-    id: UsbDeviceId,
-) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let request = ReqLendDevice {
-        version: crate::QUSB_VER,
-        req: Request::LendDevice,
-        id,
-        _padding: Default::default(),
-    };
-    tx.write_all_buf(&mut request.as_bytes()).await
+    tx.write_all_buf(&mut resp.as_bytes()).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -524,12 +526,3 @@ pub mod mass_storage {
         pub bm_cbw_status: u8,
     }
 }
-
-// CONST TESTS FOR ALIGNMENT
-// All complete messages must be aligned to 8 bytes.
-
-const _: [u8; ((size_of::<ReqListDevices>() % 8 == 0) as usize) - 1] = [];
-
-const _: [u8; ((size_of::<ReqBorrowDevice>() % 8 == 0) as usize) - 1] = [];
-
-const _: [u8; ((size_of::<ReqLendDevice>() % 8 == 0) as usize) - 1] = [];
