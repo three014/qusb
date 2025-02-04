@@ -20,7 +20,6 @@ use zerocopy::FromZeros;
 
 pub use quinn;
 pub use quinn::rustls;
-pub use rcgen;
 pub use vhci::utils::BoundedU8;
 
 mod operator;

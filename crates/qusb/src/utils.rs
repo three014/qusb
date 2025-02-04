@@ -1,4 +1,5 @@
-use crate::rustls;
+#![allow(dead_code)]
+
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
 use std::{
@@ -8,7 +9,6 @@ use std::{
     future::Future,
     hash::Hash,
     io,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;

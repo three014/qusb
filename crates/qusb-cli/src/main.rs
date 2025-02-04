@@ -1,27 +1,28 @@
 use std::{
     fs,
-    io::{stdout, BufWriter},
+    io::stdout,
     net::SocketAddr,
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use clap::{arg, Command};
-use qusb::{quinn, rcgen, rustls, BoundedU8};
+use qusb::{quinn, rustls, BoundedU8};
+use rcgen;
 use tracing_subscriber::EnvFilter;
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .thread_keep_alive(Duration::from_secs(60))
-        .build()
-        .unwrap();
+        .build()?;
 
-    rt.block_on(async_main());
+    rt.block_on(async_main())
 }
 
-async fn async_main() {
+async fn async_main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
 
     let log_path = "qusb-cli.log";
@@ -30,8 +31,7 @@ async fn async_main() {
         .read(true)
         .write(true)
         .truncate(true)
-        .open(log_path)
-        .unwrap();
+        .open(log_path)?;
     _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
         .with_line_number(true)
@@ -43,6 +43,11 @@ async fn async_main() {
             let bind: Option<SocketAddr> = sub_matches.get_one("bind_addr").cloned();
             let make_self_signed: bool = sub_matches.get_flag("make_self_signed");
             let num_ports = BoundedU8::new(4).unwrap();
+            let conf_dir = if let Some(dir) = sub_matches.get_one::<String>("config_dir") {
+                PathBuf::from(dir)
+            } else {
+                std::env::current_dir()?
+            };
 
             let (server_cfg, cert) = if make_self_signed {
                 make_self_signed_cfg()
@@ -50,7 +55,15 @@ async fn async_main() {
                 panic!()
             };
 
-            fs::write("cert", cert.pem()).unwrap();
+            println!("config directory: {}", conf_dir.display());
+            println!(
+                "bind address: {}",
+                bind.unwrap_or("[::]:7400".parse().unwrap())
+            );
+            println!("make and use self-signed certificate: {}", make_self_signed);
+
+            fs::write("server.pem", cert.pem())?;
+            return Ok(());
 
             let mut certs = rustls::RootCertStore::empty();
             certs
@@ -69,7 +82,8 @@ async fn async_main() {
                 .await
                 .expect("failed to listen for event");
 
-            handle.shutdown().await.unwrap().unwrap();
+            handle.shutdown().await.unwrap()?;
+            Ok(())
         }
         _ => todo!(),
     }
@@ -90,6 +104,7 @@ fn cli() -> Command {
                         .value_parser(SocketAddr::from_str),
                 )
                 .arg(arg!(make_self_signed: --"use-self-signed-certs" "Create and sign certificates for this session only. The created certificates are output in the current working directory."))
+                .arg(arg!(config_dir: -f --"conf-dir" [DIR] "Directory to store configuration files, client/server certificates, etc."))
         )
 }
 
