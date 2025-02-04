@@ -1,5 +1,7 @@
 /target
 notes/
 sandbox/
-log
+*.log
 *.txt
+*.svg
+*perf*

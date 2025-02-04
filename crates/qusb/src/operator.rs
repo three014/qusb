@@ -23,7 +23,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn, Instrument};
+use tracing::{debug, error, info, trace, trace_span, warn, warn_span, Instrument};
 use vhci::{
     ioctl::{self, UrbType},
     usbfs::{Dir, Request},
@@ -33,7 +33,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     stub::{self, RegisterPort},
-    utils::{self, align_to_usize, SimpleMap, Timer},
+    utils::{self, align_to_usize, SimpleMap},
     Error, Result, RusbError, UrbWithIsoData, UrbWithIsoGiveback,
 };
 
@@ -98,7 +98,6 @@ async fn handle_port_stat<W: AsyncWrite + Unpin>(
     handles: &mut SimpleMap<u32, ioctl::UrbHandle>,
     mut tx: W,
 ) {
-    let timer = Timer::start();
     let status = next.status();
     let change = next.change();
     let flags = next.flags();
@@ -112,7 +111,7 @@ async fn handle_port_stat<W: AsyncWrite + Unpin>(
         debug!("RESET successful -> use default address");
         *addr = 0;
     } else if prev.status().contains(PortStatus::POWER) && (!status).contains(PortStatus::POWER) {
-        debug!("port is powered off");
+        // debug!("port is powered off");
     } else if (!prev.status()).contains(PortStatus::RESET)
         && status.contains(PortStatus::RESET | PortStatus::CONNECTION)
     {
@@ -130,10 +129,6 @@ async fn handle_port_stat<W: AsyncWrite + Unpin>(
             status: msg::Status::Success,
         };
 
-        timer.stop_and_report(
-            Some(Duration::from_nanos(100)),
-            "setting up port reset frame",
-        );
         let mut request = header.as_bytes();
         tx.write_all_buf(&mut request).await.unwrap();
     } else if (!prev.flags()).contains(PortFlag::RESUMING)
@@ -168,7 +163,7 @@ impl std::fmt::Display for BorrowId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Remote Dev {:03}/{:03}, Local Port {}",
+            "remote dev {:03}/{:03}, local port {}",
             self.remote_dev.bus_number,
             self.remote_dev.device_addr,
             self.local_port.get()
@@ -225,7 +220,7 @@ where
             mut vhci,
             id: _dev_id,
         } = self;
-        
+
         const BUF_LEN: usize = 16 << 10;
         let mut scratch_buf = [0u8; BUF_LEN];
         buf_rx.reserve(8192);
@@ -346,8 +341,7 @@ where
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle)))) => {
                     assert_eq!(addr, urb.address.get());
-                    debug!("({id}) got urb (DevAddr({addr:03}))");
-                    let timer = Timer::start();
+                    // debug!("({id}, local dev {addr:03})");
 
                     let next_seqnum = seqnum.fetch_add(1, Ordering::Relaxed);
                     assert!(handles.insert(next_seqnum, handle).is_none());
@@ -415,18 +409,10 @@ where
                                 .chain(urb_header.as_bytes())
                                 .chain(data.as_bytes());
 
-                            timer.stop_and_report(
-                                Some(Duration::from_nanos(500)),
-                                "setting up URB frame for sending",
-                            );
                             tx.write_all_buf(&mut request).await.unwrap();
                         }
                         Dir::Out | Dir::In => {
                             let mut request = header.as_bytes().chain(urb_header.as_bytes());
-                            timer.stop_and_report(
-                                Some(Duration::from_nanos(50)),
-                                "setting up URB frame for sending",
-                            );
                             tx.write_all_buf(&mut request).await.unwrap();
                         }
                     }
@@ -455,7 +441,6 @@ where
                     },
                     mut urb,
                 ))))) => {
-                    let timer = Timer::start();
                     let handle = handles.remove(&seqnum).unwrap();
                     let _ = seqnums.remove(&handle).unwrap();
                     let frame = urb.get_mut();
@@ -491,11 +476,6 @@ where
                         transfer,
                         iso_giveback,
                     };
-
-                    timer.stop_and_report(
-                        Some(Duration::from_nanos(500)),
-                        "unpacking URB for giveback",
-                    );
 
                     vhci.giveback_urb(lender_urb).await.unwrap();
                 }
@@ -599,7 +579,7 @@ fn open_device(dev_id: msg::UsbDeviceId) -> rusb::Result<Arc<rusb::DeviceHandle<
         })
 }
 
-#[tracing::instrument(level = "trace", skip_all)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn port_reset<C: rusb::UsbContext>(
     seqnum: u32,
     dev_id: msg::UsbDeviceId,
@@ -626,12 +606,11 @@ enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-#[tracing::instrument(level = "trace", skip_all)]
+// #[tracing::instrument(level = "trace", skip_all)]
 fn get_or_alloc_transfer(
     mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     num_iso_packets: u16,
 ) -> InnerTransfer {
-    let timer = Timer::start();
     let mut maybe_first_entry;
     let maybe_entry = if 0 == num_iso_packets {
         maybe_first_entry = cache.first_entry();
@@ -668,39 +647,28 @@ fn get_or_alloc_transfer(
         if remove_entry {
             cache.remove(&(transfer.num_iso_packets() as u16));
         }
-        timer.stop_and_report(Some(Duration::from_nanos(500)), "getting a transfer");
         transfer
     } else {
         drop(cache);
-        timer.stop_and_report(Some(Duration::from_nanos(500)), "allocating a transfer");
         InnerTransfer::new(num_iso_packets as usize)
     }
 }
 
-#[tracing::instrument(level = "trace", skip_all)]
+// #[tracing::instrument(level = "trace", skip_all)]
 fn insert_spare_transfer(
     mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     transfer: InnerTransfer,
 ) {
-    let timer = Timer::start();
     const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
     let entry = cache.get_mut(&(transfer.num_iso_packets() as u16));
     match entry {
         Some(entry) => match std::mem::replace(entry, EMPTY) {
             OneOrMany::One(other) => {
                 *entry = OneOrMany::Many(vec![transfer, other]);
-                timer.stop_and_report(
-                    Some(Duration::from_nanos(500)),
-                    "inserting a spare transfer into a newly allocated bucket",
-                );
             }
             OneOrMany::Many(mut vec) => {
                 vec.push(transfer);
                 *entry = OneOrMany::Many(vec);
-                timer.stop_and_report(
-                    Some(Duration::from_nanos(500)),
-                    "inserting a spare transfer",
-                );
             }
         },
         // Almost all our transfers will be made for Ctrl, Int, or Bulk, so we go ahead
@@ -710,17 +678,9 @@ fn insert_spare_transfer(
                 transfer.num_iso_packets() as u16,
                 OneOrMany::Many(vec![transfer]),
             );
-            timer.stop_and_report(
-                Some(Duration::from_nanos(500)),
-                "inserting a spare transfer into a newly allocated bucket",
-            );
         }
         None => {
             cache.insert(transfer.num_iso_packets() as u16, OneOrMany::One(transfer));
-            timer.stop_and_report(
-                Some(Duration::from_nanos(500)),
-                "inserting a spare transfer",
-            );
         }
     }
 }
@@ -756,7 +716,6 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
 
     // #[tracing::instrument(level = "trace", skip_all)]
     pub fn reserve(&mut self, num_bytes: usize) -> UsbMemMut {
-        let timer = Timer::start();
         assert!(num_bytes <= DMA_LEN, "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {DMA_LEN} bytes)");
         let queue = &mut self.queue;
         for _ in 0..queue.len() {
@@ -768,10 +727,6 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
                 unsafe { dma.set_len(num_bytes) };
                 let mem = dma.split_to(num_bytes);
 
-                timer.stop_and_report(
-                    Some(Duration::from_micros(2)),
-                    "reserving direct-access memory for transfer",
-                );
                 return mem;
             } else {
                 // By rotating the current handle to the end,
@@ -792,7 +747,6 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
         unsafe { dma.set_len(num_bytes) };
         let mem = dma.split_to(num_bytes);
         queue.push_front(dma);
-        timer.stop_and_report(None, "allocating direct-access memory for transfer");
         mem
     }
 }
@@ -804,6 +758,7 @@ fn convert_libusb_to_vhci(
     seqnum: u32,
     dev_id: msg::UsbDeviceId,
 ) -> vhci::Status {
+    let _guard = tracing::Span::current().entered();
     match status {
         Ok(TransferStatus::Completed) => vhci::Status::Success,
         Ok(TransferStatus::Error) => vhci::Status::Error,
@@ -915,9 +870,10 @@ where
         let runtime = event_handler.clone();
         let ctx = device.context().clone();
         let event_handler_loop = std::thread::spawn(move || {
+            let _guard = warn_span!("libusb_event_handler").entered();
             while !runtime.is_cancelled() {
                 if let Err(err) = ctx.handle_events(Some(Duration::from_secs(5))) {
-                    warn!("error from event handler: {err}");
+                    warn! { %err };
                 }
             }
         });
@@ -949,8 +905,7 @@ where
                 }
             } {
                 Event::RecvFrame(Some(Recv::Urb((header, urb_frame)))) => {
-                    debug!("({}) received new URB", header.seqnum);
-                    let time_to_submit = Timer::start();
+                    // debug!("({}) received new URB", header.seqnum);
                     let cancel = CancellationToken::new();
                     cancel_tokens.insert(header.seqnum, cancel.clone());
 
@@ -968,7 +923,6 @@ where
 
                     // New idea: reserve the data before we get into the
                     // future so that we don't need a mutex
-                    let time_to_reserve_buffers = Timer::start();
                     let (transfer_buf, mut iso_raw_buf) = if UrbType::Ctrl == urb_header.kind {
                         let mut transfer = {
                             let w_length = ctrl.length() as usize;
@@ -996,10 +950,6 @@ where
                                     scratch_dma.reserve(needed).split_to(transfer_len)
                                 };
                                 dma.as_mut().copy_from_slice(&transfer);
-                                time_to_reserve_buffers.stop_and_report(
-                                    None,
-                                    "reserving and copying buffer space for transfer",
-                                );
                                 (dma, data)
                             }
                             Dir::In => {
@@ -1023,8 +973,6 @@ where
                                 } else {
                                     BytesMut::new()
                                 };
-                                time_to_reserve_buffers
-                                    .stop_and_report(None, "reserving buffer space for transfer");
                                 (dma, iso_buf)
                             }
                         }
@@ -1096,8 +1044,8 @@ where
                                     )
                                 };
 
-                                time_to_submit.stop_and_report(None, "setting up iso transfer");
-                                let result = transfer.submit(cancel).await;
+                                // SAFETY: TODO: Ensure that tokio completes all transfers.
+                                let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 // let _errno = dbg!(io::Error::last_os_error());
@@ -1129,8 +1077,8 @@ where
                                     )
                                 };
 
-                                time_to_submit.stop_and_report(None, "setting up int transfer");
-                                let result = transfer.submit(cancel).await;
+                                // SAFETY: TODO: Ensure that tokio completes all transfers.
+                                let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
@@ -1140,7 +1088,6 @@ where
                             UrbType::Ctrl
                                 if Request::STANDARD_INTERFACE_SET_INTERFACE == ctrl.req() =>
                             {
-                                let timer = Timer::start();
                                 let setting = ctrl.value() as u8;
                                 let interface = ctrl.index() as u8;
                                 let status = match handle.set_alternate_setting(interface, setting) {
@@ -1154,7 +1101,6 @@ where
                                         vhci::Status::Stall
                                     },
                                 };
-                                timer.stop_and_report(None, "setting alternate setting");
 
                                 (status, None, BytesMut::new())
                             }
@@ -1180,7 +1126,6 @@ where
                             UrbType::Ctrl if Request::STANDARD_ENDPOINT_CLEAR_FEATURE == ctrl.req() => {
                                 let endpoint = ctrl.index() as u8;
 
-                                let timer = Timer::start();
                                 let status = match handle.clear_halt(endpoint) {
                                     Ok(_) => vhci::Status::Success,
                                     Err(err) => {
@@ -1193,7 +1138,6 @@ where
                                         vhci::Status::Stall
                                     },
                                 };
-                                timer.stop_and_report(None, "clearing stall");
 
                                 (status, None, BytesMut::new())
                             }
@@ -1211,8 +1155,8 @@ where
                                     )
                                 };
 
-                                time_to_submit.stop_and_report(None, "setting up ctrl transfer");
-                                let result = transfer.submit(cancel).await;
+                                // SAFETY: TODO: Ensure that tokio completes all transfers.
+                                let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 trace! { %ctrl };
@@ -1241,8 +1185,8 @@ where
                                     )
                                 };
 
-                                time_to_submit.stop_and_report(Some(Duration::from_micros(15)), "setting up bulk transfer");
-                                let result = transfer.submit(cancel).await;
+                                // SAFETY: TODO: Ensure that tokio completes all transfers.
+                                let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
@@ -1270,7 +1214,7 @@ where
                         }
 
                         (header, urb_header, transfer, iso_pkts)
-                    }.in_current_span();
+                    }.instrument(trace_span!("transfer_construction"));
                     // debug!("size_of::<F>() = {}", size_of_val(&fut));
                     active_transfers.spawn(fut);
                 }
@@ -1302,7 +1246,6 @@ where
                     }
                 }
                 Event::SendFrame((header, urb_header, transfer, iso_pkts)) => {
-                    let timer = Timer::start();
                     cancel_tokens.remove(&header.seqnum);
 
                     let status = match urb_header.status {
@@ -1380,10 +1323,6 @@ where
                             .chain(transfer)
                             .chain(padding)
                             .chain(iso_pkts.as_bytes());
-                        timer.stop_and_report(
-                            Some(Duration::from_nanos(500)),
-                            "setting up response frame",
-                        );
                         tx.write_all_buf(&mut response).await?;
                         // trace!(
                         //     "({}) {:?} endpoint ({:?}/{}): {:?}, Transfer: {:?}, Iso: {:?}",
@@ -1397,7 +1336,6 @@ where
                         // );
                     } else {
                         let mut response = header.as_bytes();
-                        timer.stop_and_report(None, "setting up response frame");
                         tx.write_all_buf(&mut response).await?;
                         break Err(Error::ReqFailed);
                     }
@@ -1407,6 +1345,7 @@ where
         };
 
         cancel_tokens.into_values().for_each(|token| token.cancel());
+        _ = active_transfers.join_all().await;
         event_handler.cancel();
         drop(device);
         _ = event_handler_loop.join();

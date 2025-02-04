@@ -426,10 +426,8 @@ impl GetSliceLen for UrbFrame {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const BASE_LEN: usize = size_of::<UrbHeader>();
 
-        let (header, rest) =
-            UrbHeader::try_ref_from_prefix(buf).map_err(|_| GetSliceLenErr::BufferShort {
-                num_bytes_needed: BASE_LEN - buf.len(),
-            })?;
+        let (header, rest) = UrbHeader::try_ref_from_prefix(buf)
+            .map_err(|err| GetSliceLenErr::from_convert_err(BASE_LEN, err))?;
 
         let transfer_padded_len = header.actual_transfer_len.next_multiple_of(8) as usize;
         let num_isos = header.iso_packet_count as usize;
@@ -530,20 +528,8 @@ pub mod mass_storage {
 // CONST TESTS FOR ALIGNMENT
 // All complete messages must be aligned to 8 bytes.
 
-const fn _size_of_req_list_devices() -> usize {
-    size_of::<Version>() + size_of::<Request>()
-}
+const _: [u8; ((size_of::<ReqListDevices>() % 8 == 0) as usize) - 1] = [];
 
-const _: [u8; ((_size_of_req_list_devices() % 8 == 0) as usize) - 1] = [];
+const _: [u8; ((size_of::<ReqBorrowDevice>() % 8 == 0) as usize) - 1] = [];
 
-const fn _size_of_req_borrow_device() -> usize {
-    size_of::<Version>() + size_of::<Request>() + size_of::<UsbDeviceId>() + size_of::<[u8; 6]>()
-}
-
-const _: [u8; ((_size_of_req_borrow_device() % 8 == 0) as usize) - 1] = [];
-
-const fn _size_of_req_lend_device() -> usize {
-    size_of::<Version>() + size_of::<Request>() + size_of::<UsbDeviceId>() + size_of::<[u8; 6]>()
-}
-
-const _: [u8; ((_size_of_req_lend_device() % 8 == 0) as usize) - 1] = [];
+const _: [u8; ((size_of::<ReqLendDevice>() % 8 == 0) as usize) - 1] = [];

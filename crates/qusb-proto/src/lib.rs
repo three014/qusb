@@ -21,6 +21,23 @@ pub enum GetSliceLenErr {
     BufferShort { num_bytes_needed: usize },
 }
 
+impl GetSliceLenErr {
+    pub fn from_convert_err<A, Dst: ?Sized, V>(
+        needed_size: usize,
+        err: zerocopy::ConvertError<A, zerocopy::SizeError<&[u8], Dst>, V>,
+    ) -> Self {
+        use zerocopy::ConvertError::*;
+        match err {
+            Alignment(_) | Validity(_) => {
+                GetSliceLenErr::NoConfidence
+            }
+            Size(src) => GetSliceLenErr::BufferShort {
+                num_bytes_needed: needed_size - src.into_src().len(),
+            },
+        }
+    }
+}
+
 /// You received a DST from the internet in the
 /// form of bytes, and you want to find out the
 /// number of elements in the trailing slice.
