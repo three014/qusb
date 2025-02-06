@@ -142,11 +142,7 @@ impl vhci::Urb for UrbWithIsoData<'_> {
     }
 
     fn dir(&self) -> vhci::usbfs::Dir {
-        if vhci::ioctl::UrbType::Ctrl == self.kind() {
-            self.header.ctrl_packet.req().dir()
-        } else {
-            self.header.endpoint.direction()
-        }
+        self.header.endpoint.direction()
     }
 
     fn bytes_transferred(&self) -> u16 {
@@ -188,11 +184,7 @@ impl vhci::Urb for UrbWithIsoGiveback<'_> {
     }
 
     fn dir(&self) -> vhci::usbfs::Dir {
-        if vhci::ioctl::UrbType::Ctrl == self.kind() {
-            self.header.ctrl_packet.req().dir()
-        } else {
-            self.header.endpoint.direction()
-        }
+        self.header.endpoint.direction()
     }
 
     fn bytes_transferred(&self) -> u16 {

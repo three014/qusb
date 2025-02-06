@@ -714,6 +714,7 @@ dependencies = [
  "quinn",
  "qusb-proto",
  "rand",
+ "rcgen",
  "rusb",
  "rusb_async",
  "thiserror 2.0.11",

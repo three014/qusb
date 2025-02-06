@@ -334,7 +334,7 @@ impl Demuxer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    handle: Arc<Mutex<Option<tokio::task::JoinHandle<io::Result<()>>>>>,
+    handle: Arc<tokio::task::JoinHandle<io::Result<()>>>,
     register_tx: mpsc::Sender<Ctrl<Register, (Port, WorkReceiver)>>,
     giveback_tx: mpsc::Sender<UrbHandle>,
     disconnect_tx: mpsc::Sender<Ctrl<Port>>,
@@ -349,9 +349,9 @@ impl Controller {
         let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
-        let handle = Arc::new(Mutex::new(Some(tokio::spawn(
+        let handle = Arc::new(tokio::spawn(
             Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).run(),
-        ))));
+        ));
 
         Ok(Self {
             handle,
@@ -404,18 +404,17 @@ impl Controller {
         self.remote.port_reset_done(port, enable)
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn shutdown(self) {
         drop(self.register_tx);
         drop(self.disconnect_tx);
-        let handle = self.handle.lock().unwrap().take();
-        drop(self.handle);
+        let handle = Arc::into_inner(self.handle);
         if let Some(handle) = handle {
             info!("about to wait for vhci controller handle");
             match handle.await {
                 Ok(Ok(_)) => trace!("controller thread finished with no issues"),
-                Ok(Err(_err)) => todo!("Figure out what kind of I/O errors we can get"),
-                Err(_err) => todo!("Figure out what might make the thread panic"),
+                Ok(Err(_err)) => unimplemented!("i/o error? {_err}"),
+                Err(_err) => unimplemented!("thread panicked? {_err}"),
             }
         }
     }

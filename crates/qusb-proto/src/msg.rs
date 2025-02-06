@@ -11,58 +11,7 @@
 //! and is free to end the stream right there.
 //!
 //! All message data must be sent in little endian,
-//! AND every complete message must be aligned to 4 bytes.
-//!
-//! # Message Format
-//!
-//! Request::ListDevices:
-//!
-//! | Offset | Length | Value      | Description                                     |
-//! |--------|--------|------------|-------------------------------------------------|
-//! | 0      | 1      |            | Major number                                    |
-//! | 1      | 1      |            | Minor number                                    |
-//! | 2      | 2      |            | Patch number                                    |
-//! | 4      | 4      | 0x00000000 | Request code: Retrieve the list of USB devices. |
-//!
-//! Request::BorrowDevice:
-//!
-//! | Offset | Length | Value      | Description                                  |
-//! |--------|--------|------------|----------------------------------------------|
-//! | 0      | 1      |            | Major number                                 |
-//! | 1      | 1      |            | Minor number                                 |
-//! | 2      | 2      |            | Patch number                                 |
-//! | 4      | 4      | 0x00000001 | Request code: Borrow a USB device from peer. |
-//! | 8      | 1      |            | USB bus number                               |
-//! | 9      | 1      |            | USB device number                            |
-//! | 10     | 6      | 0          | Padding for align(8)
-//!
-//! Response::ListDevices:
-//!
-//! | Offset                    | Length   | Value      | Description                                                   |
-//! |---------------------------|----------|------------|---------------------------------------------------------------|
-//! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
-//! | 1                         | 7        | 0          | Padding for align(8)                                          |
-//! | 8                         |          |            | UsbDeviceInfoHeader                                           |
-//! |                           |          |            | UsbInterfaceInfo * padded_num_interfaces                      |
-//!
-//! Non-zero status response:
-//!
-//! | Offset                    | Length   | Value      | Description                                                   |
-//! |---------------------------|----------|------------|---------------------------------------------------------------|
-//! | 0                         | 1        | 0x00       | Status: Nonzero status                                        |
-//! | 1                         | 3        | 0          | Padding for align(8) (technically)
-//! | 4                         | 1        |            | Major number (only if status == VersionMismatch)              |
-//! | 5                         | 1        |            | Minor number (only if status == VersionMismatch)              |
-//! | 7                         | 3        |            | Patch number (only if status == VersionMismatch)              |
-//!
-//! Response::BorrowDevice:
-//!
-//! | Offset                    | Length   | Value      | Description                                                   |
-//! |---------------------------|----------|------------|---------------------------------------------------------------|
-//! | 0                         | 1        | 0x00       | Status: 0 for OK                                              |
-//! | 1                         | 7        | 0          | Padding for status
-//!
-//!
+//! AND every complete message must be aligned to 8 bytes.
 
 use std::{
     ffi::OsStr,
@@ -440,8 +389,8 @@ impl GetSliceLen for UrbFrame {
         let valid = (is_out && is_pending) || (!is_out && !is_pending);
 
         // If transfer has real data to send, then we count the
-        // padded transfer length and number of isochronous packets
-        let required_byte_len = (transfer_padded_len + iso_byte_len) * valid as usize;
+        // padded transfer length. We always count the iso packets.
+        let required_byte_len = transfer_padded_len * valid as usize + iso_byte_len;
         if required_byte_len > rest.len() {
             Err(GetSliceLenErr::BufferShort {
                 num_bytes_needed: required_byte_len - rest.len(),

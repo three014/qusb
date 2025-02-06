@@ -1,6 +1,7 @@
 use core::str;
-use std::{io::BufWriter, sync::Mutex, time::Duration};
+use std::{io::{stdout, BufWriter}, sync::Mutex, time::Duration};
 
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 
 mod common;
@@ -58,7 +59,7 @@ fn borrow_self_dev() {
     _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
         .with_line_number(true)
-        .with_writer(Mutex::new(BufWriter::with_capacity(8192 * 4, log_file)))
+        .with_writer(Mutex::new(stdout()))
         .try_init();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -72,6 +73,7 @@ async fn borrow_self_dev_inner() {
     let addr = common::addr(7002);
     let (client, server) = common::localhost(addr);
     let handle = server.serve();
+    let ctrl_c = tokio::signal::ctrl_c();
 
     {
         let session = client.connect(addr, "localhost").await.unwrap();
@@ -79,12 +81,23 @@ async fn borrow_self_dev_inner() {
 
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
-                bus_number: 1,
-                device_addr: 11,
+                bus_number: 4,
+                device_addr: 2,
             })
             .await
             .unwrap();
-        usb.borrow().await.unwrap();
+        let cancel = CancellationToken::new();
+        tokio::select! {
+            Err(err) = usb.borrow(cancel.clone()) => {
+                panic!("{err}");
+            }
+            Err(err) = ctrl_c => {
+                panic!("{err}");
+            }
+            else => {
+                cancel.cancel();
+            }
+        }
     }
 
     handle.shutdown().await.unwrap().unwrap();

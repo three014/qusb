@@ -50,14 +50,10 @@ async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Resu
             return Ok(None);
         }
 
-        match buf.claim_dst() {
+        min_len = match buf.claim_dst() {
             Ok(frame) => break frame,
             Err(ReadError::CorruptedData) => todo!(),
-            Err(ReadError::BufferShort {
-                num_bytes_needed, ..
-            }) => {
-                min_len = buf.len() + num_bytes_needed;
-            }
+            Err(ReadError::BufferShort { num_bytes_needed }) => buf.len() + num_bytes_needed,
         }
     };
 
@@ -309,11 +305,7 @@ where
                         }
 
                         fn dir(&self) -> vhci::usbfs::Dir {
-                            if UrbType::Ctrl == self.kind() {
-                                self.ioctl_urb.setup_packet.req().dir()
-                            } else {
-                                self.ioctl_urb.endpoint.direction()
-                            }
+                            self.ioctl_urb.endpoint.direction()
                         }
 
                         fn bytes_transferred(&self) -> u16 {
@@ -459,23 +451,23 @@ where
                     let transfer_len = urb.actual_transfer_len as usize;
 
                     // We might not be expecting data if we sent some to the usb device
-                    let (transfer, iso_giveback) = match urb.endpoint.direction() {
-                        Dir::Out => Default::default(),
+                    let (transfer, rest) = match urb.endpoint.direction() {
+                        Dir::Out => (Default::default(), &mut frame.data),
                         Dir::In => {
                             let (transfer, rest) = <[u8]>::mut_from_prefix_with_elems(
                                 &mut frame.data,
                                 align_to_usize(transfer_len),
                             )
                             .unwrap();
-                            let iso_packets =
-                                <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
-                                    rest,
-                                    urb.iso_packet_count as usize,
-                                )
-                                .unwrap();
-                            (&mut transfer[..transfer_len], iso_packets)
+                            (&mut transfer[..transfer_len], rest)
                         }
                     };
+
+                    let iso_giveback = <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
+                        rest,
+                        urb.iso_packet_count as usize,
+                    )
+                    .unwrap();
 
                     let lender_urb = UrbWithIsoGiveback {
                         handle,
@@ -1176,7 +1168,7 @@ where
                                 let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
-                                trace! { %ctrl };
+                                // trace! { %ctrl };
 
                                 let mut buf = {
                                     let (transfer, mut buf) = transfer.into_parts().unwrap();
@@ -1293,11 +1285,7 @@ where
                     let transfer_padded_len = transfer.len() + padding.len();
                     debug_assert_eq!(transfer_padded_len % 8, 0);
 
-                    let dir = if UrbType::Ctrl == urb_header.kind {
-                        urb_header.ctrl_packet.req().dir()
-                    } else {
-                        urb_header.endpoint.direction()
-                    };
+                    let dir = urb_header.endpoint.direction();
 
                     let actual_transfer_len = if Dir::Out == dir {
                         urb_header.actual_transfer_len
@@ -1305,14 +1293,10 @@ where
                         transfer.len() as u16
                     };
 
-                    let iso_packet_count = if Dir::Out == dir {
-                        urb_header.iso_packet_count
-                    } else {
-                        (iso_pkts.len() / size_of::<ioctl::IocIsoPacketGiveback>()) as u16
-                    };
+                    let iso_packet_count = (iso_pkts.len() / size_of::<ioctl::IocIsoPacketGiveback>()) as u16;
 
                     let total_frame_len = if Dir::Out == dir {
-                        size_of::<Header>() + size_of::<UrbHeader>()
+                        size_of::<Header>() + size_of::<UrbHeader>() + iso_pkts.len()
                     } else {
                         size_of::<Header>()
                             + size_of::<UrbHeader>()
