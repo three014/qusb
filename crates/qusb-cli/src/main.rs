@@ -11,6 +11,7 @@ use std::{
 use clap::{arg, Command};
 use qusb::{quinn, rustls, BoundedU8};
 use rcgen;
+use tracing::instrument::WithSubscriber;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
@@ -50,9 +51,19 @@ async fn async_main() -> anyhow::Result<()> {
             };
 
             let (server_cfg, cert) = if make_self_signed {
-                make_self_signed_cfg()
+                let (cfg, cert_key) = make_self_signed_cfg();
+                let key_pair = cert_key.key_pair.serialize_pem();
+                let cert = cert_key.cert.pem();
+                fs::write("server.pem", cert + &key_pair)?;
+                (cfg, cert_key)
             } else {
-                panic!()
+                let cert_path = {
+                    let mut dir = conf_dir.clone();
+                    dir.set_file_name("server.pem");
+                    dir
+                };
+                let cert_key = fs::read(cert_path)?;
+                todo!()
             };
 
             println!("config directory: {}", conf_dir.display());
@@ -62,12 +73,9 @@ async fn async_main() -> anyhow::Result<()> {
             );
             println!("make and use self-signed certificate: {}", make_self_signed);
 
-            fs::write("server.pem", cert.pem())?;
-            return Ok(());
-
             let mut certs = rustls::RootCertStore::empty();
             certs
-                .add(rustls::pki_types::CertificateDer::from(cert))
+                .add(rustls::pki_types::CertificateDer::from(cert.cert))
                 .unwrap();
             let client = rustls::ClientConfig::builder()
                 .with_root_certificates(Arc::new(certs))
@@ -111,7 +119,7 @@ fn cli() -> Command {
 /// Convenience function for making self-signed certificates.
 ///
 /// Probably don't use in production environments?
-pub fn make_self_signed_cfg() -> (rustls::ServerConfig, rcgen::Certificate) {
+pub fn make_self_signed_cfg() -> (rustls::ServerConfig, rcgen::CertifiedKey) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let priv_key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
 
@@ -123,5 +131,5 @@ pub fn make_self_signed_cfg() -> (rustls::ServerConfig, rcgen::Certificate) {
     .with_no_client_auth()
     .with_single_cert(vec![cert.cert.der().clone()], priv_key.into())
     .unwrap();
-    (server, cert.cert)
+    (server, cert)
 }

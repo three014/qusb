@@ -264,6 +264,8 @@ impl Session {
                 return Err(Error::Unknown);
             }
             Err(ReadError::BufferShort { .. }) => {
+                // TODO: This can be possible if client just didn't
+                // send enough data, then closed the connection.
                 unreachable!("we should have read enough data to get the version")
             }
         };
@@ -289,7 +291,7 @@ impl Session {
                             rusb::Speed::High | rusb::Speed::Super | rusb::Speed::SuperPlus => {
                                 msg::DataRate::High
                             }
-                            _ => unimplemented!(),
+                            _ => unimplemented!("there's a new usb speed?"),
                         };
 
                         let response = msg::Resp::BorrowDevice {
@@ -364,14 +366,14 @@ impl Session {
         };
 
         match resp {
-            msg::Resp::ListDevices { .. } => (),
+            msg::Resp::ListDevices { .. } => { /* success */ }
             msg::Resp::Failure {
                 stat: msg::Status::VersionMismatch,
                 ver: msg::VersionOpt::Some(theirs),
             } => {
                 return Err(Error::VersionMismatch(theirs));
             }
-            _ => unimplemented!(),
+            resp => unimplemented!("why did the peer send this? {resp:?}"),
         }
 
         Ok(UsbDevices(buf))
@@ -431,7 +433,7 @@ impl Session {
                 stat: msg::Status::NoDev,
                 ..
             } => return Err(Error::DevNotFound(id)),
-            _ => unimplemented!(),
+            resp => unimplemented!("why did the peer send this? {resp:?}"),
         };
 
         let client = BorrowDevice::new(tx, rx, buf, self.dev.clone(), data_rate, id);
@@ -516,7 +518,7 @@ impl Session {
                 stat: msg::Status::NoDev,
                 ..
             } => return Err(Error::DevNotFound(id)),
-            _ => unimplemented!(),
+            resp => unimplemented!("why did the peer say this? {resp:?}"),
         }
 
         let client = LendDevice::new(tx, rx, buf, device, id);
@@ -704,67 +706,63 @@ impl Server {
     pub fn serve(self) -> ServerHandle {
         let cancel_for_handle = CancellationToken::new();
         let cancel_for_serve = cancel_for_handle.clone();
-        let handle = tokio::spawn(
-            async move {
-                let mut set = tokio::task::JoinSet::new();
-                info!("Server ready to accept new connections");
+        let fut = async move {
+            let mut set = tokio::task::JoinSet::new();
+            info!("Server ready to accept new connections");
 
-                enum Event {
-                    Incoming(Option<quinn::Incoming>),
-                    Cancel,
-                    MaybeCompletedTask(Option<ServerTaskResult>),
-                }
-
-                loop {
-                    let is_empty = set.is_empty();
-                    let event = tokio::select! {
-                        incoming = self.endpoint.accept() => {
-                            Event::Incoming(incoming)
-                        },
-                        _ = cancel_for_serve.cancelled() => {
-                            Event::Cancel
-                        },
-                        maybe_complete = set.join_next_with_id(), if !is_empty => {
-                            Event::MaybeCompletedTask(maybe_complete)
-                        }
-                    };
-
-                    match event {
-                        Event::Incoming(Some(incoming)) => {
-                            debug!("Incoming connection from {}", incoming.remote_address());
-                            set.spawn(
-                                ReqHandler::new(
-                                    self.dev.clone(),
-                                    incoming,
-                                    cancel_for_serve.clone(),
-                                )
-                                .open_session(),
-                            );
-                        }
-                        Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
-                            info!("session {id} completed successfully")
-                        }
-                        Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
-                            warn! { %cause, "session {id} failed" }
-                        }
-                        Event::MaybeCompletedTask(Some(Err(cause))) => error! { %cause },
-                        Event::Incoming(None) | Event::Cancel => break,
-                        _ => (),
-                    }
-                }
-
-                while let Some(result) = set.join_next_with_id().await {
-                    match result {
-                        Ok((id, Ok(_))) => info!("session {id} completed successfully"),
-                        Ok((id, Err(cause))) => warn! { %cause, "session {id} failed" },
-                        Err(cause) => error! { %cause },
-                    }
-                }
-
-                Ok(())
+            enum Event {
+                Incoming(Option<quinn::Incoming>),
+                Cancel,
+                MaybeCompletedTask(Option<ServerTaskResult>),
             }
-            .in_current_span(),
-        );
+
+            loop {
+                let is_empty = set.is_empty();
+                let event = tokio::select! {
+                    incoming = self.endpoint.accept() => {
+                        Event::Incoming(incoming)
+                    },
+                    _ = cancel_for_serve.cancelled() => {
+                        Event::Cancel
+                    },
+                    maybe_complete = set.join_next_with_id(), if !is_empty => {
+                        Event::MaybeCompletedTask(maybe_complete)
+                    }
+                };
+
+                match event {
+                    Event::Incoming(Some(incoming)) => {
+                        debug!("Incoming connection from {}", incoming.remote_address());
+                        set.spawn(
+                            ReqHandler::new(self.dev.clone(), incoming, cancel_for_serve.clone())
+                                .open_session(),
+                        );
+                    }
+                    Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
+                        info!("session {id} completed successfully")
+                    }
+                    Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
+                        warn! { %cause, "session {id} failed" }
+                    }
+                    Event::MaybeCompletedTask(Some(Err(cause))) => error! { %cause },
+                    Event::Incoming(None) | Event::Cancel => break,
+                    _ => (),
+                }
+            }
+
+            while let Some(result) = set.join_next_with_id().await {
+                match result {
+                    Ok((id, Ok(_))) => info!("session {id} completed successfully"),
+                    Ok((id, Err(cause))) => warn! { %cause, "session {id} failed" },
+                    Err(cause) => error! { %cause },
+                }
+            }
+
+            Ok(())
+        }
+        .in_current_span();
+
+        let handle = tokio::spawn(fut);
         ServerHandle {
             handle,
             cancel_token: cancel_for_handle,

@@ -174,7 +174,14 @@ pub struct BorrowDevice<W, R> {
 }
 
 impl<W, R> BorrowDevice<W, R> {
-    pub fn new(tx: W, rx: R, buf_rx: Ring, vhci: stub::Controller, data_rate: msg::DataRate, id: msg::UsbDeviceId) -> Self {
+    pub fn new(
+        tx: W,
+        rx: R,
+        buf_rx: Ring,
+        vhci: stub::Controller,
+        data_rate: msg::DataRate,
+        id: msg::UsbDeviceId,
+    ) -> Self {
         Self {
             tx,
             rx,
@@ -224,10 +231,7 @@ where
             msg::DataRate::Full => DataRate::Full,
             msg::DataRate::High => DataRate::High,
         };
-        let (port, mut work_rx) = vhci
-            .register(RegisterPort::Any, data_rate)
-            .await
-            .unwrap();
+        let (port, mut work_rx) = vhci.register(RegisterPort::Any, data_rate).await.unwrap();
 
         let id = BorrowId {
             remote_dev: _dev_id,
@@ -237,7 +241,7 @@ where
         enum Event {
             Work(Option<ioctl::Work>),
             Frame(io::Result<Option<Recv>>),
-            Cancelled
+            Cancelled,
         }
 
         let seqnum = AtomicU32::new(0);
@@ -559,7 +563,9 @@ fn set_config<C: rusb::UsbContext>(
     }
 }
 
-pub(crate) fn open_device(dev_id: msg::UsbDeviceId) -> rusb::Result<rusb::DeviceHandle<rusb::Context>> {
+pub(crate) fn open_device(
+    dev_id: msg::UsbDeviceId,
+) -> rusb::Result<rusb::DeviceHandle<rusb::Context>> {
     rusb::Context::new()
         .and_then(|ctx| ctx.devices())
         .and_then(|list| {
@@ -785,6 +791,13 @@ fn convert_libusb_to_vhci(
     }
 }
 
+#[inline]
+fn write_transfer(src: &[u8], dst: &mut [u8]) {
+    let src = <[u64]>::ref_from_bytes(src).unwrap();
+    let dst = <[u64]>::mut_from_bytes(dst).unwrap();
+    dst.copy_from_slice(src);
+}
+
 // struct TransferData {
 //     header: Header,
 //     urb: Data<UrbFrame>,
@@ -826,8 +839,20 @@ pub struct LendDevice<W, R> {
 }
 
 impl<W, R> LendDevice<W, R> {
-    pub fn new(tx: W, rx: R, buf_rx: Ring, device: rusb::DeviceHandle<rusb::Context>, id: msg::UsbDeviceId) -> Self {
-        Self { tx, rx, buf_rx, device, id }
+    pub fn new(
+        tx: W,
+        rx: R,
+        buf_rx: Ring,
+        device: rusb::DeviceHandle<rusb::Context>,
+        id: msg::UsbDeviceId,
+    ) -> Self {
+        Self {
+            tx,
+            rx,
+            buf_rx,
+            device,
+            id,
+        }
     }
 }
 
@@ -849,7 +874,7 @@ where
         enum Event {
             RecvFrame(Option<Recv>),
             SendFrame((Header, UrbHeader, Option<UsbMemMut>, BytesMut)),
-            Cancelled
+            Cancelled,
         }
 
         let device = Arc::new(device);
@@ -921,9 +946,15 @@ where
                                 size_of::<ioctl::IocSetupPacket>() + align_to_usize(transfer_len);
                             scratch_dma.reserve(needed)
                         };
-                        ctrl.write_to_prefix(&mut transfer).unwrap();
+                        *ioctl::IocSetupPacket::mut_from_bytes(
+                            &mut transfer[..size_of::<ioctl::IocSetupPacket>()],
+                        )
+                        .unwrap() = ctrl;
                         if Dir::Out == ctrl.req().dir() {
-                            data.as_ref().write_to_suffix(&mut transfer).unwrap();
+                            write_transfer(
+                                &data,
+                                &mut transfer[size_of::<ioctl::IocSetupPacket>()..],
+                            );
                         }
                         (
                             transfer.split_to(transfer_len + size_of::<ioctl::IocSetupPacket>()),
@@ -932,15 +963,11 @@ where
                     } else {
                         match urb_header.endpoint.direction() {
                             Dir::Out => {
-                                let transfer = data
-                                    .split_to(align_to_usize(transfer_len))
-                                    .split_to(transfer_len);
-                                let mut dma = {
-                                    let needed = align_to_usize(transfer_len);
-                                    scratch_dma.reserve(needed).split_to(transfer_len)
-                                };
-                                dma.as_mut().copy_from_slice(&transfer);
-                                (dma, data)
+                                let needed = align_to_usize(transfer_len);
+                                let transfer = data.split_to(needed);
+                                let mut dma = scratch_dma.reserve(needed);
+                                write_transfer(&transfer, &mut dma);
+                                (dma.split_to(transfer_len), data)
                             }
                             Dir::In => {
                                 let dma = {
@@ -1371,12 +1398,17 @@ where
 
         let devices = match iter() {
             Ok(devices) => {
-                let response = msg::Resp::ListDevices { _padding: Default::default() };
+                let response = msg::Resp::ListDevices {
+                    _padding: Default::default(),
+                };
                 msg::send_resp(&mut tx, response).await?;
                 devices
             }
             Err(err) => {
-                let response = msg::Resp::Failure { stat: msg::Status::Failed, ver: msg::VersionOpt::None(Default::default())  };
+                let response = msg::Resp::Failure {
+                    stat: msg::Status::Failed,
+                    ver: msg::VersionOpt::None(Default::default()),
+                };
                 msg::send_resp(&mut tx, response).await?;
                 tx.close().await?;
                 return Err(err.into());
