@@ -5,3 +5,5 @@ sandbox/
 *.txt
 *.svg
 *perf*
+*.key
+*.pem

@@ -57,7 +57,7 @@ impl Demuxer {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn run(self) -> io::Result<()> {
+    async fn demux_vhci(self) -> io::Result<()> {
         let Self {
             mut register_rx,
             mut giveback_rx,
@@ -334,7 +334,7 @@ impl Demuxer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    handle: Arc<tokio::task::JoinHandle<io::Result<()>>>,
+    handle: Option<Arc<tokio::task::JoinHandle<io::Result<()>>>>,
     register_tx: mpsc::Sender<Ctrl<Register, (Port, WorkReceiver)>>,
     giveback_tx: mpsc::Sender<UrbHandle>,
     disconnect_tx: mpsc::Sender<Ctrl<Port>>,
@@ -342,16 +342,16 @@ pub struct Controller {
 }
 
 impl Controller {
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
         let (register_tx, register_rx) = mpsc::channel(4);
         let (giveback_tx, giveback_rx) = mpsc::channel(32);
         let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
-        let handle = Arc::new(tokio::spawn(
-            Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).run(),
-        ));
+        let handle = Some(Arc::new(tokio::spawn(
+            Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).demux_vhci(),
+        )));
 
         Ok(Self {
             handle,
@@ -362,7 +362,7 @@ impl Controller {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub async fn register(
         &mut self,
         port: RegisterPort,
@@ -375,7 +375,7 @@ impl Controller {
         rx.await.unwrap()
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn fetch_data<T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut>(
         &self,
         urb: T,
@@ -387,11 +387,11 @@ impl Controller {
         &self,
         urb: T,
     ) -> io::Result<()> {
-        _ = tokio::task::unconstrained(self.giveback_tx.send(urb.handle())).await;
+        _ = self.giveback_tx.send(urb.handle()).await;
         self.remote.giveback(urb)
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub async fn disconnect(&mut self, port: Port) -> io::Result<()> {
         let (rx, disconnect) = Ctrl::new(port);
 
@@ -399,22 +399,24 @@ impl Controller {
         rx.await.unwrap()
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
+    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
         self.remote.port_reset_done(port, enable)
     }
+}
 
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn shutdown(self) {
-        drop(self.register_tx);
-        drop(self.disconnect_tx);
-        let handle = Arc::into_inner(self.handle);
-        if let Some(handle) = handle {
+impl Drop for Controller {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take().and_then(|arc| Arc::into_inner(arc)) {
             info!("about to wait for vhci controller handle");
-            match handle.await {
-                Ok(Ok(_)) => trace!("controller thread finished with no issues"),
-                Ok(Err(_err)) => unimplemented!("i/o error? {_err}"),
-                Err(_err) => unimplemented!("thread panicked? {_err}"),
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    match handle.await {
+                        Ok(Ok(_)) => trace!("controller thread finished with no issues"),
+                        Ok(Err(_err)) => unimplemented!("i/o error? {_err}"),
+                        Err(_err) => unimplemented!("thread panicked? {_err}"),
+                    }
+                });
             }
         }
     }
@@ -462,10 +464,9 @@ mod tests {
 
     #[tokio::test]
     async fn controller_idles() {
-        let controller = Controller::start(BoundedU8::new(3).unwrap()).unwrap();
+        let _controller = Controller::start(BoundedU8::new(3).unwrap()).unwrap();
 
         thread::sleep(Duration::from_millis(500));
-        controller.shutdown().await;
     }
 
     // #[tokio::test]

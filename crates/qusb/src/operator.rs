@@ -446,7 +446,10 @@ where
                     let urb = &mut frame.header;
 
                     if vhci::Status::Success != urb.status {
-                        warn!("({id}) transfer {} failed: {:?}", seqnum, urb.status);
+                        warn!(
+                            "({id}) {:?} transfer {} failed: {:?}",
+                            urb.kind, seqnum, urb.status
+                        );
                     }
                     let transfer_len = urb.actual_transfer_len as usize;
 
@@ -1210,11 +1213,15 @@ where
                             let len = transfer.as_ref().map(|t| t.len()).unwrap_or_default();
                             if len != urb_header.actual_transfer_len as usize {
                                 warn!(
-                                    "({}) did not finish transferring data ({}/{})", 
+                                    "({}) {:?} did not finish transferring data ({}/{})", 
                                     header.seqnum,
+                                    urb_header.kind,
                                     len,
                                     urb_header.actual_transfer_len
                                 );
+                                if UrbType::Ctrl == urb_header.kind {
+                                    trace! { %ctrl };
+                                }
                                 urb_header.actual_transfer_len = len as u16;
                             }
                             if let Some(t) = transfer.as_mut() {
@@ -1223,7 +1230,7 @@ where
                         }
 
                         (header, urb_header, transfer, iso_pkts)
-                    }.instrument(trace_span!("transfer_construction"));
+                    }.instrument(trace_span!("setup_transfer"));
                     // debug!("size_of::<F>() = {}", size_of_val(&fut));
                     active_transfers.spawn(fut);
                 }
@@ -1293,7 +1300,8 @@ where
                         transfer.len() as u16
                     };
 
-                    let iso_packet_count = (iso_pkts.len() / size_of::<ioctl::IocIsoPacketGiveback>()) as u16;
+                    let iso_packet_count =
+                        (iso_pkts.len() / size_of::<ioctl::IocIsoPacketGiveback>()) as u16;
 
                     let total_frame_len = if Dir::Out == dir {
                         size_of::<Header>() + size_of::<UrbHeader>() + iso_pkts.len()
