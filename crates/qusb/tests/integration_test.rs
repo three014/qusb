@@ -164,7 +164,7 @@ fn client_borrows_usb() {
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
                 bus_number: 9,
-                device_addr: 2,
+                device_addr: 3,
             })
             .await
             .unwrap();

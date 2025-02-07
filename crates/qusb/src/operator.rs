@@ -351,27 +351,11 @@ where
                     // Calculating all parts of the transfer frame
                     let actual_transfer_len = urb.buffer_length as usize;
                     let packet_count = urb.packet_count as usize;
+                    let iso_byte_len = packet_count * size_of::<ioctl::IocIsoPacketData>();
 
                     let padded_transfer_len = align_to_usize(actual_transfer_len);
-                    let data_len =
-                        padded_transfer_len + packet_count * size_of::<ioctl::IocIsoPacketData>();
-                    let total_frame_len = {
-                        let static_len = size_of::<Header>() + size_of::<UrbHeader>();
-                        if Dir::Out == urb.endpoint.direction()
-                            && (actual_transfer_len > 0 || packet_count > 0)
-                        {
-                            static_len + data_len
-                        } else {
-                            static_len
-                        }
-                    };
+                    let data_len = padded_transfer_len + iso_byte_len;
 
-                    let header = Header {
-                        total_frame_len: (total_frame_len / 8) as u16,
-                        seqnum: next_seqnum,
-                        command: msg::Command::CmdSubmit,
-                        status: msg::Status::Success,
-                    };
                     let urb_header = msg::UrbHeader {
                         kind: urb.typ,
                         actual_transfer_len: actual_transfer_len as u16,
@@ -405,16 +389,65 @@ where
                             };
 
                             vhci.fetch_data(borrower_urb).unwrap();
+                            let total_frame_len = {
+                                let static_len = size_of::<Header>() + size_of::<UrbHeader>();
+                                static_len + data_len
+                            };
+                            let header = Header {
+                                total_frame_len: (total_frame_len / 8) as u16,
+                                seqnum: next_seqnum,
+                                command: msg::Command::CmdSubmit,
+                                status: msg::Status::Success,
+                            };
                             let mut request = header
                                 .as_bytes()
                                 .chain(urb_header.as_bytes())
                                 .chain(data.as_bytes());
 
-                            tx.write_all_buf(&mut request).await.unwrap();
+                            tx.write_all_buf(&mut request).await?;
+                        }
+                        Dir::In if packet_count > 0 => {
+                            let data = &mut scratch_buf[..data_len];
+                            let (transfer, rest) = data.split_at_mut(padded_transfer_len);
+                            let iso_data = <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(
+                                rest,
+                                packet_count,
+                            )
+                            .unwrap();
+
+                            let borrower_urb = UrbWithIsoData {
+                                handle,
+                                header: &urb_header,
+                                transfer: &mut transfer[..actual_transfer_len],
+                                iso_data,
+                            };
+                            vhci.fetch_data(borrower_urb).unwrap();
+                            let total_frame_len = {
+                                let static_len = size_of::<Header>() + size_of::<UrbHeader>();
+                                static_len + iso_byte_len
+                            };
+                            let header = Header {
+                                total_frame_len: (total_frame_len / 8) as u16,
+                                seqnum: next_seqnum,
+                                command: msg::Command::CmdSubmit,
+                                status: msg::Status::Success,
+                            };
+                            let mut request = header
+                                .as_bytes()
+                                .chain(urb_header.as_bytes())
+                                .chain(&scratch_buf[padded_transfer_len..iso_byte_len]);
+                            tx.write_all_buf(&mut request).await?;
                         }
                         Dir::Out | Dir::In => {
+                            let total_frame_len = size_of::<Header>() + size_of::<UrbHeader>();
+                            let header = Header {
+                                total_frame_len: (total_frame_len / 8) as u16,
+                                seqnum: next_seqnum,
+                                command: msg::Command::CmdSubmit,
+                                status: msg::Status::Success,
+                            };
                             let mut request = header.as_bytes().chain(urb_header.as_bytes());
-                            tx.write_all_buf(&mut request).await.unwrap();
+                            tx.write_all_buf(&mut request).await?;
                         }
                     }
                 }
@@ -481,7 +514,10 @@ where
                         iso_giveback,
                     };
 
-                    vhci.giveback_urb(lender_urb).await.unwrap();
+                    if let Err(err) = vhci.giveback_urb(lender_urb).await {
+                        warn! { %err, "error while giving back completed urb. context: {urb:?}, transfer.len() = {}", transfer.len() };
+                        panic!("giveback failed (check logs for more info)");
+                    }
                 }
                 Event::Frame(Ok(Some(Recv::PortReset(Header {
                     seqnum,
@@ -514,6 +550,7 @@ where
             }
         };
 
+        info!("disconnecting {id}");
         vhci.disconnect(port).await?;
         result
     }
@@ -1000,6 +1037,8 @@ where
                                         scratch.set_len(needed);
                                     }
                                     scratch.split_to(needed)
+                                } else if UrbType::Iso == urb_header.kind && !data.is_empty() {
+                                    data
                                 } else {
                                     BytesMut::new()
                                 };
