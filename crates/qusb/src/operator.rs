@@ -1,6 +1,8 @@
 use std::{
+    cell::{RefCell, RefMut},
     collections::{BTreeMap, VecDeque},
     io,
+    rc::Rc,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex, MutexGuard,
@@ -612,7 +614,8 @@ enum OneOrMany<T> {
 
 // #[tracing::instrument(level = "trace", skip_all)]
 fn get_or_alloc_transfer(
-    mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
+    // mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
+    mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     num_iso_packets: u16,
 ) -> InnerTransfer {
     let mut maybe_first_entry;
@@ -660,7 +663,8 @@ fn get_or_alloc_transfer(
 
 // #[tracing::instrument(level = "trace", skip_all)]
 fn insert_spare_transfer(
-    mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
+    // mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
+    mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     transfer: InnerTransfer,
 ) {
     const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
@@ -897,8 +901,10 @@ where
         buf_rx.reserve(BUF_LEN);
         let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
         let mut scratch_buf = BytesMut::with_capacity(BUF_LEN);
-        let cached_transfers: Arc<Mutex<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        // let cached_transfers: Arc<Mutex<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
+        //     Arc::new(Mutex::new(BTreeMap::new()));
+        let cached_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
+            Rc::new(RefCell::new(BTreeMap::new()));
 
         let result = loop {
             let check_transfer = !active_transfers.is_empty();
@@ -921,7 +927,8 @@ where
 
                     let claimed = Arc::clone(&claimed_interfaces);
                     let handle = Arc::clone(&device);
-                    let cache = Arc::clone(&cached_transfers);
+                    // let cache = Arc::clone(&cached_transfers);
+                    let cache = cached_transfers.clone();
 
                     // This all took less than 2 microseconds
                     let (urb_header, data) = urb_frame.split::<[u8]>();
@@ -1044,7 +1051,7 @@ where
                                     .unwrap();
                                 // trace!("{:?}", &iso_packets);
 
-                                let transfer = get_or_alloc_transfer(cache.lock().unwrap(), num_iso_packets as u16);
+                                let transfer = get_or_alloc_transfer(cache.borrow_mut(), num_iso_packets as u16);
                                 let mut transfer = unsafe {
                                     transfer.into_iso(
                                         &handle,
@@ -1076,11 +1083,11 @@ where
                                 }
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
-                                insert_spare_transfer(cache.lock().unwrap(), transfer);
+                                insert_spare_transfer(cache.borrow_mut(), transfer);
                                 (status, Some(buf), iso_raw_buf)
                             }
                             UrbType::Int => {
-                                let transfer = get_or_alloc_transfer(cache.lock().unwrap(), 0);
+                                let transfer = get_or_alloc_transfer(cache.borrow_mut(), 0);
                                 let mut transfer = unsafe {
                                     transfer.into_int(
                                         &handle,
@@ -1094,7 +1101,7 @@ where
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
-                                insert_spare_transfer(cache.lock().unwrap(), transfer);
+                                insert_spare_transfer(cache.borrow_mut(), transfer);
                                 (status, Some(buf), BytesMut::new())
                             }
                             UrbType::Ctrl
@@ -1155,7 +1162,7 @@ where
                             }
                             UrbType::Ctrl => {
                                 let is_get_status = Request::STANDARD_DEVICE_GET_STATUS == ctrl.req();
-                                let transfer = get_or_alloc_transfer(cache.lock().unwrap(), 0);
+                                let transfer = get_or_alloc_transfer(cache.borrow_mut(), 0);
                                 // SAFETY: Transfer buffer is longer than
                                 //         required lengths, and setup packet
                                 //         contains the right length as well.
@@ -1175,7 +1182,7 @@ where
 
                                 let mut buf = {
                                     let (transfer, mut buf) = transfer.into_parts().unwrap();
-                                    insert_spare_transfer(cache.lock().unwrap(), transfer);
+                                    insert_spare_transfer(cache.borrow_mut(), transfer);
                                     buf.split_off(size_of::<ioctl::IocSetupPacket>())
                                 };
 
@@ -1187,7 +1194,7 @@ where
                                 (status, Some(buf), BytesMut::new())
                             }
                             UrbType::Bulk => {
-                                let transfer = get_or_alloc_transfer(cache.lock().unwrap(), 0);
+                                let transfer = get_or_alloc_transfer(cache.borrow_mut(), 0);
                                 let mut transfer = unsafe {
                                     transfer.into_bulk(
                                         &handle,
@@ -1202,7 +1209,7 @@ where
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
-                                insert_spare_transfer(cache.lock().unwrap(), transfer);
+                                insert_spare_transfer(cache.borrow_mut(), transfer);
                                 (status, Some(buf), BytesMut::new())
                             }
                         };
@@ -1232,7 +1239,7 @@ where
                         (header, urb_header, transfer, iso_pkts)
                     }.instrument(trace_span!("setup_transfer"));
                     // debug!("size_of::<F>() = {}", size_of_val(&fut));
-                    active_transfers.spawn(fut);
+                    active_transfers.spawn_local(fut);
                 }
                 Event::RecvFrame(Some(Recv::PortReset(header))) => {
                     trace!("({}) got port reset", header.seqnum);

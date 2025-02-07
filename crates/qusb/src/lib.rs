@@ -725,7 +725,7 @@ impl Server {
                 match event {
                     Event::Incoming(Some(incoming)) => {
                         debug!("Incoming connection from {}", incoming.remote_address());
-                        set.spawn(
+                        set.spawn_local(
                             ReqHandler::new(self.dev.clone(), incoming, cancel_for_serve.clone())
                                 .open_session(),
                         );
@@ -754,7 +754,7 @@ impl Server {
         }
         .in_current_span();
 
-        let handle = tokio::spawn(fut);
+        let handle = tokio::task::spawn_local(fut);
         ServerHandle {
             handle,
             cancel_token: cancel_for_handle,

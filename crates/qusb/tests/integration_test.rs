@@ -1,5 +1,9 @@
 use core::str;
-use std::{io::{stdout, BufWriter}, sync::Mutex, time::Duration};
+use std::{
+    io::{stdout, BufWriter},
+    sync::Mutex,
+    time::Duration,
+};
 
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
@@ -46,7 +50,7 @@ mod common;
 //     handle.shutdown().await.unwrap().unwrap();
 // }
 
-#[test]
+// #[test]
 fn borrow_self_dev() {
     let log_path = "borrow_self_dev.log";
     let log_file = std::fs::File::options()
@@ -59,14 +63,15 @@ fn borrow_self_dev() {
     _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
         .with_line_number(true)
-        .with_writer(Mutex::new(stdout()))
+        .with_writer(Mutex::new(BufWriter::with_capacity(1024, log_file)))
         .try_init();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .thread_keep_alive(Duration::from_secs(60))
         .build()
         .unwrap();
-    runtime.block_on(borrow_self_dev_inner());
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, borrow_self_dev_inner());
 }
 
 async fn borrow_self_dev_inner() {
@@ -81,8 +86,8 @@ async fn borrow_self_dev_inner() {
 
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
-                bus_number: 4,
-                device_addr: 2,
+                bus_number: 1,
+                device_addr: 13,
             })
             .await
             .unwrap();
@@ -126,35 +131,55 @@ async fn borrow_self_dev_inner() {
 //     handle.shutdown().await.unwrap().unwrap();
 // }
 
-// #[tokio::test]
-// async fn client_borrows_usb() {
-//     let log_path = "client_borrows_usb.log";
-//     let log_file = std::fs::File::options()
-//         .create(true)
-//         .read(true)
-//         .write(true)
-//         .truncate(true)
-//         .open(log_path)
-//         .unwrap();
-//     _ = tracing_subscriber::fmt()
-//         .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
-//         .with_line_number(true)
-//         .with_writer(Mutex::new(BufWriter::new(log_file)))
-//         .try_init();
+#[test]
+fn client_borrows_usb() {
+    let log_path = "client_borrows_usb.log";
+    let log_file = std::fs::File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+        .unwrap();
+    _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
+        .with_line_number(true)
+        .with_writer(Mutex::new(BufWriter::with_capacity(128, log_file)))
+        .try_init();
 
-//     let client = common::dummy_trusting_client("[::]:7400".parse().unwrap());
-//     let session = client
-//         .connect("10.4.31.230:7400".parse().unwrap(), "pan1.test.bed")
-//         .await
-//         .unwrap();
-//     tracing::info!("Connected to {}", session.remote_address());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .thread_keep_alive(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
+        let client = common::dummy_trusting_client("[::]:7400".parse().unwrap());
+        let session = client
+            .connect("10.4.31.230:7400".parse().unwrap(), "pan1.test.bed")
+            .await
+            .unwrap();
+        tracing::info!("Connected to {}", session.remote_address());
 
-//     let usb = session
-//         .req_borrow(proto::msg::UsbDeviceId {
-//             bus_number: 3,
-//             device_addr: 48,
-//         })
-//         .await
-//         .unwrap();
-//     usb.borrow().await.unwrap();
-// }
+        let usb = session
+            .req_borrow(proto::msg::UsbDeviceId {
+                bus_number: 9,
+                device_addr: 2,
+            })
+            .await
+            .unwrap();
+        let ctrl_c = tokio::signal::ctrl_c();
+        let cancel = CancellationToken::new();
+        tokio::select! {
+            Err(err) = usb.borrow(cancel.clone()) => {
+                panic!("{err}");
+            }
+            Err(err) = ctrl_c => {
+                panic!("{err}");
+            }
+            else => {
+                cancel.cancel();
+            }
+        }
+    });
+}

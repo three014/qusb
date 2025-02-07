@@ -349,7 +349,7 @@ impl Controller {
         let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
-        let handle = Some(Arc::new(tokio::spawn(
+        let handle = Some(Arc::new(tokio::task::spawn_local(
             Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).demux_vhci(),
         )));
 
