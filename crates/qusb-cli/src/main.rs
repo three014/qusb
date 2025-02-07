@@ -24,7 +24,8 @@ fn main() -> anyhow::Result<()> {
         .thread_keep_alive(Duration::from_secs(60))
         .build()?;
 
-    rt.block_on(async_main())
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async_main())
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -38,7 +39,7 @@ async fn async_main() -> anyhow::Result<()> {
         .truncate(true)
         .open(log_path)?;
     _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
+        .with_env_filter(EnvFilter::builder().parse("rusb=trace,qusb=trace").unwrap())
         .with_line_number(true)
         .with_writer(Mutex::new(BufWriter::with_capacity(128, _log_file)))
         .try_init();

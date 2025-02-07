@@ -4,7 +4,7 @@ use std::{
     io,
     rc::Rc,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::Duration,
@@ -564,7 +564,18 @@ pub(crate) fn open_device(
     dev_id: msg::UsbDeviceId,
 ) -> rusb::Result<rusb::DeviceHandle<rusb::Context>> {
     rusb::Context::new()
-        .and_then(|ctx| ctx.devices())
+        .and_then(|ctx| {
+            // let span = tracing::trace_span!("libusb");
+            // ctx.set_log_level(rusb::LogLevel::Debug);
+            // ctx.set_log_callback(
+            //     Box::new(move |_level, msg| {
+            //         let _enter = span.enter();
+            //         tracing::trace!("{}", msg.trim_end());
+            //     }),
+            //     rusb::LogCallbackMode::Context,
+            // );
+            ctx.devices()
+        })
         .and_then(|list| {
             list.iter()
                 .find(|dev| {
@@ -783,9 +794,10 @@ fn convert_libusb_to_vhci(
         Err(rusb::Error::NotSupported) => {
             unreachable!("will we ever mess with the transfer flags?")
         }
-        Err(err) => {
-            warn! { %err, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
-            vhci::Status::Error
+        Err(_err) => {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            warn! { %errno, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
+            vhci::Status::from_errno_raw(-errno, UrbType::Iso == kind)
         }
     }
 }
@@ -930,7 +942,6 @@ where
                     // let cache = Arc::clone(&cached_transfers);
                     let cache = cached_transfers.clone();
 
-                    // This all took less than 2 microseconds
                     let (urb_header, data) = urb_frame.split::<[u8]>();
                     let mut urb_header = urb_header.read();
                     let ctrl = urb_header.ctrl_packet;
@@ -1049,7 +1060,15 @@ where
                                         num_iso_packets,
                                     )
                                     .unwrap();
-                                // trace!("{:?}", &iso_packets);
+                                match urb_header.endpoint.direction() {
+                                    Dir::In => {
+                                        // trace!("{urb_header:?}");
+                                    },
+                                    Dir::Out => {
+                                        // trace!("{urb_header:?}");
+                                        trace!("({}) {:?}", header.seqnum, &iso_packets);
+                                    },
+                                }
 
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), num_iso_packets as u16);
                                 let mut transfer = unsafe {
@@ -1067,8 +1086,6 @@ where
                                 let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
-                                // let _errno = dbg!(io::Error::last_os_error());
-
                                 let iso_packets =
                                     <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
                                         &mut iso_raw_buf[..],
@@ -1076,14 +1093,23 @@ where
                                     )
                                     .unwrap();
                                 for (our_pkt, libusb_pkt) in
-                                    iso_packets.iter_mut().zip(transfer.iso_packets().unwrap())
+                                    iso_packets.iter_mut().zip(transfer.iso_packets().expect("why wouldn't a transfer be complete here?"))
                                 {
                                     our_pkt.packet_actual = libusb_pkt.actual_len();
                                     our_pkt.status = libusb_pkt.status() as i32;
                                 }
+                                trace!("{:?}", &iso_packets);
+                                if vhci::Status::Success != status {
+                                    static IS_ALT_SET: AtomicBool = AtomicBool::new(false);
+                                    if !IS_ALT_SET.swap(true, Ordering::SeqCst) {
+                                        handle.set_alternate_setting(1, 1).unwrap();
+                                        handle.set_alternate_setting(2, 1).unwrap();
+                                    }
+                                }
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
                                 insert_spare_transfer(cache.borrow_mut(), transfer);
+
                                 (status, Some(buf), iso_raw_buf)
                             }
                             UrbType::Int => {
@@ -1178,8 +1204,6 @@ where
                                 let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
-                                // trace! { %ctrl };
-
                                 let mut buf = {
                                     let (transfer, mut buf) = transfer.into_parts().unwrap();
                                     insert_spare_transfer(cache.borrow_mut(), transfer);
@@ -1237,7 +1261,7 @@ where
                         }
 
                         (header, urb_header, transfer, iso_pkts)
-                    }.instrument(trace_span!("setup_transfer"));
+                    }.instrument(trace_span!("transfer"));
                     // debug!("size_of::<F>() = {}", size_of_val(&fut));
                     active_transfers.spawn_local(fut);
                 }
