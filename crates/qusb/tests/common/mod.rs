@@ -6,7 +6,6 @@ use std::{
 };
 use vhci::utils::BoundedU8;
 
-
 /// A custom certificate that accepts any and all certificates it sees.
 ///
 /// Do not use in production environments.

@@ -73,9 +73,7 @@ async fn async_main() -> anyhow::Result<()> {
             };
 
             println!("config directory: {}", conf_dir.display());
-            println!(
-                "bind address: {bind}",
-            );
+            println!("bind address: {bind}",);
             println!("make and use self-signed certificate: {make_self_signed}");
             println!("allow insecure connections: {allow_insecure}");
 

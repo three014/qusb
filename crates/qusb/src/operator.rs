@@ -841,8 +841,8 @@ fn convert_libusb_to_vhci(
 
 #[inline]
 fn write_transfer(src: &[u8], dst: &mut [u8]) {
-    let src = <[u64]>::ref_from_bytes(src).unwrap();
-    let dst = <[u64]>::mut_from_bytes(dst).unwrap();
+    // let src = <[u64]>::ref_from_bytes(src).unwrap();
+    // let dst = <[u64]>::mut_from_bytes(dst).unwrap();
     dst.copy_from_slice(src);
 }
 
@@ -949,9 +949,6 @@ where
         const BUF_LEN: usize = 16 << 10;
         buf_rx.reserve(BUF_LEN);
         let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
-        let mut scratch_buf = BytesMut::with_capacity(BUF_LEN);
-        // let cached_transfers: Arc<Mutex<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
-        //     Arc::new(Mutex::new(BTreeMap::new()));
         let cached_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
             Rc::new(RefCell::new(BTreeMap::new()));
 
@@ -970,13 +967,11 @@ where
                 }
             } {
                 Event::RecvFrame(Some(Recv::Urb((header, urb_frame)))) => {
-                    // debug!("({}) received new URB", header.seqnum);
                     let cancel = CancellationToken::new();
                     cancel_tokens.insert(header.seqnum, cancel.clone());
 
                     let claimed = Arc::clone(&claimed_interfaces);
                     let handle = Arc::clone(&device);
-                    // let cache = Arc::clone(&cached_transfers);
                     let cache = cached_transfers.clone();
 
                     let (urb_header, data) = urb_frame.split::<[u8]>();
@@ -984,7 +979,6 @@ where
                     let ctrl = urb_header.ctrl_packet;
                     let mut data = data.into_bytes_mut();
                     let transfer_len = urb_header.actual_transfer_len as usize;
-                    let iso_packet_count = urb_header.iso_packet_count as usize;
 
                     // New idea: reserve the data before we get into the
                     // future so that we don't need a mutex
@@ -1011,40 +1005,20 @@ where
                             BytesMut::new(),
                         )
                     } else {
-                        match urb_header.endpoint.direction() {
+                        let transfer_buf = match urb_header.endpoint.direction() {
                             Dir::Out => {
                                 let needed = align_to_usize(transfer_len);
                                 let transfer = data.split_to(needed);
                                 let mut dma = scratch_dma.reserve(needed);
                                 write_transfer(&transfer, &mut dma);
-                                (dma.split_to(transfer_len), data)
+                                dma.split_to(transfer_len)
                             }
                             Dir::In => {
-                                let dma = {
-                                    let needed = align_to_usize(transfer_len);
-                                    scratch_dma.reserve(needed).split_to(transfer_len)
-                                };
-                                let iso_buf = if UrbType::Iso == urb_header.kind {
-                                    let scratch = &mut scratch_buf;
-                                    let len = scratch.len();
-                                    let needed =
-                                        iso_packet_count * size_of::<ioctl::IocIsoPacketData>();
-                                    let additional = needed.saturating_sub(len);
-                                    scratch.reserve(additional);
-                                    // SAFETY: None of this buf is read, only written to at first.
-                                    //         Plus we just ensured that we have capacity for this.
-                                    unsafe {
-                                        scratch.set_len(needed);
-                                    }
-                                    scratch.split_to(needed)
-                                } else if UrbType::Iso == urb_header.kind && !data.is_empty() {
-                                    data
-                                } else {
-                                    BytesMut::new()
-                                };
-                                (dma, iso_buf)
+                                let needed = align_to_usize(transfer_len);
+                                scratch_dma.reserve(needed).split_to(transfer_len)
                             }
-                        }
+                        };
+                        (transfer_buf, data)
                     };
 
                     let fut = async move {
@@ -1088,8 +1062,6 @@ where
                                     }
                                 }
 
-                                // trace!("{urb_header:?}");
-
                                 // TODO: There might be an issue with setting up
                                 //       iso packet offsets, I'm not sure yet.
                                 let num_iso_packets = urb_header.iso_packet_count as usize;
@@ -1099,15 +1071,7 @@ where
                                         num_iso_packets,
                                     )
                                     .unwrap();
-                                match urb_header.endpoint.direction() {
-                                    Dir::In => {
-                                        // trace!("{urb_header:?}");
-                                    },
-                                    Dir::Out => {
-                                        // trace!("{urb_header:?}");
-                                        trace!("({}) {:?}", header.seqnum, &iso_packets);
-                                    },
-                                }
+                                // trace!("({}) {:?}", header.seqnum, &iso_packets);
 
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), num_iso_packets as u16);
                                 let mut transfer = unsafe {
@@ -1137,17 +1101,28 @@ where
                                     our_pkt.packet_actual = libusb_pkt.actual_len();
                                     our_pkt.status = libusb_pkt.status() as i32;
                                 }
-                                trace!("{:?}", &iso_packets);
+                                let (transfer, mut buf) = transfer.into_parts().unwrap();
+                                insert_spare_transfer(cache.borrow_mut(), transfer);
+
                                 if vhci::Status::Success != status {
-                                    static IS_ALT_SET: AtomicBool = AtomicBool::new(false);
-                                    if !IS_ALT_SET.swap(true, Ordering::SeqCst) {
-                                        handle.set_alternate_setting(1, 1).unwrap();
-                                        handle.set_alternate_setting(2, 1).unwrap();
+                                    static _IS_ALT_SET: AtomicBool = AtomicBool::new(false);
+                                    if !_IS_ALT_SET.swap(true, Ordering::SeqCst) {
+                                        let result = handle.set_alternate_setting(2, 1);
+                                        debug!("setting alt 1 for interface 2: {result:?}");
+                                    //     let active_config = handle.device().active_config_descriptor().unwrap();
+                                    //     active_config.interfaces().for_each(|int| {
+                                    //         int.descriptors().for_each(|int_desc| {
+                                    //             if 1 == int_desc.class_code() && 2 == int_desc.sub_class_code() && 0 < int_desc.num_endpoints() {
+                                    //                 let result = handle.set_alternate_setting(int_desc.interface_number(), int_desc.setting_number());
+                                    //                 debug!("setting alt {} for interface {}: {result:?}", int_desc.setting_number(), int_desc.interface_number());
+                                    //             }
+                                    //         })
+                                    //     });
                                     }
                                 }
-
-                                let (transfer, buf) = transfer.into_parts().unwrap();
-                                insert_spare_transfer(cache.borrow_mut(), transfer);
+                                if Dir::In == urb_header.endpoint.direction() {
+                                    unsafe { buf.set_len(buf.capacity()) };
+                                }
 
                                 (status, Some(buf), iso_raw_buf)
                             }
@@ -1282,21 +1257,23 @@ where
                         {
                             let len = transfer.as_ref().map(|t| t.len()).unwrap_or_default();
                             if len != urb_header.actual_transfer_len as usize {
-                                warn!(
-                                    "({}) {:?} did not finish transferring data ({}/{})", 
-                                    header.seqnum,
-                                    urb_header.kind,
-                                    len,
-                                    urb_header.actual_transfer_len
-                                );
-                                if UrbType::Ctrl == urb_header.kind {
-                                    trace! { %ctrl };
+                                if UrbType::Iso != urb_header.kind {
+                                    warn!(
+                                        "({}) {:?} did not finish transferring data ({}/{})", 
+                                        header.seqnum,
+                                        urb_header.kind,
+                                        len,
+                                        urb_header.actual_transfer_len
+                                    );
                                 }
                                 urb_header.actual_transfer_len = len as u16;
                             }
                             if let Some(t) = transfer.as_mut() {
                                 t.clear();
                             }
+                        }
+                        if UrbType::Ctrl == urb_header.kind {
+                            // trace! { %ctrl };
                         }
 
                         (header, urb_header, transfer, iso_pkts)
