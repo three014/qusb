@@ -235,6 +235,7 @@ where
             remote_dev: _dev_id,
             local_port: port,
         };
+        info!("({id}) connected new device with {data_rate:?}");
 
         enum Event {
             Work(Option<ioctl::Work>),
@@ -246,9 +247,9 @@ where
         let mut addr: u8 = 0xff;
         let mut prev = ioctl::IocPortStat::default();
         let mut handles: SimpleMap<u32, ioctl::UrbHandle> =
-            SimpleMap::with_capacity_and_hasher(32, Default::default());
+            SimpleMap::with_capacity_and_hasher(64, Default::default());
         let mut seqnums: SimpleMap<ioctl::UrbHandle, u32> =
-            SimpleMap::with_capacity_and_hasher(32, Default::default());
+            SimpleMap::with_capacity_and_hasher(64, Default::default());
 
         info!("({id}) starting event loop");
 
@@ -342,7 +343,6 @@ where
                 }
                 Event::Work(Some(ioctl::Work::ProcessUrb((urb, handle)))) => {
                     assert_eq!(addr, urb.address.get());
-                    // debug!("({id}, local dev {addr:03})");
 
                     let next_seqnum = seqnum.fetch_add(1, Ordering::Relaxed);
                     assert!(handles.insert(next_seqnum, handle).is_none());
@@ -435,7 +435,7 @@ where
                             let mut request = header
                                 .as_bytes()
                                 .chain(urb_header.as_bytes())
-                                .chain(&scratch_buf[padded_transfer_len..iso_byte_len]);
+                                .chain(&scratch_buf[padded_transfer_len..padded_transfer_len + iso_byte_len]);
                             tx.write_all_buf(&mut request).await?;
                         }
                         Dir::Out | Dir::In => {
@@ -482,8 +482,8 @@ where
 
                     if vhci::Status::Success != urb.status {
                         warn!(
-                            "({id}) {:?} transfer {} failed: {:?}",
-                            urb.kind, seqnum, urb.status
+                            "({id}) {:?} {:?} transfer {} failed: {:?}",
+                            urb.kind, urb.endpoint.direction(), seqnum, urb.status
                         );
                     }
                     let transfer_len = urb.actual_transfer_len as usize;
@@ -515,8 +515,8 @@ where
                     };
 
                     if let Err(err) = vhci.giveback_urb(lender_urb).await {
-                        warn! { %err, "error while giving back completed urb. context: {urb:?}, transfer.len() = {}", transfer.len() };
-                        panic!("giveback failed (check logs for more info)");
+                        warn! { %err, "error while giving back completed urb {seqnum}. context: {urb:?}, {transfer:?}, {iso_giveback:?}" };
+                        // panic!("giveback failed (check logs for more info)");
                     }
                 }
                 Event::Frame(Ok(Some(Recv::PortReset(Header {
@@ -660,9 +660,7 @@ enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-// #[tracing::instrument(level = "trace", skip_all)]
 fn get_or_alloc_transfer(
-    // mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     num_iso_packets: u16,
 ) -> InnerTransfer {
@@ -709,9 +707,7 @@ fn get_or_alloc_transfer(
     }
 }
 
-// #[tracing::instrument(level = "trace", skip_all)]
 fn insert_spare_transfer(
-    // mut cache: MutexGuard<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     transfer: InnerTransfer,
 ) {
@@ -770,7 +766,6 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
         Self { queue, handle }
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn reserve(&mut self, num_bytes: usize) -> UsbMemMut {
         assert!(num_bytes <= DMA_LEN, "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {DMA_LEN} bytes)");
         let queue = &mut self.queue;
@@ -980,8 +975,8 @@ where
                     let mut data = data.into_bytes_mut();
                     let transfer_len = urb_header.actual_transfer_len as usize;
 
-                    // New idea: reserve the data before we get into the
-                    // future so that we don't need a mutex
+                    // Reserve the data before we get into the
+                    // future so that we don't need synchronization.
                     let (transfer_buf, mut iso_raw_buf) = if UrbType::Ctrl == urb_header.kind {
                         let mut transfer = {
                             let w_length = ctrl.length() as usize;

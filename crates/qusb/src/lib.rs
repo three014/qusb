@@ -4,7 +4,6 @@ use proto::{
     msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use std::os::unix::ffi::OsStrExt;
 use std::{
     io,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
@@ -12,6 +11,7 @@ use std::{
     path::Path,
     sync::{Arc, LazyLock},
 };
+use std::{os::unix::ffi::OsStrExt, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn, Instrument};
 use usb_ids::UsbIds;
@@ -528,6 +528,21 @@ impl Client {
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Result<Session> {
         let conn = self.endpoint.connect(peer_addr, peer_name).unwrap().await?;
+        let conn2 = conn.clone();
+        tokio::task::spawn_local(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = conn2.closed() => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let stats = conn2.stats();
+                        trace!("{stats:?}");
+                    }
+                }
+            }
+        });
         Ok(Session::new(conn, self.dev.clone()))
     }
 }

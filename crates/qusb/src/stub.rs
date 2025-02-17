@@ -66,14 +66,10 @@ impl Demuxer {
         } = self;
 
         let register_queue = Mutex::new(VecDeque::new());
-        let mailer = Mutex::new(Mailer::with_capacities(8, 8, 10, 67));
-        let (work_tx, mut work_rx) = mpsc::channel(64);
+        let mailer = Mutex::new(Mailer::with_capacities(8, 8, 10, 1024));
+        let (work_tx, mut work_rx) = mpsc::channel(128);
         let work_receiver = vhci.work_receiver().unwrap();
         let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx));
-
-        // let mut dbg_register_complete_bucket = FxHashSet::with_hasher(Default::default());
-        // let mut dbg_register_inprogress_bucket = FxHashSet::with_hasher(Default::default());
-        // let mut dbg_urb_bucket = FxHashSet::with_hasher(Default::default());
 
         struct Context {
             vhci: Mutex<vhci::Controller>,
@@ -165,8 +161,6 @@ impl Demuxer {
                     });
                 }
                 Event::GivebackUrb(Some(handle)) => {
-                    // dbg_urb_bucket.remove(&handle);
-                    // dbg_register_complete_bucket.remove(&handle);
                     _ = ctx.mailer.lock().unwrap().remove_by_key3(&handle);
                 }
                 Event::Disconnect(Some(Ctrl { data: port, tx })) => {
@@ -187,7 +181,6 @@ impl Demuxer {
                     });
                 }
                 Event::Work(ioc_work) => {
-                    let timer = Timer::start();
                     // SAFETY: Per the function's safety contract,
                     //         the work item is unaltered from the
                     //         ioctl call.
@@ -222,27 +215,11 @@ impl Demuxer {
                                     let port = queue.pop_front().unwrap();
 
                                     mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
-                                    // TODO: Alternate idea to line 206 - Allow linking operation
-                                    //       to push out old keys
                                     mailer.link_key2_to_key1(NoHash(address), &port);
-                                    // assert_eq!(
-                                    //     LinkResult::Success,
-                                    //     ctx.mailer.link_key2_to_key1(NoHash(address), &port),
-                                    //     "{address:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                    //     dbg_register_inprogress_bucket,
-                                    //     dbg_register_complete_bucket,
-                                    //     dbg_urb_bucket
-                                    // );
                                     assert_eq!(
                                         LinkResult::Success,
                                         mailer.link_key3_to_key1(*handle, &port),
-                                        // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                        // dbg_register_inprogress_bucket,
-                                        // dbg_register_complete_bucket,
-                                        // dbg_urb_bucket
                                     );
-                                    // dbg_register_complete_bucket.insert(handle);
-                                    // dbg_register_inprogress_bucket.remove(&handle);
                                     mailer.get_by_key1(&port).cloned()
                                 }
                                 vhci::ioctl::UrbType::Ctrl
@@ -252,27 +229,17 @@ impl Demuxer {
                                     assert_eq!(
                                         LinkResult::Success,
                                         mailer.link_key3_to_key1(*handle, &port),
-                                        // "{handle:?}/{port:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                        // dbg_register_inprogress_bucket,
-                                        // dbg_register_complete_bucket,
-                                        // dbg_urb_bucket
                                     );
-                                    // dbg_register_inprogress_bucket.insert(handle);
                                     mailer.get_by_key1(&port).cloned()
                                 }
                                 _ => {
                                     let address = NoHash(urb.address);
                                     match mailer.link_key3_to_key2(*handle, &address) {
                                             LinkResult::Success | LinkResult::NewKeyAlreadyExists => {
-                                                // dbg_urb_bucket.insert(handle);
                                                 mailer.get_by_key2(&address).cloned()
                                             }
                                             LinkResult::ExistingKeyDoesNotExist => panic!(
                                                 "key {address:?} does not exist, was trying to link {handle:?}"
-                                                // "LinkResult::ExistingKeyDoesNotExist\nurb: {urb:?}\n{handle:?}/{address:?}\nin-progress bucket: {:?}\ncompleted bucket: {:?}\nurb bucket: {:?}",
-                                                // dbg_register_inprogress_bucket,
-                                                // dbg_register_complete_bucket,
-                                                // dbg_urb_bucket
                                             ),
                                         }
                                 }
@@ -285,7 +252,6 @@ impl Demuxer {
                         }
                     };
 
-                    timer.stop_and_report(Some(Duration::from_micros(5)), "routing work item");
                     if let Some(tx) = tx {
                         if tx.send(work).await.is_err() {
                             // TODO: Remove by which key? By the value itself?
@@ -342,7 +308,6 @@ pub struct Controller {
 }
 
 impl Controller {
-    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
         let (register_tx, register_rx) = mpsc::channel(4);
         let (giveback_tx, giveback_rx) = mpsc::channel(32);
@@ -362,7 +327,6 @@ impl Controller {
         })
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
     pub async fn register(
         &mut self,
         port: RegisterPort,
@@ -375,7 +339,6 @@ impl Controller {
         rx.await.unwrap()
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn fetch_data<T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut>(
         &self,
         urb: T,
@@ -391,7 +354,6 @@ impl Controller {
         self.remote.giveback(urb)
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
     pub async fn disconnect(&mut self, port: Port) -> io::Result<()> {
         let (rx, disconnect) = Ctrl::new(port);
 
@@ -399,7 +361,6 @@ impl Controller {
         rx.await.unwrap()
     }
 
-    // #[tracing::instrument(level = "trace", skip_all)]
     pub fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
         self.remote.port_reset_done(port, enable)
     }
