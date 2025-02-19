@@ -62,7 +62,6 @@ fn borrow_self_dev() {
         .unwrap();
     _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
-        .with_line_number(true)
         .with_writer(Mutex::new(BufWriter::with_capacity(1024, log_file)))
         .try_init();
     let runtime = tokio::runtime::Builder::new_current_thread()
