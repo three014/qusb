@@ -432,10 +432,10 @@ where
                                 command: msg::Command::CmdSubmit,
                                 status: msg::Status::Success,
                             };
-                            let mut request = header
-                                .as_bytes()
-                                .chain(urb_header.as_bytes())
-                                .chain(&scratch_buf[padded_transfer_len..padded_transfer_len + iso_byte_len]);
+                            let mut request = header.as_bytes().chain(urb_header.as_bytes()).chain(
+                                &scratch_buf
+                                    [padded_transfer_len..padded_transfer_len + iso_byte_len],
+                            );
                             tx.write_all_buf(&mut request).await?;
                         }
                         Dir::Out | Dir::In => {
@@ -483,7 +483,10 @@ where
                     if vhci::Status::Success != urb.status {
                         warn!(
                             "({id}) {:?} {:?} transfer {} failed: {:?}",
-                            urb.kind, urb.endpoint.direction(), seqnum, urb.status
+                            urb.kind,
+                            urb.endpoint.direction(),
+                            seqnum,
+                            urb.status
                         );
                     }
                     let transfer_len = urb.actual_transfer_len as usize;
@@ -515,7 +518,7 @@ where
                     };
 
                     if let Err(err) = vhci.giveback_urb(lender_urb).await {
-                        warn! { %err, "error while giving back completed urb {seqnum}. context: {urb:?}, {transfer:?}, {iso_giveback:?}" };
+                        error! { %err, "error while giving back completed urb {seqnum}. context: {urb:?}, {transfer:?}, {iso_giveback:?}" };
                         // panic!("giveback failed (check logs for more info)");
                     }
                 }
@@ -829,9 +832,7 @@ fn convert_libusb_to_vhci(
     match status {
         Ok(status) => vhci_from_transfer_status(status),
         Err(rusb::Error::InvalidParam) => vhci::Status::Stall,
-        Err(rusb::Error::NoDevice) => {
-            vhci::Status::DeviceDisconnected
-        }
+        Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
         Err(rusb::Error::Busy) => {
             unreachable!("for now, no transfer can be resubmitted")
         }
@@ -949,8 +950,7 @@ where
 
         let mut cancel_tokens: IntMap<u32, CancellationToken> =
             IntMap::with_capacity_and_hasher(1024, Default::default());
-        let mut active_transfers: JoinSet<TransferPayload> =
-            JoinSet::new();
+        let mut active_transfers: JoinSet<TransferPayload> = JoinSet::new();
         let claimed_interfaces: Arc<Mutex<IntSet<u8>>> = Arc::new(Mutex::new(
             IntSet::with_capacity_and_hasher(16, Default::default()),
         ));
@@ -1080,21 +1080,6 @@ where
                                         num_iso_packets,
                                     )
                                     .unwrap();
-
-                                static IS_ALT_SET: AtomicBool = AtomicBool::new(false);
-                                if !IS_ALT_SET.swap(true, Ordering::SeqCst) && Dir::Out == urb_header.endpoint.direction() {
-                                    // let result = handle.set_alternate_setting(2, 1);
-                                    // debug!("setting alt 1 for interface 2 endpoint {}: {result:?}", urb_header.endpoint.0);
-                                    // let active_config = handle.device().active_config_descriptor().unwrap();
-                                    // active_config.interfaces().for_each(|int| {
-                                    //     int.descriptors().for_each(|int_desc| {
-                                    //         if 1 == int_desc.class_code() && 2 == int_desc.sub_class_code() && 0 < int_desc.num_endpoints() {
-                                    //             let result = handle.set_alternate_setting(int_desc.interface_number(), int_desc.setting_number());
-                                    //             debug!("setting alt {} for interface {}: {result:?}", int_desc.setting_number(), int_desc.interface_number());
-                                    //         }
-                                    //     })
-                                    // });
-                                }
 
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), num_iso_packets as u16);
                                 let mut transfer = unsafe {
@@ -1409,8 +1394,12 @@ where
                         //     &iso_pkts[..]
                         // );
                     } else {
-                        let mut response = header.as_bytes();
-                        tx.write_all_buf(&mut response).await?;
+                        error!("({}) {:?} on {:?} failed, {:?}", header.seqnum, urb.kind, urb.endpoint, urb.status);
+                        let response = Header {
+                            total_frame_len: (size_of::<Header>() / 8) as u16,
+                            ..header
+                        };
+                        tx.write_all_buf(&mut response.as_bytes()).await?;
                         let errno = urb.status.to_errno_raw(UrbType::Iso == urb.kind);
                         break Err(Error::Io(io::Error::from_raw_os_error(-errno)));
                     }
@@ -1428,7 +1417,7 @@ where
         event_handler.cancel();
         drop(device);
         _ = event_handler_loop.join();
-        tx.close().await?;
+        _ = tx.close().await;
 
         result
     }
