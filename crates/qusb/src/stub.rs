@@ -339,6 +339,7 @@ impl Controller {
         rx.await.unwrap()
     }
 
+    #[inline]
     pub fn fetch_data<T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut>(
         &self,
         urb: T,
@@ -361,6 +362,7 @@ impl Controller {
         rx.await.unwrap()
     }
 
+    #[inline(always)]
     pub fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
         self.remote.port_reset_done(port, enable)
     }

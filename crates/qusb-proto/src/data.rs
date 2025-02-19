@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
-use zerocopy::{Immutable, KnownLayout, TryFromBytes};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::GetSliceLen;
 use crate::GetSliceLenErr;
@@ -20,7 +20,7 @@ pub struct IterMutDst<'a, T: ?Sized + 'a> {
 
 impl<'a, T> Iterator for IterMutDst<'a, T>
 where
-    T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+    T: TryFromBytes + GetSliceLen + Immutable + ?Sized + IntoBytes,
 {
     type Item = &'a mut T;
 
@@ -61,7 +61,7 @@ pub struct Data<T: ?Sized> {
 
 impl<T> Data<T>
 where
-    T: KnownLayout + TryFromBytes + Immutable + ?Sized,
+    T: KnownLayout + TryFromBytes + Immutable + ?Sized + IntoBytes,
 {
     pub fn get(&self) -> &T {
         T::try_ref_from_bytes(&self.buf).unwrap()
@@ -103,7 +103,7 @@ where
     pub fn split<U>(mut self) -> (Data<T::Header>, Data<U>)
     where
         T: GetSliceLen,
-        U: TryFromBytes + Immutable + KnownLayout + ?Sized,
+        U: TryFromBytes + Immutable + KnownLayout + ?Sized + IntoBytes,
     {
         let rest = self.buf.split_off(size_of::<T::Header>());
         let header = std::mem::replace(&mut self.buf, BytesMut::new());
@@ -191,7 +191,7 @@ impl Ring {
 
     pub fn peek_mut<T>(&mut self) -> Result<&mut T, ReadError>
     where
-        T: TryFromBytes + KnownLayout + Immutable,
+        T: TryFromBytes + KnownLayout + Immutable + IntoBytes,
     {
         let size_of = std::mem::size_of::<T>();
         if self.buf.len() < size_of {
@@ -331,7 +331,7 @@ impl Ring {
     /// [`TryFromBytes`] returns an error.
     pub fn iter_mut<'a, T>(&'a mut self) -> impl Iterator<Item = &'a mut T>
     where
-        T: TryFromBytes + KnownLayout + Immutable + 'a,
+        T: TryFromBytes + KnownLayout + Immutable + IntoBytes + 'a,
     {
         self.buf
             .chunks_exact_mut(std::mem::size_of::<T>())

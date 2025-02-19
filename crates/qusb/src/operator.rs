@@ -61,15 +61,15 @@ async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Resu
 
     let frame_ref = frame.get();
     match frame_ref.header.command {
-        msg::Command::CmdUnlink => Ok(Some(Recv::Unlink(frame_ref.header.clone()))),
+        msg::Command::CmdUnlink => Ok(Some(Recv::Unlink(frame_ref.header))),
         msg::Command::CmdPort | msg::Command::RetPort => {
-            Ok(Some(Recv::PortReset(frame_ref.header.clone())))
+            Ok(Some(Recv::PortReset(frame_ref.header)))
         }
         msg::Command::RetSubmit | msg::Command::CmdSubmit => {
             // In this case this will probably
             // be faster since we already parsed
             // the header
-            let header = frame_ref.header.clone();
+            let header = frame_ref.header;
             let (_, urb) = frame.split::<UrbFrame>();
             Ok(Some(Recv::Urb((header, urb))))
         }
@@ -478,7 +478,7 @@ where
                     let handle = handles.remove(&seqnum).unwrap();
                     let _ = seqnums.remove(&handle).unwrap();
                     let frame = urb.get_mut();
-                    let urb = &mut frame.header;
+                    let urb = frame.header();
 
                     if vhci::Status::Success != urb.status {
                         warn!(
@@ -509,7 +509,7 @@ where
 
                     let lender_urb = UrbWithIsoGiveback {
                         handle,
-                        header: urb,
+                        header: &urb,
                         transfer,
                         iso_giveback,
                     };
@@ -527,7 +527,9 @@ where
                     let handle = handles.remove(&seqnum).unwrap();
                     let _ = seqnums.remove(&handle).unwrap();
                     debug!("({id}) port has been reset");
-                    vhci.reset_done(port, true).unwrap();
+                    if let Err(err) = vhci.reset_done(port, true) {
+                        break Err(err.into());
+                    }
                 }
                 Event::Frame(Ok(Some(Recv::Urb((Header { status, .. }, _)))))
                 | Event::Frame(Ok(Some(Recv::PortReset(Header { status, .. })))) => match status {
@@ -601,18 +603,19 @@ pub(crate) fn open_device(
     dev_id: msg::UsbDeviceId,
 ) -> rusb::Result<rusb::DeviceHandle<rusb::Context>> {
     rusb::Context::new()
-        .and_then(|ctx| {
-            // let span = tracing::trace_span!("libusb");
-            // ctx.set_log_level(rusb::LogLevel::Debug);
-            // ctx.set_log_callback(
-            //     Box::new(move |_level, msg| {
-            //         let _enter = span.enter();
-            //         tracing::trace!("{}", msg.trim_end());
-            //     }),
-            //     rusb::LogCallbackMode::Context,
-            // );
-            ctx.devices()
-        })
+        // .and_then(|mut ctx| {
+        //     let span = tracing::trace_span!("libusb");
+        //     ctx.set_log_level(rusb::LogLevel::Debug);
+        //     ctx.set_log_callback(
+        //         Box::new(move |_level, msg| {
+        //             let _enter = span.enter();
+        //             tracing::trace!("{}", msg.trim_end());
+        //         }),
+        //         rusb::LogCallbackMode::Context,
+        //     );
+        //     ctx.devices()
+        // })
+        .and_then(|ctx| ctx.devices())
         .and_then(|list| {
             list.iter()
                 .find(|dev| {
@@ -803,6 +806,19 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
 }
 
 #[inline]
+const fn vhci_from_transfer_status(status: TransferStatus) -> vhci::Status {
+    match status {
+        TransferStatus::Completed => vhci::Status::Success,
+        TransferStatus::Error => vhci::Status::Error,
+        TransferStatus::TimedOut => vhci::Status::TimedOut,
+        TransferStatus::Cancelled => vhci::Status::Canceled,
+        TransferStatus::Stall => vhci::Status::Stall,
+        TransferStatus::NoDevice => vhci::Status::DeviceDisconnected,
+        TransferStatus::Overflow => vhci::Status::Babble,
+    }
+}
+
+#[inline]
 fn convert_libusb_to_vhci(
     status: rusb::Result<TransferStatus>,
     kind: UrbType,
@@ -811,24 +827,20 @@ fn convert_libusb_to_vhci(
 ) -> vhci::Status {
     let _guard = tracing::Span::current().entered();
     match status {
-        Ok(TransferStatus::Completed) => vhci::Status::Success,
-        Ok(TransferStatus::Error) => vhci::Status::Error,
-        Ok(TransferStatus::TimedOut) => vhci::Status::TimedOut,
-        Ok(TransferStatus::Cancelled) => vhci::Status::Canceled,
-        Ok(TransferStatus::Stall) | Err(rusb::Error::InvalidParam) => vhci::Status::Stall,
-        Ok(TransferStatus::NoDevice) | Err(rusb::Error::NoDevice) => {
+        Ok(status) => vhci_from_transfer_status(status),
+        Err(rusb::Error::InvalidParam) => vhci::Status::Stall,
+        Err(rusb::Error::NoDevice) => {
             vhci::Status::DeviceDisconnected
         }
-        Ok(TransferStatus::Overflow) => vhci::Status::Babble,
         Err(rusb::Error::Busy) => {
             unreachable!("for now, no transfer can be resubmitted")
         }
         Err(rusb::Error::NotSupported) => {
             unreachable!("will we ever mess with the transfer flags?")
         }
-        Err(_err) => {
+        Err(err) => {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-            warn! { %errno, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
+            warn! { %err, %errno, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
             vhci::Status::from_errno_raw(-errno, UrbType::Iso == kind)
         }
     }
@@ -836,8 +848,8 @@ fn convert_libusb_to_vhci(
 
 #[inline]
 fn write_transfer(src: &[u8], dst: &mut [u8]) {
-    // let src = <[u64]>::ref_from_bytes(src).unwrap();
-    // let dst = <[u64]>::mut_from_bytes(dst).unwrap();
+    let src = <[u64]>::ref_from_bytes(src).unwrap();
+    let dst = <[u64]>::mut_from_bytes(dst).unwrap();
     dst.copy_from_slice(src);
 }
 
@@ -872,6 +884,8 @@ fn write_transfer(src: &[u8], dst: &mut [u8]) {
 //         todo!()
 //     }
 // }
+
+type TransferPayload = (Header, UrbHeader, Option<UsbMemMut>, BytesMut);
 
 pub struct LendDevice<W, R> {
     tx: W,
@@ -916,7 +930,7 @@ where
 
         enum Event {
             RecvFrame(Option<Recv>),
-            SendFrame((Header, UrbHeader, Option<UsbMemMut>, BytesMut)),
+            SendFrame(TransferPayload),
             Cancelled,
         }
 
@@ -934,8 +948,8 @@ where
         });
 
         let mut cancel_tokens: IntMap<u32, CancellationToken> =
-            IntMap::with_capacity_and_hasher(256, Default::default());
-        let mut active_transfers: JoinSet<(Header, UrbHeader, Option<UsbMemMut>, BytesMut)> =
+            IntMap::with_capacity_and_hasher(1024, Default::default());
+        let mut active_transfers: JoinSet<TransferPayload> =
             JoinSet::new();
         let claimed_interfaces: Arc<Mutex<IntSet<u8>>> = Arc::new(Mutex::new(
             IntSet::with_capacity_and_hasher(16, Default::default()),
@@ -1066,7 +1080,21 @@ where
                                         num_iso_packets,
                                     )
                                     .unwrap();
-                                // trace!("({}) {:?}", header.seqnum, &iso_packets);
+
+                                static IS_ALT_SET: AtomicBool = AtomicBool::new(false);
+                                if !IS_ALT_SET.swap(true, Ordering::SeqCst) && Dir::Out == urb_header.endpoint.direction() {
+                                    // let result = handle.set_alternate_setting(2, 1);
+                                    // debug!("setting alt 1 for interface 2 endpoint {}: {result:?}", urb_header.endpoint.0);
+                                    // let active_config = handle.device().active_config_descriptor().unwrap();
+                                    // active_config.interfaces().for_each(|int| {
+                                    //     int.descriptors().for_each(|int_desc| {
+                                    //         if 1 == int_desc.class_code() && 2 == int_desc.sub_class_code() && 0 < int_desc.num_endpoints() {
+                                    //             let result = handle.set_alternate_setting(int_desc.interface_number(), int_desc.setting_number());
+                                    //             debug!("setting alt {} for interface {}: {result:?}", int_desc.setting_number(), int_desc.interface_number());
+                                    //         }
+                                    //     })
+                                    // });
+                                }
 
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), num_iso_packets as u16);
                                 let mut transfer = unsafe {
@@ -1084,38 +1112,31 @@ where
                                 let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
-                                let iso_packets =
+                                let is_enoent = vhci::Status::Canceled == status && result.is_err_and(|err| rusb::Error::Io == err);
+
+                                let our_packets =
                                     <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
                                         &mut iso_raw_buf[..],
                                         num_iso_packets,
                                     )
                                     .unwrap();
-                                for (our_pkt, libusb_pkt) in
-                                    iso_packets.iter_mut().zip(transfer.iso_packets().expect("why wouldn't a transfer be complete here?"))
+                                let their_packets = transfer.iso_packets().expect("why wouldn't a transfer be complete here??");
+
+                                for (our_pkt, libusb_pkt) in our_packets.iter_mut().zip(their_packets)
                                 {
                                     our_pkt.packet_actual = libusb_pkt.actual_len();
-                                    our_pkt.status = libusb_pkt.status() as i32;
+                                    our_pkt.status = if !is_enoent {
+                                        vhci_from_transfer_status(libusb_pkt.status()).to_errno_raw(true)
+                                    } else {
+                                        vhci::Status::Pending.to_errno_raw(true)
+                                    };
                                 }
                                 let (transfer, mut buf) = transfer.into_parts().unwrap();
                                 insert_spare_transfer(cache.borrow_mut(), transfer);
 
-                                if vhci::Status::Success != status {
-                                    static _IS_ALT_SET: AtomicBool = AtomicBool::new(false);
-                                    if !_IS_ALT_SET.swap(true, Ordering::SeqCst) {
-                                        let result = handle.set_alternate_setting(2, 1);
-                                        debug!("setting alt 1 for interface 2: {result:?}");
-                                    //     let active_config = handle.device().active_config_descriptor().unwrap();
-                                    //     active_config.interfaces().for_each(|int| {
-                                    //         int.descriptors().for_each(|int_desc| {
-                                    //             if 1 == int_desc.class_code() && 2 == int_desc.sub_class_code() && 0 < int_desc.num_endpoints() {
-                                    //                 let result = handle.set_alternate_setting(int_desc.interface_number(), int_desc.setting_number());
-                                    //                 debug!("setting alt {} for interface {}: {result:?}", int_desc.setting_number(), int_desc.interface_number());
-                                    //             }
-                                    //         })
-                                    //     });
-                                    }
-                                }
                                 if Dir::In == urb_header.endpoint.direction() {
+                                    // SAFETY: Isochronous transfer requires that full
+                                    //         buffer sent back to caller.
                                     unsafe { buf.set_len(buf.capacity()) };
                                 }
 
@@ -1144,6 +1165,7 @@ where
                             {
                                 let setting = ctrl.value() as u8;
                                 let interface = ctrl.index() as u8;
+                                trace!("using setting {setting} for interface {interface}");
                                 let status = match handle.set_alternate_setting(interface, setting) {
                                     Ok(_) => vhci::Status::Success,
                                     Err(err) => {
@@ -1224,6 +1246,7 @@ where
                                     // indicates that our fake USB device is self powered.
                                     buf[0] = 0x01;
                                 }
+
                                 (status, Some(buf), BytesMut::new())
                             }
                             UrbType::Bulk => {
@@ -1268,7 +1291,7 @@ where
                             }
                         }
                         if UrbType::Ctrl == urb_header.kind {
-                            // trace! { %ctrl };
+                            trace! { %ctrl };
                         }
 
                         (header, urb_header, transfer, iso_pkts)
@@ -1388,13 +1411,18 @@ where
                     } else {
                         let mut response = header.as_bytes();
                         tx.write_all_buf(&mut response).await?;
-                        break Err(Error::ReqFailed);
+                        let errno = urb.status.to_errno_raw(UrbType::Iso == urb.kind);
+                        break Err(Error::Io(io::Error::from_raw_os_error(-errno)));
                     }
                 }
                 Event::RecvFrame(None) | Event::Cancelled => break Ok(()),
             }
         };
 
+        info!(
+            "shutting down ({:03}/{:03})",
+            dev_id.bus_number, dev_id.device_addr
+        );
         cancel_tokens.into_values().for_each(|token| token.cancel());
         _ = active_transfers.join_all().await;
         event_handler.cancel();

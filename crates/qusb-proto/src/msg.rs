@@ -229,8 +229,8 @@ pub trait SendUsbDeviceInfo {
     fn interfaces(&self) -> &[UsbInterfaceInfo];
 }
 
-#[derive(FromZeros, KnownLayout, Immutable)]
-#[repr(C)]
+#[derive(FromZeros, KnownLayout, Immutable, IntoBytes)]
+#[repr(C, packed)]
 pub struct UsbDeviceInfo {
     pub header: UsbDeviceInfoHeader,
     pub interfaces: [UsbInterfaceInfo],
@@ -281,7 +281,7 @@ impl GetSliceLen for UsbDeviceInfo {
 }
 
 #[derive(Debug, Clone, KnownLayout, Immutable, IntoBytes, FromZeros)]
-#[repr(C, align(8))]
+#[repr(C)]
 pub struct UsbDeviceInfoHeader {
     pub path: [u8; PATH_MAX_LEN as usize],
     pub bus_id: [u8; BUS_ID_MAX_LEN as usize],
@@ -324,8 +324,8 @@ pub enum Command {
 ///   transmitted frame divided by 8. A frame is guaranteed to
 ///   be aligned to 8 bytes.
 /// - `status` is read by the requester, and written to by the responder.
-#[derive(Debug, Clone, KnownLayout, Immutable, FromZeros, IntoBytes)]
-#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, FromZeros, IntoBytes)]
+#[repr(C)]
 pub struct Header {
     pub total_frame_len: u16,
     pub command: Command,
@@ -349,7 +349,7 @@ pub struct Header {
 /// [`In`]: vhci::usbfs::Dir::In
 /// [`Pending`]: vhci::Status::Pending
 #[derive(Debug, Clone, KnownLayout, Immutable, IntoBytes, FromZeros)]
-#[repr(C, align(8))]
+#[repr(C)]
 pub struct UrbHeader {
     pub actual_transfer_len: u16,
     // pub transfer_padded_len: u16,
@@ -364,11 +364,21 @@ pub struct UrbHeader {
     // pub _padding: [u8; 5],
 }
 
-#[derive(KnownLayout, Immutable, FromZeros)]
-#[repr(C)]
+#[derive(KnownLayout, Immutable, FromZeros, IntoBytes)]
+#[repr(C, packed)]
 pub struct UrbFrame {
     pub header: UrbHeader,
     pub data: [u8],
+}
+
+impl UrbFrame {
+    pub const fn header(&self) -> UrbHeader {
+        // SAFETY: UrbHeader pointer is valid if UrbFrame is valid,
+        //         which it is.
+        unsafe {
+            (&raw const self.header).read_unaligned()
+        }
+    }
 }
 
 impl GetSliceLen for UrbFrame {
@@ -401,8 +411,8 @@ impl GetSliceLen for UrbFrame {
     }
 }
 
-#[derive(KnownLayout, Immutable, FromZeros)]
-#[repr(C)]
+#[derive(KnownLayout, Immutable, FromZeros, IntoBytes)]
+#[repr(C, packed)]
 pub struct QusbFrame {
     pub header: Header,
     pub data: [u8],

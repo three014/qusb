@@ -1,5 +1,5 @@
 use thiserror::Error;
-use zerocopy::{Immutable, KnownLayout, TryFromBytes};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 pub mod data;
 pub mod msg;
@@ -57,9 +57,9 @@ impl GetSliceLenErr {
 /// stuff based on this value.
 pub trait GetSliceLen
 where
-    Self: KnownLayout<PointerMetadata = usize>,
+    Self: KnownLayout<PointerMetadata = usize> + IntoBytes,
 {
-    type Header: TryFromBytes + KnownLayout + Immutable + Sized;
+    type Header: TryFromBytes + KnownLayout + Immutable + Sized + IntoBytes;
 
     /// If `buf` was some DST `T`, then this
     /// function returns the number of elements
