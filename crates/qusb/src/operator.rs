@@ -217,7 +217,7 @@ where
             mut buf_rx,
             mut vhci,
             data_rate,
-            id: _dev_id,
+            id: dev_id,
         } = self;
 
         const BUF_LEN: usize = 16 << 10;
@@ -229,13 +229,13 @@ where
             msg::DataRate::Full => DataRate::Full,
             msg::DataRate::High => DataRate::High,
         };
-        let (port, mut work_rx) = vhci.register(RegisterPort::Any, data_rate).await.unwrap();
+        let (port, mut work_rx) = vhci.register(RegisterPort::Any, data_rate).await?;
 
         let id = BorrowId {
-            remote_dev: _dev_id,
+            remote_dev: dev_id,
             local_port: port,
         };
-        info!("({id}) connected new device with {data_rate:?}");
+        info!("({id}) connected new device with {data_rate:?} speed");
 
         enum Event {
             Work(Option<ioctl::Work>),
@@ -247,14 +247,15 @@ where
         let mut addr: u8 = 0xff;
         let mut prev = ioctl::IocPortStat::default();
         let mut handles: SimpleMap<u32, ioctl::UrbHandle> =
-            SimpleMap::with_capacity_and_hasher(64, Default::default());
+            SimpleMap::with_capacity_and_hasher(512, Default::default());
         let mut seqnums: SimpleMap<ioctl::UrbHandle, u32> =
-            SimpleMap::with_capacity_and_hasher(64, Default::default());
+            SimpleMap::with_capacity_and_hasher(512, Default::default());
 
         info!("({id}) starting event loop");
 
         let result: Result<()> = loop {
             let event = tokio::select! {
+                biased;
                 maybe_work = work_rx.recv() => {
                     Event::Work(maybe_work)
                 }

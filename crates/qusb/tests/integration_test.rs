@@ -91,15 +91,14 @@ async fn borrow_self_dev_inner() {
             .await
             .unwrap();
         let cancel = CancellationToken::new();
+        let mut handle = tokio::task::spawn_local(usb.borrow(cancel.clone()));
         tokio::select! {
-            Err(err) = usb.borrow(cancel.clone()) => {
-                panic!("{err}");
+            result = &mut handle => {
+                result.unwrap().unwrap();
             }
-            Err(err) = ctrl_c => {
-                panic!("{err}");
-            }
-            else => {
-                cancel.cancel();
+            result = ctrl_c => {
+                result.unwrap();
+                handle.await.unwrap().unwrap();
             }
         }
     }
@@ -163,21 +162,20 @@ fn client_borrows_usb() {
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
                 bus_number: 9,
-                device_addr: 3,
+                device_addr: 4,
             })
             .await
             .unwrap();
         let ctrl_c = tokio::signal::ctrl_c();
         let cancel = CancellationToken::new();
+        let mut handle = tokio::task::spawn_local(usb.borrow(cancel.clone()));
         tokio::select! {
-            Err(err) = usb.borrow(cancel.clone()) => {
-                panic!("{err}");
+            result = &mut handle => {
+                result.unwrap().unwrap();
             }
-            Err(err) = ctrl_c => {
-                panic!("{err}");
-            }
-            else => {
-                cancel.cancel();
+            result = ctrl_c => {
+                result.unwrap();
+                handle.await.unwrap().unwrap();
             }
         }
     });

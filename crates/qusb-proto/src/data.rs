@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::{io, marker::PhantomData};
 
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 
 use bytes::BytesMut;
 use thiserror::Error;
@@ -162,6 +162,7 @@ impl Ring {
         }
     }
 
+    #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.buf.reserve(additional);
     }
@@ -362,6 +363,7 @@ impl Ring {
     ///
     /// On success, returns the number of bytes read into
     /// the internal buffer.
+    #[inline]
     pub async fn fill_with_reader<R>(&mut self, mut rx: R) -> io::Result<usize>
     where
         R: AsyncRead + Unpin,
@@ -398,9 +400,14 @@ impl Ring {
     where
         R: AsyncRead + Unpin,
     {
+        const EXTRA: usize = 16 << 10;
         while num_bytes > self.len() {
             if 0 == self.fill_with_reader(&mut rx).await? {
-                return Ok(None);
+                if !self.buf.has_remaining_mut() {
+                    self.reserve(EXTRA);
+                } else {
+                    return Ok(None);
+                }
             }
         }
 
