@@ -1089,7 +1089,7 @@ where
                                 let result = unsafe { transfer.submit(cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
-                                let is_enoent = vhci::Status::Canceled == status && result.is_err_and(|err| rusb::Error::Io == err);
+                                // let is_enoent = vhci::Status::Canceled == status && result.is_err_and(|err| rusb::Error::Io == err);
 
                                 let our_packets =
                                     <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
@@ -1102,11 +1102,7 @@ where
                                 for (our_pkt, libusb_pkt) in our_packets.iter_mut().zip(their_packets)
                                 {
                                     our_pkt.packet_actual = libusb_pkt.actual_len();
-                                    our_pkt.status = if !is_enoent {
-                                        vhci_from_transfer_status(libusb_pkt.status()).to_errno_raw(true)
-                                    } else {
-                                        vhci::Status::Pending.to_errno_raw(true)
-                                    };
+                                    our_pkt.status = vhci_from_transfer_status(libusb_pkt.status()).to_errno_raw(true)
                                 }
                                 let (transfer, mut buf) = transfer.into_parts().unwrap();
                                 insert_spare_transfer(cache.borrow_mut(), transfer);
@@ -1308,7 +1304,7 @@ where
 
                     let status = match urb_header.status {
                         vhci::Status::Pending => todo!(),
-                        // vhci::Status::Error => msg::Status::DevErr,
+                        vhci::Status::Error => msg::Status::DevErr,
                         vhci::Status::DeviceDisconnected => msg::Status::NoDev,
                         vhci::Status::BitStuff => todo!(),
                         vhci::Status::Crc => todo!(),

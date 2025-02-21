@@ -7,9 +7,13 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use std::{
     io,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    num::NonZeroU64,
     ops::Deref,
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
+    },
 };
 use std::{os::unix::ffi::OsStrExt, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -700,7 +704,7 @@ impl ReqHandler {
 }
 
 pub(crate) type ServerTaskResult =
-    std::result::Result<(tokio::task::Id, Result<()>), tokio::task::JoinError>;
+    std::result::Result<(NonZeroU64, Result<()>), tokio::task::JoinError>;
 
 #[derive(Debug)]
 pub struct Server {
@@ -732,8 +736,14 @@ impl Server {
                     _ = cancel_for_serve.cancelled() => {
                         Event::Cancel
                     },
-                    maybe_complete = set.join_next_with_id(), if !is_empty => {
-                        Event::MaybeCompletedTask(maybe_complete)
+                    maybe_complete = set.join_next(), if !is_empty => {
+                        static ID: AtomicU64 = AtomicU64::new(1);
+                        let id = ID.fetch_add(1, Ordering::Relaxed);
+                        Event::MaybeCompletedTask(
+                            maybe_complete.map(|join| {
+                                join.map(|result| (NonZeroU64::new(id).unwrap(), result))
+                            })
+                        )
                     }
                 };
 
