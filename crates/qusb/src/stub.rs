@@ -313,7 +313,7 @@ impl Controller {
         let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
-        let handle = Some(Arc::new(tokio::task::spawn_local(
+        let handle = Some(Arc::new(tokio::task::spawn(
             Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).demux_vhci(),
         )));
 
@@ -379,15 +379,14 @@ impl Drop for Controller {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take().and_then(|arc| Arc::into_inner(arc)) {
             info!("about to wait for vhci controller handle");
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    match handle.await {
-                        Ok(Ok(_)) => trace!("controller thread finished with no issues"),
-                        Ok(Err(_err)) => unimplemented!("i/o error? {_err}"),
-                        Err(_err) => unimplemented!("thread panicked? {_err}"),
-                    }
-                });
-            }
+            let rt = tokio::runtime::Handle::current();
+            rt.spawn(async move {
+                match handle.await {
+                    Ok(Ok(_)) => trace!("controller thread finished with no issues"),
+                    Ok(Err(_err)) => unimplemented!("i/o error? {_err}"),
+                    Err(_err) => unimplemented!("thread panicked? {_err}"),
+                }
+            });
         }
     }
 }

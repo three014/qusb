@@ -568,10 +568,18 @@ where
         let cloned_map = Arc::clone(&map);
         let send_loop = borrow::SendLoop::new(tx, work_rx);
         let send_handler = BorrowSendHandler::new(vhci.remote(), id, map);
-        let send = tokio::spawn(send_loop.run(send_handler, cancel_token.clone()));
+        let send = tokio::spawn(
+            send_loop
+                .run(send_handler, cancel_token.clone())
+                .in_current_span(),
+        );
         let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
         let recv_handler = BorrowRecvHandler::new(vhci.remote(), id, cloned_map);
-        let recv = tokio::spawn(recv_loop.run(recv_handler, cancel_token.clone()));
+        let recv = tokio::spawn(
+            recv_loop
+                .run(recv_handler, cancel_token.clone())
+                .in_current_span(),
+        );
 
         let recv_result = recv.await.unwrap();
         cancel_token.cancel();
