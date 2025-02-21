@@ -2,7 +2,6 @@ use std::{
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -14,7 +13,7 @@ use vhci::{
     DataRate, Port, PortChange, PortStatus,
 };
 
-use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, Timer};
+use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap};
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -366,6 +365,14 @@ impl Controller {
     pub fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
         self.remote.port_reset_done(port, enable)
     }
+
+    #[inline]
+    pub fn remote(&self) -> VhciRemote {
+        VhciRemote {
+            remote: self.remote.clone(),
+            giveback_tx: self.giveback_tx.clone(),
+        }
+    }
 }
 
 impl Drop for Controller {
@@ -382,6 +389,35 @@ impl Drop for Controller {
                 });
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VhciRemote {
+    remote: vhci::Remote,
+    giveback_tx: mpsc::Sender<UrbHandle>,
+}
+
+impl VhciRemote {
+    #[inline]
+    pub fn fetch_data<T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut>(
+        &self,
+        urb: T,
+    ) -> io::Result<()> {
+        self.remote.fetch_data(urb)
+    }
+
+    pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
+        &self,
+        urb: T,
+    ) -> io::Result<()> {
+        _ = self.giveback_tx.send(urb.handle()).await;
+        self.remote.giveback(urb)
+    }
+
+    #[inline(always)]
+    pub fn reset_done(&self, port: Port, enable: bool) -> io::Result<()> {
+        self.remote.port_reset_done(port, enable)
     }
 }
 
