@@ -106,7 +106,7 @@ where
         U: TryFromBytes + Immutable + KnownLayout + ?Sized + IntoBytes,
     {
         let rest = self.buf.split_off(size_of::<T::Header>());
-        let header = std::mem::replace(&mut self.buf, BytesMut::new());
+        let header = self.buf;
         (Data::new(header), Data::new(rest))
     }
 }
@@ -117,12 +117,6 @@ impl Data<[u8]> {
     #[inline]
     pub fn into_bytes_mut(mut self) -> BytesMut {
         std::mem::replace(&mut self.buf, BytesMut::new())
-    }
-}
-
-impl<T: ?Sized> Drop for Data<T> {
-    fn drop(&mut self) {
-        self.buf.advance(self.buf.len());
     }
 }
 
