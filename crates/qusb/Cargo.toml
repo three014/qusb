@@ -33,5 +33,6 @@ rcgen = "0.13.2"
 tokio = { version = "1.41.1", default-features = false, features = [
     "sync",
     "rt",
+    "rt-multi-thread",
     "signal",
 ] }

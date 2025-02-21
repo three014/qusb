@@ -1,4 +1,4 @@
-use std::{future::Future, io, marker::PhantomData};
+use std::{future::Future, io};
 
 use bytes::Bytes;
 use proto::{
@@ -34,7 +34,6 @@ pub trait SendHandler {
 pub struct SendLoop<W> {
     tx: W,
     work_rx: WorkReceiver,
-    _p: PhantomData<*const ()>,
 }
 
 impl<W> SendLoop<W> {
@@ -43,10 +42,10 @@ impl<W> SendLoop<W> {
         Self {
             tx,
             work_rx,
-            _p: PhantomData,
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
         W: AsyncWrite + Unpin + 'static,
@@ -54,7 +53,6 @@ impl<W> SendLoop<W> {
     {
         use tokio::io::AsyncWriteExt;
 
-        let _guard = tracing::Span::current().entered();
         loop {
             let work = tokio::select! {
                 biased;
@@ -74,7 +72,6 @@ impl<W> SendLoop<W> {
                     if let Some(header) = handler.port_stat(next) {
                         self.tx
                             .write_u64_le(transmute!(header))
-                            .in_current_span()
                             .await?;
                     }
                 }
@@ -83,17 +80,16 @@ impl<W> SendLoop<W> {
                         && urb.address.is_for_unassigned()
                         && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                 {
-                    handler.set_address(urb, handle).in_current_span().await?;
+                    handler.set_address(urb, handle).await?;
                 }
                 Work::ProcessUrb((urb, handle)) => {
                     let mut bytes = handler.process_urb(urb, handle)?;
-                    self.tx.write_all_buf(&mut bytes).in_current_span().await?;
+                    self.tx.write_all_buf(&mut bytes).await?;
                 }
                 Work::CancelUrb(handle) => {
                     if let Some(header) = handler.cancel_urb(handle) {
                         self.tx
                             .write_u64_le(transmute!(header))
-                            .in_current_span()
                             .await?;
                     }
                 }
@@ -114,7 +110,6 @@ pub trait RecvHandler {
 pub struct RecvLoop<R> {
     rx: R,
     buf: Ring,
-    _p: PhantomData<*const ()>,
 }
 
 impl<R> RecvLoop<R> {
@@ -123,17 +118,15 @@ impl<R> RecvLoop<R> {
         Self {
             rx,
             buf,
-            _p: PhantomData,
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
         R: AsyncRead + Unpin + 'static,
         H: RecvHandler,
     {
-        let _guard = tracing::Span::current().entered();
-
         loop {
             let recv = tokio::select! {
                 biased;
@@ -158,7 +151,7 @@ impl<R> RecvLoop<R> {
                     },
                     data,
                 )) => {
-                    handler.urb_reply(seqnum, data).in_current_span().await?;
+                    handler.urb_reply(seqnum, data).await?;
                 }
                 super::Recv::PortReset(Header {
                     seqnum,

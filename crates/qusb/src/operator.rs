@@ -314,9 +314,9 @@ impl borrow::SendHandler for BorrowSendHandler {
             ctrl_packet: urb.setup_packet,
         };
 
-        let needs_fetch = actual_transfer_len > 0 || packet_count > 0;
         let is_out = urb_header.is_out();
-        let real_transfer_len = urb_header.padded_transfer_len() * needs_fetch as usize;
+        let needs_fetch = (actual_transfer_len > 0 && is_out) || packet_count > 0;
+        let real_transfer_len = urb_header.padded_transfer_len() * is_out as usize;
         let iso_byte_len = urb_header.iso_byte_len();
         let header_len = size_of::<Header>() + size_of::<UrbHeader>();
         let data_len = real_transfer_len + iso_byte_len;
@@ -329,7 +329,7 @@ impl borrow::SendHandler for BorrowSendHandler {
             unsafe {
                 self.buf.set_len(total_frame_len);
             }
-            self.buf.split_to(header_len + data_len)
+            self.buf.split_to(total_frame_len)
         };
 
         if needs_fetch {
@@ -353,7 +353,7 @@ impl borrow::SendHandler for BorrowSendHandler {
                 // SAFETY: Data will never be read.
                 unsafe { self.buf.set_len(actual_transfer_len) };
                 let transfer = &mut self.buf[..actual_transfer_len];
-                // All of `data` is the isochronous packet buffer.
+                // CONTRACT: All of `data` is the isochronous packet buffer.
                 let iso_data =
                     <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(data, packet_count)
                         .unwrap();
@@ -382,7 +382,7 @@ impl borrow::SendHandler for BorrowSendHandler {
         buf[..header_len].zero();
 
         // Now we grab our references and assign our headers to them.
-        let (header_ref, rest) = Header::try_mut_from_prefix(&mut buf).unwrap();
+        let (header_ref, rest) = Header::try_mut_from_prefix(&mut buf[..header_len]).unwrap();
         *header_ref = header;
         let urb_ref = UrbHeader::try_mut_from_bytes(rest).unwrap();
         *urb_ref = urb_header;
@@ -561,52 +561,27 @@ where
         };
         info!("({id}) connected new device with {data_rate:?} speed");
 
-        let cancel = cancel_token.clone();
-        let remote = vhci.remote();
-        let result = tokio::task::spawn_blocking(move || {
-            std::thread::scope(|s| {
-                // New idea: Each loop should run in its own thread
-                let map = Arc::new(Mutex::new((
-                    SimpleMap::with_capacity_and_hasher(512, Default::default()),
-                    SimpleMap::with_capacity_and_hasher(512, Default::default()),
-                )));
-                let cloned_map = Arc::clone(&map);
-                let send = std::thread::Builder::new()
-                    .name(format!("{id} - send loop"))
-                    .spawn_scoped(s, || {
-                        let send_loop = borrow::SendLoop::new(tx, work_rx);
-                        let send_handler = BorrowSendHandler::new(remote.clone(), id, map);
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        let local_set = tokio::task::LocalSet::new();
-                        local_set.block_on(&rt, send_loop.run(send_handler, cancel.clone()))
-                    })?;
+        let map = Arc::new(Mutex::new((
+            SimpleMap::with_capacity_and_hasher(512, Default::default()),
+            SimpleMap::with_capacity_and_hasher(512, Default::default()),
+        )));
+        let cloned_map = Arc::clone(&map);
+        let send_loop = borrow::SendLoop::new(tx, work_rx);
+        let send_handler = BorrowSendHandler::new(vhci.remote(), id, map);
+        let send = tokio::spawn(send_loop.run(send_handler, cancel_token.clone()));
+        let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
+        let recv_handler = BorrowRecvHandler::new(vhci.remote(), id, cloned_map);
+        let recv = tokio::spawn(recv_loop.run(recv_handler, cancel_token.clone()));
 
-                let recv = std::thread::Builder::new()
-                    .name(format!("{id} - recv loop"))
-                    .spawn_scoped(s, || {
-                        let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
-                        let recv_handler = BorrowRecvHandler::new(remote.clone(), id, cloned_map);
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        let local_set = tokio::task::LocalSet::new();
-                        local_set.block_on(&rt, recv_loop.run(recv_handler, cancel.clone()))
-                    })?;
-
-                recv.join().unwrap()?;
-                send.join().unwrap()?;
-                Ok(())
-            })
-        })
-        .await.unwrap();
+        let recv_result = recv.await.unwrap();
+        cancel_token.cancel();
+        let send_result = send.await.unwrap();
 
         info!("disconnecting {id}");
         vhci.disconnect(port).await?;
-        result
+        send_result?;
+        recv_result?;
+        Ok(())
     }
 }
 

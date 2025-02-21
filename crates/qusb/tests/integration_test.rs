@@ -145,7 +145,8 @@ fn client_borrows_usb() {
         .with_writer(Mutex::new(BufWriter::with_capacity(128, log_file)))
         .try_init();
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .thread_keep_alive(Duration::from_secs(60))
         .build()
@@ -162,19 +163,20 @@ fn client_borrows_usb() {
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
                 bus_number: 9,
-                device_addr: 4,
+                device_addr: 2,
             })
             .await
             .unwrap();
         let ctrl_c = tokio::signal::ctrl_c();
         let cancel = CancellationToken::new();
-        let mut handle = tokio::task::spawn_local(usb.borrow(cancel.clone()));
+        let mut handle = tokio::task::spawn(usb.borrow(cancel.clone()));
         tokio::select! {
             result = &mut handle => {
                 result.unwrap().unwrap();
             }
             result = ctrl_c => {
                 result.unwrap();
+                cancel.cancel();
                 handle.await.unwrap().unwrap();
             }
         }
