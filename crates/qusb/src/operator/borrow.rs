@@ -7,7 +7,6 @@ use proto::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 use vhci::{
     ioctl::{self, UrbType, Work},
     usbfs::Request,
@@ -23,11 +22,7 @@ pub trait SendHandler {
         urb: ioctl::IocUrb,
         handle: ioctl::UrbHandle,
     ) -> impl Future<Output = io::Result<()>>;
-    fn process_urb(
-        &mut self,
-        urb: ioctl::IocUrb,
-        handle: ioctl::UrbHandle,
-    ) -> io::Result<Bytes>;
+    fn process_urb(&mut self, urb: ioctl::IocUrb, handle: ioctl::UrbHandle) -> io::Result<Bytes>;
     fn cancel_urb(&mut self, handle: ioctl::UrbHandle) -> Option<Header>;
 }
 
@@ -39,10 +34,7 @@ pub struct SendLoop<W> {
 impl<W> SendLoop<W> {
     #[inline]
     pub const fn new(tx: W, work_rx: WorkReceiver) -> Self {
-        Self {
-            tx,
-            work_rx,
-        }
+        Self { tx, work_rx }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -70,9 +62,7 @@ impl<W> SendLoop<W> {
             match work {
                 Work::PortStat(next) => {
                     if let Some(header) = handler.port_stat(next) {
-                        self.tx
-                            .write_u64_le(transmute!(header))
-                            .await?;
+                        self.tx.write_u64_le(transmute!(header)).await?;
                     }
                 }
                 Work::ProcessUrb((urb, handle))
@@ -88,9 +78,7 @@ impl<W> SendLoop<W> {
                 }
                 Work::CancelUrb(handle) => {
                     if let Some(header) = handler.cancel_urb(handle) {
-                        self.tx
-                            .write_u64_le(transmute!(header))
-                            .await?;
+                        self.tx.write_u64_le(transmute!(header)).await?;
                     }
                 }
             }
@@ -115,10 +103,7 @@ pub struct RecvLoop<R> {
 impl<R> RecvLoop<R> {
     #[inline]
     pub const fn new(rx: R, buf: Ring) -> Self {
-        Self {
-            rx,
-            buf,
-        }
+        Self { rx, buf }
     }
 
     #[tracing::instrument(level = "trace", skip_all)]

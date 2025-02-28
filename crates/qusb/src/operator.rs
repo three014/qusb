@@ -638,19 +638,25 @@ pub(crate) fn open_device(
     dev_id: msg::UsbDeviceId,
 ) -> rusb::Result<rusb::DeviceHandle<rusb::Context>> {
     rusb::Context::new()
-        // .and_then(|mut ctx| {
-        //     let span = tracing::trace_span!("libusb");
-        //     ctx.set_log_level(rusb::LogLevel::Debug);
-        //     ctx.set_log_callback(
-        //         Box::new(move |_level, msg| {
-        //             let _enter = span.enter();
-        //             tracing::trace!("{}", msg.trim_end());
-        //         }),
-        //         rusb::LogCallbackMode::Context,
-        //     );
-        //     ctx.devices()
-        // })
-        .and_then(|ctx| ctx.devices())
+        .and_then(|mut ctx| {
+            let span = tracing::trace_span!("libusb");
+            // ctx.set_log_level(rusb::LogLevel::Debug);
+            ctx.set_log_callback(
+                Box::new(move |level, msg| {
+                    let _enter = span.enter();
+                    match level {
+                        rusb::LogLevel::None => (),
+                        rusb::LogLevel::Error => error!("{}", msg.trim_end()),
+                        rusb::LogLevel::Warning => warn!("{}", msg.trim_end()),
+                        rusb::LogLevel::Info => debug!("{}", msg.trim_end()),
+                        rusb::LogLevel::Debug => trace!("{}", msg.trim_end()),
+                    }
+                }),
+                rusb::LogCallbackMode::Context,
+            );
+            ctx.devices()
+        })
+        // .and_then(|ctx| ctx.devices())
         .and_then(|list| {
             list.iter()
                 .find(|dev| {
@@ -720,6 +726,8 @@ fn get_or_alloc_transfer(
                 // Only true if number of packets is zero (Ctrl, Int, or Bulk)
                 OneOrMany::Many(vec) if vec.is_empty() => {
                     debug_assert_eq!(num_iso_packets, 0);
+                    // Put back the vec since it has allocated memory
+                    *entry = OneOrMany::Many(vec);
                     (InnerTransfer::new(num_iso_packets as usize), false)
                 }
                 OneOrMany::Many(mut vec) => {
@@ -1082,7 +1090,7 @@ where
                                     .unwrap();
 
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), num_iso_packets as u16);
-                                let mut transfer = unsafe {
+                                let transfer = unsafe {
                                     transfer.into_iso(
                                         &handle,
                                         urb_header.endpoint.0,
@@ -1094,7 +1102,7 @@ where
                                 };
 
                                 // SAFETY: TODO: Ensure that tokio completes all transfers.
-                                let result = unsafe { transfer.submit(cancel) }.await;
+                                let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 // let is_enoent = vhci::Status::Canceled == status && result.is_err_and(|err| rusb::Error::Io == err);
@@ -1125,7 +1133,7 @@ where
                             }
                             UrbType::Int => {
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), 0);
-                                let mut transfer = unsafe {
+                                let transfer = unsafe {
                                     transfer.into_int(
                                         &handle,
                                         urb_header.endpoint.0,
@@ -1134,7 +1142,7 @@ where
                                 };
 
                                 // SAFETY: TODO: Ensure that tokio completes all transfers.
-                                let result = unsafe { transfer.submit(cancel) }.await;
+                                let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
@@ -1146,7 +1154,7 @@ where
                             {
                                 let setting = ctrl.value() as u8;
                                 let interface = ctrl.index() as u8;
-                                trace!("using setting {setting} for interface {interface}");
+                                trace!("({}) using setting {setting} for interface {interface}", header.seqnum);
                                 let status = match handle.set_alternate_setting(interface, setting) {
                                     Ok(_) => vhci::Status::Success,
                                     Err(err) => {
@@ -1204,7 +1212,7 @@ where
                                 // SAFETY: Transfer buffer is longer than
                                 //         required lengths, and setup packet
                                 //         contains the right length as well.
-                                let mut transfer = unsafe {
+                                let transfer = unsafe {
                                     transfer.into_ctrl(
                                         &handle,
                                         transfer_buf,
@@ -1213,7 +1221,7 @@ where
                                 };
 
                                 // SAFETY: TODO: Ensure that tokio completes all transfers.
-                                let result = unsafe { transfer.submit(cancel) }.await;
+                                let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let mut buf = {
@@ -1232,7 +1240,7 @@ where
                             }
                             UrbType::Bulk => {
                                 let transfer = get_or_alloc_transfer(cache.borrow_mut(), 0);
-                                let mut transfer = unsafe {
+                                let transfer = unsafe {
                                     transfer.into_bulk(
                                         &handle,
                                         urb_header.endpoint.0,
@@ -1242,7 +1250,7 @@ where
                                 };
 
                                 // SAFETY: TODO: Ensure that tokio completes all transfers.
-                                let result = unsafe { transfer.submit(cancel) }.await;
+                                let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status = convert_libusb_to_vhci(result, urb_header.kind, header.seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
@@ -1272,7 +1280,7 @@ where
                             }
                         }
                         if UrbType::Ctrl == urb_header.kind {
-                            trace! { %ctrl };
+                            trace! { %ctrl, "({})", header.seqnum };
                         }
 
                         (header, urb_header, transfer, iso_pkts)

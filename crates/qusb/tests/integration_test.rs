@@ -155,7 +155,12 @@ fn client_borrows_usb() {
     local.block_on(&runtime, async move {
         let client = common::dummy_trusting_client("[::]:7400".parse().unwrap());
         let session = client
-            .connect("[2603:8081:4500:3c04:a465:7d92:8bda:84c1]:7400".parse().unwrap(), "pan1.garden.lan")
+            .connect(
+                "[2603:8081:4500:3c04:a465:7d92:8bda:84c1]:7400"
+                    .parse()
+                    .unwrap(),
+                "pan1.garden.lan",
+            )
             .await
             .unwrap();
         tracing::info!("Connected to {}", session.remote_address());
