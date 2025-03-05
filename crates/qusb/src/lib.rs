@@ -679,7 +679,7 @@ impl ReqHandler {
                 return Ok(())
             }
         };
-        trace!(
+        info!(
             "established new session with {} - RTT {:?}",
             conn.remote_address(),
             conn.rtt()

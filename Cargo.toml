@@ -2,5 +2,8 @@
 resolver = "2"
 members = ["crates/*"]
 
-[profile.release]
+[profile.reldbg]
+inherits = "release"
 debug = true
+lto = "fat"
+incremental = true

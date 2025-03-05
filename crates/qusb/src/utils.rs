@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use core::fmt;
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
 use std::{
@@ -12,6 +13,26 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
+
+pub struct Counter {
+    inner: u32,
+}
+
+impl Counter {
+    pub const fn new(start: u32) -> Self {
+        Self {
+            inner: start,
+        }
+    }
+
+    /// Increments the inner value by 1,
+    /// then returns the previous value.
+    pub const fn increment(&mut self) -> u32 {
+        let prev = self.inner;
+        self.inner += 1;
+        prev
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkResult {
@@ -467,8 +488,9 @@ impl CloseStream for quinn::SendStream {
     }
 }
 
+#[inline]
 pub const fn align_to_usize(val: usize) -> usize {
-    val + (size_of::<usize>() - 1) & !(size_of::<usize>() - 1)
+    (val + (size_of::<usize>() - 1)) & !(size_of::<usize>() - 1)
 }
 
 // /// A synchronous sleep function that uses
@@ -558,7 +580,7 @@ impl Timer {
     }
 
     #[inline]
-    pub fn stop_and_report(self, threshold: Option<Duration>, msg: &str) {
+    pub fn stop_and_report(self, threshold: Option<Duration>, msg: fmt::Arguments) {
         let elapsed = self.0.elapsed();
         if threshold.unwrap_or(Duration::ZERO) < elapsed {
             tracing::trace!("{msg} took {elapsed:?}");

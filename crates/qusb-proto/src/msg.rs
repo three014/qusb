@@ -85,6 +85,24 @@ pub enum Status {
     Proto,
 }
 
+impl From<vhci::Status> for Status {
+    fn from(value: vhci::Status) -> Self {
+        match value {
+            vhci::Status::Pending => todo!(),
+            vhci::Status::ShortPacket => todo!(),
+            vhci::Status::Error => Self::DevErr,
+            vhci::Status::DeviceDisconnected => todo!(),
+            vhci::Status::BitStuff => todo!(),
+            vhci::Status::Crc => todo!(),
+            vhci::Status::NoResponse => todo!(),
+            vhci::Status::BufferOverrun => todo!(),
+            vhci::Status::BufferUnderrun => todo!(),
+            vhci::Status::AllIsoPacketsFailed => todo!(),
+            _ => Self::Success,
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, PartialEq, Eq, Hash,
 )]
@@ -571,7 +589,7 @@ impl GetSliceLen for UrbFrame {
         let is_out = header.is_out();
         let is_reply = header.is_reply();
 
-        let has_transfer = (is_out && !is_reply) || (!is_out && !is_reply);
+        let has_transfer = (is_out && !is_reply) || (!is_out && is_reply);
 
         // If transfer has real data to send, then we count the
         // padded transfer length. We always count the iso packets.

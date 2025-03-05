@@ -15,7 +15,6 @@ use qusb::{
     BoundedU8,
 };
 use rcgen;
-use tracing::instrument::WithSubscriber;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {

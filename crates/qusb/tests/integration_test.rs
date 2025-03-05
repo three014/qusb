@@ -50,7 +50,7 @@ mod common;
 //     handle.shutdown().await.unwrap().unwrap();
 // }
 
-// #[test]
+#[test]
 fn borrow_self_dev() {
     let log_path = "borrow_self_dev.log";
     let log_file = std::fs::File::options()
@@ -62,7 +62,7 @@ fn borrow_self_dev() {
         .unwrap();
     _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::builder().parse("none,qusb=trace").unwrap())
-        .with_writer(Mutex::new(BufWriter::with_capacity(1024, log_file)))
+        .with_writer(Mutex::new(BufWriter::with_capacity(512, log_file)))
         .try_init();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -86,7 +86,7 @@ async fn borrow_self_dev_inner() {
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
                 bus_number: 1,
-                device_addr: 13,
+                device_addr: 8,
             })
             .await
             .unwrap();
@@ -98,6 +98,7 @@ async fn borrow_self_dev_inner() {
             }
             result = ctrl_c => {
                 result.unwrap();
+                cancel.cancel();
                 handle.await.unwrap().unwrap();
             }
         }
@@ -129,7 +130,7 @@ async fn borrow_self_dev_inner() {
 //     handle.shutdown().await.unwrap().unwrap();
 // }
 
-#[test]
+// #[test]
 fn client_borrows_usb() {
     let log_path = "client_borrows_usb.log";
     let log_file = std::fs::File::options()

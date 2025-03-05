@@ -192,11 +192,10 @@ impl Demuxer {
                                 if stat.change().contains(PortChange::RESET)
                                     && (!stat.status()).contains(PortStatus::RESET)
                                     && stat.status().contains(PortStatus::ENABLE)
+                                    && !queue.contains(&stat.index())
                                 {
-                                    if !queue.contains(&stat.index()) {
-                                        queue.push_back(stat.index());
-                                        mailer.unlink_all_but_key1(&stat.index());
-                                    }
+                                    queue.push_back(stat.index());
+                                    mailer.unlink_all_but_key1(&stat.index());
                                 }
                                 mailer.get_by_key1(&stat.index()).cloned()
                             }
@@ -346,6 +345,7 @@ impl Controller {
         self.remote.fetch_data(urb)
     }
 
+    #[inline]
     pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
         &self,
         urb: T,
@@ -354,6 +354,7 @@ impl Controller {
         self.remote.giveback(urb)
     }
 
+    #[inline]
     pub async fn disconnect(&mut self, port: Port) -> io::Result<()> {
         let (rx, disconnect) = Ctrl::new(port);
 
@@ -377,7 +378,7 @@ impl Controller {
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take().and_then(|arc| Arc::into_inner(arc)) {
+        if let Some(handle) = self.handle.take().and_then(Arc::into_inner) {
             info!("about to wait for vhci controller handle");
             let rt = tokio::runtime::Handle::current();
             rt.spawn(async move {
@@ -399,19 +400,21 @@ pub struct VhciRemote {
 
 impl VhciRemote {
     #[inline]
-    pub fn fetch_data<T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut>(
-        &self,
-        urb: T,
-    ) -> io::Result<()> {
+    pub fn fetch_data<T>(&self, urb: T) -> io::Result<()>
+    where
+        T: vhci::Urb + vhci::IsoPacketDataMut + vhci::TransferMut,
+    {
         self.remote.fetch_data(urb)
     }
 
-    pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
-        &self,
-        urb: T,
-    ) -> io::Result<()> {
+    pub async fn giveback_urb<T>(&self, urb: T) -> io::Result<()>
+    where
+        T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + 'static,
+    {
         _ = self.giveback_tx.send(urb.handle()).await;
-        self.remote.giveback(urb)
+        let remote = self.remote.clone();
+        tokio::task::spawn_blocking(move || remote.giveback(urb));
+        Ok(())
     }
 
     #[inline(always)]

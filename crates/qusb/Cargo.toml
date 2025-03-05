@@ -24,7 +24,8 @@ zerocopy = "0.8.13"
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4" }
 fxhash = "0.2.1"
 rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.3.6" }
-# s2n-quic = "1.53.0"
+tokio-timerfd = "0.2.0"
+futures-core = { version = "0.3.31", default-features = false }
 
 [dev-dependencies]
 tracing-test = { version = "0.2.5" }

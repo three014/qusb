@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
-use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::GetSliceLen;
 use crate::GetSliceLenErr;
@@ -61,6 +61,16 @@ pub struct Data<T: ?Sized> {
 
 impl<T> Data<T>
 where
+    T: KnownLayout + FromBytes + Immutable + Sized + IntoBytes,
+{
+    #[inline]
+    pub fn read(&self) -> T {
+        T::read_from_bytes(&self.buf).unwrap()
+    }
+}
+
+impl<T> Data<T>
+where
     T: KnownLayout + TryFromBytes + Immutable + ?Sized + IntoBytes,
 {
     pub fn get(&self) -> &T {
@@ -71,7 +81,7 @@ where
         T::try_mut_from_bytes(&mut self.buf).unwrap()
     }
 
-    pub fn read(&self) -> T
+    pub fn try_read(&self) -> T
     where
         T: Sized + Clone,
     {
@@ -114,9 +124,9 @@ where
 impl Data<[u8]> {
     /// Consumes the `Data` and returns the underlying
     /// slice as a `BytesMut`.
-    #[inline]
-    pub fn into_bytes_mut(mut self) -> BytesMut {
-        std::mem::replace(&mut self.buf, BytesMut::new())
+    #[inline(always)]
+    pub fn into_bytes_mut(self) -> BytesMut {
+        self.buf
     }
 }
 

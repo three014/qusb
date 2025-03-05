@@ -1,29 +1,37 @@
-use std::{future::Future, io};
+use std::{
+    future::{poll_fn, Future},
+    io,
+    pin::pin,
+    time::Duration,
+};
 
 use bytes::Bytes;
+use futures_core::Stream;
 use proto::{
     data::{Data, Ring},
     msg::{Header, UrbFrame},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use vhci::{
     ioctl::{self, UrbType, Work},
     usbfs::Request,
 };
-use zerocopy::transmute;
 
 use crate::stub::WorkReceiver;
 
 pub trait SendHandler {
-    fn port_stat(&mut self, stat: ioctl::IocPortStat) -> Option<Header>;
+    fn port_stat(&mut self, stat: ioctl::IocPortStat);
     fn set_address(
         &mut self,
         urb: ioctl::IocUrb,
         handle: ioctl::UrbHandle,
     ) -> impl Future<Output = io::Result<()>>;
-    fn process_urb(&mut self, urb: ioctl::IocUrb, handle: ioctl::UrbHandle) -> io::Result<Bytes>;
-    fn cancel_urb(&mut self, handle: ioctl::UrbHandle) -> Option<Header>;
+    fn process_urb(&mut self, urb: ioctl::IocUrb, handle: ioctl::UrbHandle) -> io::Result<()>;
+    fn cancel_urb(&mut self, handle: ioctl::UrbHandle);
+    fn is_buf_empty(&self) -> bool;
+    fn flush_buf(&mut self) -> Bytes;
 }
 
 pub struct SendLoop<W> {
@@ -37,7 +45,6 @@ impl<W> SendLoop<W> {
         Self { tx, work_rx }
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
         W: AsyncWrite + Unpin + 'static,
@@ -45,42 +52,60 @@ impl<W> SendLoop<W> {
     {
         use tokio::io::AsyncWriteExt;
 
+        enum Event {
+            Cancelled,
+            Work(Option<Work>),
+            FlushBuf,
+        }
+
+        let _guard = tracing::Span::current().entered();
+        let mut timer = pin!(tokio_timerfd::Interval::new_interval(
+            Duration::from_micros(25)
+        )?);
+        let mut wait_to_send = poll_fn(|cx| timer.as_mut().poll_next(cx));
+        let mut cancelled = pin!(cancel.cancelled());
+
         loop {
-            let work = tokio::select! {
+            let event = tokio::select! {
                 biased;
-                maybe_work = self.work_rx.recv() => {
-                    match maybe_work {
-                        Some(work) => work,
-                        None => break Ok(()),
-                    }
+                _ = &mut cancelled => {
+                    Event::Cancelled
                 }
-                _ = cancel.cancelled() => {
-                    break Ok(())
+                result = &mut wait_to_send, if !handler.is_buf_empty() => {
+                    result.unwrap().unwrap();
+                    Event::FlushBuf
+                }
+                maybe_work = self.work_rx.recv() => {
+                    Event::Work(maybe_work)
                 }
             };
 
-            match work {
-                Work::PortStat(next) => {
-                    if let Some(header) = handler.port_stat(next) {
-                        self.tx.write_u64_le(transmute!(header)).await?;
-                    }
+            match event {
+                Event::Work(Some(Work::PortStat(next))) => {
+                    handler.port_stat(next);
                 }
-                Work::ProcessUrb((urb, handle))
+                Event::Work(Some(Work::ProcessUrb((urb, handle))))
                     if UrbType::Ctrl == urb.typ
                         && urb.address.is_for_unassigned()
                         && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                 {
-                    handler.set_address(urb, handle).await?;
+                    handler.set_address(urb, handle).in_current_span().await?;
                 }
-                Work::ProcessUrb((urb, handle)) => {
-                    let mut bytes = handler.process_urb(urb, handle)?;
-                    self.tx.write_all_buf(&mut bytes).await?;
+                Event::Work(Some(Work::ProcessUrb((urb, handle)))) => {
+                    handler.process_urb(urb, handle)?;
                 }
-                Work::CancelUrb(handle) => {
-                    if let Some(header) = handler.cancel_urb(handle) {
-                        self.tx.write_u64_le(transmute!(header)).await?;
-                    }
+                Event::Work(Some(Work::CancelUrb(handle))) => {
+                    handler.cancel_urb(handle);
                 }
+                Event::FlushBuf => {
+                    let mut bytes = handler.flush_buf();
+                    assert_eq!(bytes.len() % 8, 0);
+                    self.tx
+                        .write_all_buf(&mut bytes)
+                        .in_current_span()
+                        .await?;
+                }
+                Event::Cancelled | Event::Work(None) => break Ok(()),
             }
         }
     }
@@ -106,24 +131,22 @@ impl<R> RecvLoop<R> {
         Self { rx, buf }
     }
 
-    #[tracing::instrument(level = "trace", skip_all)]
     pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
         R: AsyncRead + Unpin + 'static,
         H: RecvHandler,
     {
+        let _guard = tracing::Span::current().entered();
         loop {
             let recv = tokio::select! {
                 biased;
+                _ = cancel.cancelled() => break Ok(()),
                 maybe_frame = super::recv_frame(&mut self.rx, &mut self.buf) => {
                     match maybe_frame {
                         Ok(Some(frame)) => frame,
                         Ok(None) => break Ok(()),
-                        Err(err) => break Err(err.into()),
+                        Err(err) => break Err(err),
                     }
-                }
-                _ = cancel.cancelled() => {
-                    break Ok(())
                 }
             };
 
@@ -136,7 +159,7 @@ impl<R> RecvLoop<R> {
                     },
                     data,
                 )) => {
-                    handler.urb_reply(seqnum, data).await?;
+                    handler.urb_reply(seqnum, data).in_current_span().await?;
                 }
                 super::Recv::PortReset(Header {
                     seqnum,
