@@ -364,7 +364,7 @@ impl borrow::SendHandler for BorrowSendHandler {
                 handle,
                 header: &urb_header,
                 transfer,
-                iso_data
+                iso_data,
             };
 
             // It's okay if we exit early without fixing our
@@ -425,7 +425,8 @@ impl borrow::SendHandler for BorrowSendHandler {
 
         unsafe { headers.as_mut_ptr().cast::<Header>().write(header) };
         unsafe {
-            headers.as_mut_ptr()
+            headers
+                .as_mut_ptr()
                 .byte_add(size_of::<Header>())
                 .cast::<UrbHeader>()
                 .write(urb_header)
@@ -447,8 +448,6 @@ impl borrow::SendHandler for BorrowSendHandler {
     fn flush_buf(&mut self) -> Bytes {
         self.buf.split().freeze()
     }
-
-    
 }
 
 enum GivebackData {
@@ -1094,11 +1093,21 @@ where
         let mut ctrl_transfers: JoinSet<Seq<Ctrl>> = JoinSet::new();
         let mut bulk_transfers: JoinSet<Seq<Bulk>> = JoinSet::new();
         let mut timer = pin!(tokio_timerfd::Interval::new_interval(
-            Duration::from_micros(25)
+            Duration::from_micros(500)
         )?);
         let mut wait_to_send = poll_fn(|cx| timer.as_mut().poll_next(cx));
 
         let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
+
+        // ---- Stats ----
+        let mut max_active_transfers = 0;
+        let mut num_active_transfers = 0;
+        let mut max_completed_transfers_before_flush = 0;
+        let mut num_transfers_completed = 0;
+        let mut last_few_setup_times = VecDeque::with_capacity(THRESHOLD);
+        let mut min_setup_time = Duration::MAX;
+        let mut max_setup_time = Duration::ZERO;
+        const THRESHOLD: usize = 32;
 
         let result = loop {
             match tokio::select! {
@@ -1107,13 +1116,19 @@ where
                     Event::Cancelled
                 }
                 frame = recv_frame(&mut rx, &mut buf_rx) => {
+                    num_active_transfers += 1;
+                    max_active_transfers = std::cmp::max(max_active_transfers, num_active_transfers);
                     Event::RecvFrame2(frame)
                 }
                 result = &mut wait_to_send, if !buf_tx.is_empty() => {
                     result.unwrap().unwrap();
+                    max_completed_transfers_before_flush = std::cmp::max(max_completed_transfers_before_flush, num_transfers_completed);
+                    num_transfers_completed = 0;
                     Event::FlushBuf
                 }
                 result = blocking_transfers.join_next(), if !blocking_transfers.is_empty() => {
+                    num_transfers_completed += 1;
+                    num_active_transfers -= 1;
                     let seq = result.unwrap().unwrap();
                     Event::CompletedCtrl(Seq {
                         seqnum: seq.seqnum,
@@ -1127,15 +1142,23 @@ where
                     })
                 }
                 result = ctrl_transfers.join_next(), if !ctrl_transfers.is_empty() => {
+                    num_transfers_completed += 1;
+                    num_active_transfers -= 1;
                     Event::CompletedCtrl(result.unwrap().unwrap())
                 }
                 result = int_transfers.join_next(), if !int_transfers.is_empty() => {
+                    num_transfers_completed += 1;
+                    num_active_transfers -= 1;
                     Event::CompletedInt(result.unwrap().unwrap())
                 }
                 result = iso_transfers.join_next(), if !iso_transfers.is_empty() => {
+                    num_transfers_completed += 1;
+                    num_active_transfers -= 1;
                     Event::CompletedIso(result.unwrap().unwrap())
                 }
                 result = bulk_transfers.join_next(), if !bulk_transfers.is_empty() => {
+                    num_transfers_completed += 1;
+                    num_active_transfers -= 1;
                     Event::CompletedBulk(result.unwrap().unwrap())
                 }
             } {
@@ -1143,6 +1166,7 @@ where
                     tx.write_all_buf(&mut buf_tx.split()).await?;
                 }
                 Event::RecvFrame2(Ok(Some(Recv::Urb((Header { seqnum, .. }, urb_frame))))) => {
+                    let start = std::time::Instant::now();
                     let cancel = CancellationToken::new();
                     cancel_tokens.insert(seqnum, cancel.clone());
 
@@ -1219,6 +1243,13 @@ where
                             };
 
                             let cache = cached_transfers.clone();
+                            let elapsed = start.elapsed();
+                            if last_few_setup_times.len() > THRESHOLD {
+                                last_few_setup_times.pop_front();
+                            }
+                            last_few_setup_times.push_back(elapsed);
+                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             iso_transfers.spawn_local(async move {
                                 let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status =
@@ -1289,6 +1320,13 @@ where
                             let transfer = unsafe { transfer.into_int(&device, endpoint.0, buf) };
 
                             let cache = cached_transfers.clone();
+                            let elapsed = start.elapsed();
+                            if last_few_setup_times.len() > THRESHOLD {
+                                last_few_setup_times.pop_front();
+                            }
+                            last_few_setup_times.push_back(elapsed);
+                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             int_transfers.spawn_local(async move {
                                 let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status =
@@ -1318,6 +1356,13 @@ where
                                 setting,
                                 interface,
                             }) => {
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
+                                last_few_setup_times.push_back(elapsed);
                                 blocking_transfers.spawn_local(
                                     device
                                         .set_alt_setting_async(seqnum, interface, setting)
@@ -1328,6 +1373,13 @@ where
                                 desired,
                             }) => {
                                 let interfaces = Arc::clone(&claimed_interfaces);
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                last_few_setup_times.push_back(elapsed);
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
                                 blocking_transfers.spawn_local(
                                     device
                                         .set_config_async(seqnum, desired, interfaces)
@@ -1337,6 +1389,13 @@ where
                             lend::CtrlKind::Blocking(lend::blocking::CtrlReq::ClearStall {
                                 endpoint,
                             }) => {
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                last_few_setup_times.push_back(elapsed);
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
                                 blocking_transfers.spawn_local(
                                     device
                                         .clear_stall_async(seqnum, endpoint)
@@ -1375,6 +1434,13 @@ where
                                 };
 
                                 let cache = cached_transfers.clone();
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                last_few_setup_times.push_back(elapsed);
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
                                 ctrl_transfers.spawn_local(async move {
                                     let result = unsafe { transfer.submit(&cancel) }.await;
                                     let status =
@@ -1425,6 +1491,13 @@ where
                             };
 
                             let cache = cached_transfers.clone();
+                            let elapsed = start.elapsed();
+                            if last_few_setup_times.len() > THRESHOLD {
+                                last_few_setup_times.pop_front();
+                            }
+                            last_few_setup_times.push_back(elapsed);
+                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             bulk_transfers.spawn_local(async move {
                                 let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status =
@@ -1898,6 +1971,28 @@ where
         trace!("joining event handler loop");
         libusb_handle.await.unwrap();
         _ = tx.close().await;
+
+        fn mean<I, E>(list: I) -> Duration
+        where
+            I: IntoIterator<Item = Duration, IntoIter = E>,
+            E: ExactSizeIterator<Item = Duration>,
+        {
+            let iter = list.into_iter();
+            let len = iter.len();
+            let sum: Duration = iter.sum();
+            sum.checked_div(len as u32).unwrap()
+        }
+
+        info!("==== STATS ====");
+        info!("Max active transfers: {max_active_transfers}");
+        info!("Max completed transfers before flush: {max_completed_transfers_before_flush}");
+        info!("Number of DMA regions in use: {}", scratch_dma.queue.len());
+        info!("Min time to setup transfer: {min_setup_time:?}");
+        info!("Max time to setup transfer: {max_setup_time:?}");
+        info!(
+            "Avg setup time for last {THRESHOLD} transfers: {:?}",
+            mean(last_few_setup_times)
+        );
 
         result
     }

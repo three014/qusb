@@ -100,10 +100,7 @@ impl<W> SendLoop<W> {
                 Event::FlushBuf => {
                     let mut bytes = handler.flush_buf();
                     assert_eq!(bytes.len() % 8, 0);
-                    self.tx
-                        .write_all_buf(&mut bytes)
-                        .in_current_span()
-                        .await?;
+                    self.tx.write_all_buf(&mut bytes).in_current_span().await?;
                 }
                 Event::Cancelled | Event::Work(None) => break Ok(()),
             }

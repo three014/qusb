@@ -1,7 +1,5 @@
 use std::{
-    collections::VecDeque,
-    io,
-    sync::{Arc, Mutex},
+    collections::VecDeque, io, pin::pin, sync::{Arc, Mutex}
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -32,19 +30,21 @@ pub struct Register {
 
 pub type WorkReceiver = mpsc::Receiver<vhci::ioctl::Work>;
 type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::Sender<vhci::ioctl::Work>>;
+type Receiver<T> = kanal::AsyncReceiver<T>;
+type Sender<T> = kanal::AsyncSender<T>;
 
 struct Demuxer {
-    register_rx: mpsc::Receiver<Ctrl<Register, RegisterPayload>>,
-    giveback_rx: mpsc::Receiver<UrbHandle>,
-    disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
+    register_rx: Receiver<Ctrl<Register, RegisterPayload>>,
+    giveback_rx: Receiver<UrbHandle>,
+    disconnect_rx: Receiver<Ctrl<Port>>,
     vhci: vhci::Controller,
 }
 
 impl Demuxer {
     fn new(
-        register_rx: mpsc::Receiver<Ctrl<Register, RegisterPayload>>,
-        giveback_rx: mpsc::Receiver<UrbHandle>,
-        disconnect_rx: mpsc::Receiver<Ctrl<Port>>,
+        register_rx: Receiver<Ctrl<Register, RegisterPayload>>,
+        giveback_rx: Receiver<UrbHandle>,
+        disconnect_rx: Receiver<Ctrl<Port>>,
         vhci: vhci::Controller,
     ) -> Self {
         Self {
@@ -58,15 +58,16 @@ impl Demuxer {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn demux_vhci(self) -> io::Result<()> {
         let Self {
-            mut register_rx,
-            mut giveback_rx,
-            mut disconnect_rx,
+            register_rx,
+            giveback_rx,
+            disconnect_rx,
             mut vhci,
         } = self;
 
         let register_queue = Mutex::new(VecDeque::new());
         let mailer = Mutex::new(Mailer::with_capacities(8, 8, 10, 1024));
-        let (work_tx, mut work_rx) = mpsc::channel(128);
+        let (work_tx, work_rx) = kanal::bounded(0);
+        let work_rx = work_rx.to_async();
         let work_receiver = vhci.work_receiver().unwrap();
         let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx));
 
@@ -103,20 +104,30 @@ impl Demuxer {
         });
 
         let mut set = tokio::task::JoinSet::new();
+
+        let mut register = pin!(register_rx.recv());
+        let mut giveback = pin!(giveback_rx.recv());
+        let mut disconnect = pin!(disconnect_rx.recv());
+        let mut work = pin!(work_rx.recv());
+
         loop {
             let events_in_progress = !set.is_empty();
             let event = tokio::select! {
-                req = register_rx.recv() => {
-                    Event::Register(req)
+                req = &mut register => {
+                    register.set(register_rx.recv());
+                    Event::Register(req.ok())
                 }
-                handle = giveback_rx.recv() => {
-                    Event::GivebackUrb(handle)
+                handle = &mut giveback => {
+                    giveback.set(giveback_rx.recv());
+                    Event::GivebackUrb(handle.ok())
                 }
-                req = disconnect_rx.recv() => {
-                    Event::Disconnect(req)
+                req = &mut disconnect => {
+                    disconnect.set(disconnect_rx.recv());
+                    Event::Disconnect(req.ok())
                 }
-                work = work_rx.recv() => {
-                    Event::Work(work.expect("we can only get here if we shutdown in the wrong order"))
+                new_work = &mut work => {
+                    work.set(work_rx.recv());
+                    Event::Work(new_work.ok().expect("we can only get here if we shutdown in the wrong order"))
                 }
                 task = set.join_next(), if events_in_progress => {
                     Event::Task(task)
@@ -286,8 +297,8 @@ impl Demuxer {
             }
         });
         work_rx.close();
-        while (work_rx.recv().await).is_some() {}
-        drop(work_rx);
+        while (work_rx.recv().await).is_ok() {}
+        // drop(work_rx);
 
         info!("waiting on recv_work thread");
         tokio::task::spawn_blocking(|| handle.join().expect("recv thread should not panic"))
@@ -299,17 +310,17 @@ impl Demuxer {
 #[derive(Debug, Clone)]
 pub struct Controller {
     handle: Option<Arc<tokio::task::JoinHandle<io::Result<()>>>>,
-    register_tx: mpsc::Sender<Ctrl<Register, (Port, WorkReceiver)>>,
-    giveback_tx: mpsc::Sender<UrbHandle>,
-    disconnect_tx: mpsc::Sender<Ctrl<Port>>,
+    register_tx: Sender<Ctrl<Register, (Port, WorkReceiver)>>,
+    giveback_tx: Sender<UrbHandle>,
+    disconnect_tx: Sender<Ctrl<Port>>,
     remote: vhci::Remote,
 }
 
 impl Controller {
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
-        let (register_tx, register_rx) = mpsc::channel(4);
-        let (giveback_tx, giveback_rx) = mpsc::channel(32);
-        let (disconnect_tx, disconnect_rx) = mpsc::channel(2);
+        let (register_tx, register_rx) = kanal::bounded_async(0);
+        let (giveback_tx, giveback_rx) = kanal::bounded_async(0);
+        let (disconnect_tx, disconnect_rx) = kanal::bounded_async(0);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
         let handle = Some(Arc::new(tokio::task::spawn(
@@ -395,7 +406,7 @@ impl Drop for Controller {
 #[derive(Debug, Clone)]
 pub struct VhciRemote {
     remote: vhci::Remote,
-    giveback_tx: mpsc::Sender<UrbHandle>,
+    giveback_tx: Sender<UrbHandle>,
 }
 
 impl VhciRemote {
@@ -407,6 +418,7 @@ impl VhciRemote {
         self.remote.fetch_data(urb)
     }
 
+    #[inline]
     pub async fn giveback_urb<T>(&self, urb: T) -> io::Result<()>
     where
         T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + 'static,
@@ -426,7 +438,7 @@ impl VhciRemote {
 #[tracing::instrument(level = "trace", skip_all)]
 fn recv_work(
     work_rx: vhci::WorkReceiver,
-    work_tx: mpsc::Sender<vhci::ioctl::IocWork>,
+    work_tx: kanal::Sender<vhci::ioctl::IocWork>,
 ) -> io::Result<()> {
     if work_tx.is_closed() {
         info!("done with receiving work for vhci");
@@ -435,7 +447,7 @@ fn recv_work(
 
     const TIMEOUT: TimeoutMillis = TimeoutMillis::Time(BoundedI16::new(999).unwrap());
     while (match work_rx.fetch_work_timeout(TIMEOUT) {
-        Ok(work) => work_tx.blocking_send(work).ok(),
+        Ok(work) => work_tx.send(work).ok(),
         Err(err)
             if err.kind() == io::ErrorKind::TimedOut
                 || err.kind() == io::ErrorKind::Interrupted

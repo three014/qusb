@@ -20,9 +20,7 @@ pub struct Counter {
 
 impl Counter {
     pub const fn new(start: u32) -> Self {
-        Self {
-            inner: start,
-        }
+        Self { inner: start }
     }
 
     /// Increments the inner value by 1,

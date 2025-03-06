@@ -26,6 +26,7 @@ fxhash = "0.2.1"
 rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.3.6" }
 tokio-timerfd = "0.2.0"
 futures-core = { version = "0.3.31", default-features = false }
+kanal = "0.1.0-pre8"
 
 [dev-dependencies]
 tracing-test = { version = "0.2.5" }

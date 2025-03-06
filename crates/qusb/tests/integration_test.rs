@@ -71,6 +71,7 @@ fn borrow_self_dev() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, borrow_self_dev_inner());
+
 }
 
 async fn borrow_self_dev_inner() {
@@ -86,15 +87,20 @@ async fn borrow_self_dev_inner() {
         let usb = session
             .req_borrow(proto::msg::UsbDeviceId {
                 bus_number: 1,
-                device_addr: 8,
+                device_addr: 9,
             })
             .await
             .unwrap();
         let cancel = CancellationToken::new();
+        let timer = tokio::time::sleep(Duration::from_secs(60));
         let mut handle = tokio::task::spawn_local(usb.borrow(cancel.clone()));
         tokio::select! {
             result = &mut handle => {
                 result.unwrap().unwrap();
+            }
+            _ = timer => {
+                cancel.cancel();
+                handle.await.unwrap().unwrap();
             }
             result = ctrl_c => {
                 result.unwrap();
