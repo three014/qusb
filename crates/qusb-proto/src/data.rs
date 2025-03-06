@@ -81,6 +81,7 @@ where
         T::try_mut_from_bytes(&mut self.buf).unwrap()
     }
 
+    #[inline]
     pub fn try_read(&self) -> T
     where
         T: Sized + Clone,
@@ -88,6 +89,7 @@ where
         T::try_read_from_bytes(&self.buf).unwrap()
     }
 
+    #[inline]
     fn new(buf: BytesMut) -> Self {
         Self {
             buf,
@@ -95,14 +97,17 @@ where
         }
     }
 
+    #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.buf.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -110,6 +115,7 @@ where
     /// Splits the internal slice at `size_of::<<T as GetSliceLen>::Header>()`,
     /// so that the first `Data` contains the header, and the second `Data`
     /// contains the remainder of the data interpreted as type `U`.
+    #[inline]
     pub fn split<U>(mut self) -> (Data<T::Header>, Data<U>)
     where
         T: GetSliceLen,

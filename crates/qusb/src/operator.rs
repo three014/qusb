@@ -1,17 +1,15 @@
 use std::{
     cell::{RefCell, RefMut},
     collections::{BTreeMap, VecDeque},
-    future::poll_fn,
     io,
     ops::DerefMut,
-    pin::pin,
     rc::Rc,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures_core::Stream;
+use futures::StreamExt;
 use lend::{blocking::BlockingOps, Bulk, Ctrl, Int, Iso, ResultData};
 use nohash_hasher::{IntMap, IntSet};
 use proto::{
@@ -532,7 +530,6 @@ impl BorrowRecvHandler {
 }
 
 impl borrow::RecvHandler for BorrowRecvHandler {
-    #[tracing::instrument(level = "debug", skip_all)]
     async fn urb_reply(&mut self, seqnum: u32, data: Data<UrbFrame>) -> io::Result<()> {
         let handle = {
             let mut guard = self.handle_seqnum_map.lock().unwrap();
@@ -566,6 +563,7 @@ impl borrow::RecvHandler for BorrowRecvHandler {
 
         self.vhci.giveback_urb(giveback).await?;
         if vhci::Status::Success != urb.status {
+            let _guard = warn_span!("urb_reply").entered();
             warn!(
                 "({}) {:?} {:?} transfer {seqnum} failed: {:?}",
                 self.id,
@@ -1083,10 +1081,9 @@ where
         let mut int_transfers: JoinSet<Seq<Int>> = JoinSet::new();
         let mut ctrl_transfers: JoinSet<Seq<Ctrl>> = JoinSet::new();
         let mut bulk_transfers: JoinSet<Seq<Bulk>> = JoinSet::new();
-        let mut timer = pin!(tokio_timerfd::Interval::new_interval(
+        let mut timer = tokio_timerfd::Interval::new_interval(
             Duration::from_micros(300)
-        )?);
-        let mut wait_to_send = poll_fn(|cx| timer.as_mut().poll_next(cx));
+        )?;
 
         // ---- Stats ----
         let mut max_active_transfers = 0;
@@ -1109,7 +1106,7 @@ where
                     max_active_transfers = std::cmp::max(max_active_transfers, num_active_transfers);
                     Event::RecvFrame2(frame)
                 }
-                result = &mut wait_to_send, if !buf_tx.is_empty() => {
+                result = timer.next(), if !buf_tx.is_empty() => {
                     result.unwrap().unwrap();
                     max_completed_transfers_before_flush = std::cmp::max(max_completed_transfers_before_flush, num_transfers_completed);
                     num_transfers_completed = 0;

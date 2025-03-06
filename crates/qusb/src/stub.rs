@@ -1,7 +1,8 @@
+use futures::SinkExt;
+use futures::StreamExt;
 use std::{
     collections::VecDeque,
     io,
-    pin::pin,
     sync::{Arc, Mutex},
 };
 
@@ -33,8 +34,9 @@ pub struct Register {
 
 pub type WorkReceiver = Receiver<vhci::ioctl::Work>;
 type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, Sender<vhci::ioctl::Work>>;
-type Receiver<T> = kanal::AsyncReceiver<T>;
-type Sender<T> = kanal::AsyncSender<T>;
+type Receiver<T> = flume::r#async::RecvStream<'static, T>;
+type BlockingSender<T> = flume::Sender<T>;
+type Sender<T> = flume::r#async::SendSink<'static, T>;
 
 struct Demuxer {
     register_rx: Receiver<Ctrl<Register, RegisterPayload>>,
@@ -61,16 +63,16 @@ impl Demuxer {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn demux_vhci(self) -> io::Result<()> {
         let Self {
-            register_rx,
-            giveback_rx,
-            disconnect_rx,
+            mut register_rx,
+            mut giveback_rx,
+            mut disconnect_rx,
             mut vhci,
         } = self;
 
         let register_queue = Mutex::new(VecDeque::new());
         let mailer = Mutex::new(Mailer::with_capacities(8, 8, 10, 1024));
-        let (work_tx, work_rx) = kanal::bounded(0);
-        let work_rx = work_rx.to_async();
+        let (work_tx, work_rx) = flume::bounded(0);
+        let mut work_rx = work_rx.into_stream();
         let work_receiver = vhci.work_receiver().unwrap();
         let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx));
 
@@ -108,29 +110,20 @@ impl Demuxer {
 
         let mut set = tokio::task::JoinSet::new();
 
-        let mut register = pin!(register_rx.recv());
-        let mut giveback = pin!(giveback_rx.recv());
-        let mut disconnect = pin!(disconnect_rx.recv());
-        let mut work = pin!(work_rx.recv());
-
         loop {
             let events_in_progress = !set.is_empty();
             let event = tokio::select! {
-                req = &mut register => {
-                    register.set(register_rx.recv());
-                    Event::Register(req.ok())
+                req = register_rx.next() => {
+                    Event::Register(req)
                 }
-                handle = &mut giveback => {
-                    giveback.set(giveback_rx.recv());
-                    Event::GivebackUrb(handle.ok())
+                handle = giveback_rx.next() => {
+                    Event::GivebackUrb(handle)
                 }
-                req = &mut disconnect => {
-                    disconnect.set(disconnect_rx.recv());
-                    Event::Disconnect(req.ok())
+                req = disconnect_rx.next() => {
+                    Event::Disconnect(req)
                 }
-                new_work = &mut work => {
-                    work.set(work_rx.recv());
-                    Event::Work(new_work.ok().expect("we can only get here if we shutdown in the wrong order"))
+                new_work = work_rx.next() => {
+                    Event::Work(new_work.expect("we can only get here if we shutdown in the wrong order"))
                 }
                 task = set.join_next(), if events_in_progress => {
                     Event::Task(task)
@@ -264,7 +257,7 @@ impl Demuxer {
                         }
                     };
 
-                    if let Some(tx) = tx {
+                    if let Some(mut tx) = tx {
                         if tx.send(work).await.is_err() {
                             // TODO: Remove by which key? By the value itself?
                         }
@@ -273,10 +266,13 @@ impl Demuxer {
                     }
                 }
                 Event::Task(Some(Ok(Continuation::Register((Ok(port), tx))))) => {
-                    let (work_tx, work_rx) = kanal::bounded_async(32);
+                    let (work_tx, work_rx) = flume::bounded(32);
                     let mut mailer = ctx.mailer.lock().unwrap();
-                    assert!(mailer.insert_by_key1(port, work_tx).is_none(), "{port:?}");
-                    if tx.send(Ok((port, work_rx))).is_err() {
+                    assert!(
+                        mailer.insert_by_key1(port, work_tx.into_sink()).is_none(),
+                        "{port:?}"
+                    );
+                    if tx.send(Ok((port, work_rx.into_stream()))).is_err() {
                         mailer.remove_by_key1(&port);
                     }
                 }
@@ -299,9 +295,9 @@ impl Demuxer {
                 warn!("error while disconnecting vhci device: {err}");
             }
         });
-        work_rx.close();
-        while (work_rx.recv().await).is_ok() {}
-        // drop(work_rx);
+        // work_rx.close();
+        // while (work_rx.recv().await).is_ok() {}
+        drop(work_rx);
 
         info!("waiting on recv_work thread");
         let waiter = || handle.join().expect("recv thread should not panic");
@@ -321,20 +317,26 @@ pub struct Controller {
 
 impl Controller {
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
-        let (register_tx, register_rx) = kanal::bounded_async(0);
-        let (giveback_tx, giveback_rx) = kanal::bounded_async(0);
-        let (disconnect_tx, disconnect_rx) = kanal::bounded_async(0);
+        let (register_tx, register_rx) = flume::bounded(0);
+        let (giveback_tx, giveback_rx) = flume::bounded(0);
+        let (disconnect_tx, disconnect_rx) = flume::bounded(0);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
         let handle = Some(Arc::new(tokio::task::spawn(
-            Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).demux_vhci(),
+            Demuxer::new(
+                register_rx.into_stream(),
+                giveback_rx.into_stream(),
+                disconnect_rx.into_stream(),
+                vhci,
+            )
+            .demux_vhci(),
         )));
 
         Ok(Self {
             handle,
-            register_tx,
-            giveback_tx,
-            disconnect_tx,
+            register_tx: register_tx.into_sink(),
+            giveback_tx: giveback_tx.into_sink(),
+            disconnect_tx: disconnect_tx.into_sink(),
             remote,
         })
     }
@@ -361,7 +363,7 @@ impl Controller {
 
     #[inline]
     pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
-        &self,
+        &mut self,
         urb: T,
     ) -> io::Result<()> {
         _ = self.giveback_tx.send(urb.handle()).await;
@@ -422,7 +424,7 @@ impl VhciRemote {
     }
 
     #[inline]
-    pub async fn giveback_urb<T>(&self, urb: T) -> io::Result<()>
+    pub async fn giveback_urb<T>(&mut self, urb: T) -> io::Result<()>
     where
         T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + 'static,
     {
@@ -441,9 +443,9 @@ impl VhciRemote {
 #[tracing::instrument(level = "trace", skip_all)]
 fn recv_work(
     work_rx: vhci::WorkReceiver,
-    work_tx: kanal::Sender<vhci::ioctl::IocWork>,
+    work_tx: BlockingSender<vhci::ioctl::IocWork>,
 ) -> io::Result<()> {
-    if work_tx.is_closed() {
+    if work_tx.is_disconnected() {
         info!("done with receiving work for vhci");
         return Ok(());
     }
@@ -458,7 +460,7 @@ fn recv_work(
                     .raw_os_error()
                     .is_some_and(|err| err == vhci::libc::ENODATA) =>
         {
-            (!work_tx.is_closed()).then_some(())
+            (!work_tx.is_disconnected()).then_some(())
         }
         Err(err) => return Err(err),
     })

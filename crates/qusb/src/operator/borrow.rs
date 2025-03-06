@@ -1,19 +1,18 @@
 use std::{
-    future::{poll_fn, Future},
+    future::Future,
     io,
     pin::pin,
     time::Duration,
 };
 
 use bytes::Bytes;
-use futures_core::Stream;
+use futures::StreamExt;
 use proto::{
     data::{Data, Ring},
     msg::{Header, UrbFrame},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 use vhci::{
     ioctl::{self, UrbType, Work},
     usbfs::Request,
@@ -62,9 +61,7 @@ impl<W> SendLoop<W> {
         let mut timer = pin!(tokio_timerfd::Interval::new_interval(
             Duration::from_micros(100)
         )?);
-        let mut wait_to_send = poll_fn(|cx| timer.as_mut().poll_next(cx));
         let mut cancelled = pin!(cancel.cancelled());
-        let mut work = pin!(self.work_rx.recv());
 
         loop {
             let event = tokio::select! {
@@ -72,13 +69,12 @@ impl<W> SendLoop<W> {
                 _ = &mut cancelled => {
                     Event::Cancelled
                 }
-                result = &mut wait_to_send, if !handler.is_buf_empty() => {
+                result = timer.next(), if !handler.is_buf_empty() => {
                     result.unwrap().unwrap();
                     Event::FlushBuf
                 }
-                maybe_work = &mut work => {
-                    work.set(self.work_rx.recv());
-                    Event::Work(maybe_work.ok())
+                maybe_work = self.work_rx.next() => {
+                    Event::Work(maybe_work)
                 }
             };
 

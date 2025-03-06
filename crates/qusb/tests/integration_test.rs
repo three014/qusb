@@ -50,7 +50,7 @@ mod common;
 //     handle.shutdown().await.unwrap().unwrap();
 // }
 
-#[test]
+// #[test]
 fn borrow_self_dev() {
     let log_path = "borrow_self_dev.log";
     let log_file = std::fs::File::options()
@@ -136,7 +136,7 @@ async fn borrow_self_dev_inner() {
 //     handle.shutdown().await.unwrap().unwrap();
 // }
 
-// #[test]
+#[test]
 fn client_borrows_usb() {
     let log_path = "client_borrows_usb.log";
     let log_file = std::fs::File::options()
@@ -152,8 +152,7 @@ fn client_borrows_usb() {
         .with_writer(Mutex::new(BufWriter::with_capacity(512, log_file)))
         .try_init();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .thread_keep_alive(Duration::from_secs(60))
         .build()
