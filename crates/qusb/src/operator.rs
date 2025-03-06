@@ -774,6 +774,19 @@ fn port_reset<C: rusb::UsbContext>(
     }
 }
 
+#[inline(always)]
+fn get_or_alloc_transfer_no_iso(mut cache: RefMut<'_, Vec<InnerTransfer>>) -> InnerTransfer {
+    cache.pop().unwrap_or_else(|| InnerTransfer::new(0))
+}
+
+#[inline(always)]
+fn insert_spare_transfer_no_iso(
+    mut cache: RefMut<'_, Vec<InnerTransfer>>,
+    transfer: InnerTransfer,
+) {
+    cache.push(transfer);
+}
+
 #[derive(Debug)]
 enum OneOrMany<T> {
     One(T),
@@ -784,30 +797,15 @@ fn get_or_alloc_transfer(
     mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     num_iso_packets: u16,
 ) -> InnerTransfer {
-    let mut maybe_first_entry;
-    let maybe_entry = if 0 == num_iso_packets {
-        maybe_first_entry = cache.first_entry();
-        maybe_first_entry.as_mut().map(|entry| entry.get_mut())
-    } else {
-        cache.range_mut(num_iso_packets..).next().map(|(_k, v)| v)
-    };
+    let maybe_entry = cache.range_mut(num_iso_packets..).next().map(|(_k, v)| v);
     if let Some(entry) = maybe_entry {
         const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
         let (transfer, remove_entry) = {
             match std::mem::replace(entry, EMPTY) {
                 OneOrMany::One(transfer) => (transfer, true),
-                // Only true if number of packets is zero (Ctrl, Int, or Bulk)
-                OneOrMany::Many(vec) if vec.is_empty() => {
-                    debug_assert_eq!(num_iso_packets, 0);
-                    // Put back the vec since it has allocated memory
-                    *entry = OneOrMany::Many(vec);
-                    (InnerTransfer::new(num_iso_packets as usize), false)
-                }
                 OneOrMany::Many(mut vec) => {
-                    let transfer = vec.pop().unwrap();
-                    // We only get rid of the vec if the number of packets
-                    // wasn't zero (aka an Isochronous transfer).
-                    if vec.is_empty() && 0 != num_iso_packets {
+                    let transfer = vec.pop().expect("shouldn't be an empty vec");
+                    if vec.is_empty() {
                         (transfer, true)
                     } else {
                         *entry = OneOrMany::Many(vec);
@@ -842,14 +840,6 @@ fn insert_spare_transfer(
                 *entry = OneOrMany::Many(vec);
             }
         },
-        // Almost all our transfers will be made for Ctrl, Int, or Bulk, so we go ahead
-        // and store those transfers in a Vec as a small optimization
-        None if 0 == transfer.num_iso_packets() => {
-            cache.insert(
-                transfer.num_iso_packets() as u16,
-                OneOrMany::Many(vec![transfer]),
-            );
-        }
         None => {
             cache.insert(transfer.num_iso_packets() as u16, OneOrMany::One(transfer));
         }
@@ -1083,9 +1073,10 @@ where
 
         const BUF_LEN: usize = 16 << 10;
         buf_rx.reserve(BUF_LEN);
+        let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
         let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
-        let cached_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> =
-            Rc::new(RefCell::new(BTreeMap::new()));
+        let cached_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> = Rc::default();
+        let cached_small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
 
         let mut blocking_transfers: JoinSet<Seq<vhci::Status>> = JoinSet::new();
         let mut iso_transfers: JoinSet<Seq<Iso>> = JoinSet::new();
@@ -1093,11 +1084,9 @@ where
         let mut ctrl_transfers: JoinSet<Seq<Ctrl>> = JoinSet::new();
         let mut bulk_transfers: JoinSet<Seq<Bulk>> = JoinSet::new();
         let mut timer = pin!(tokio_timerfd::Interval::new_interval(
-            Duration::from_micros(500)
+            Duration::from_micros(300)
         )?);
         let mut wait_to_send = poll_fn(|cx| timer.as_mut().poll_next(cx));
-
-        let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
 
         // ---- Stats ----
         let mut max_active_transfers = 0;
@@ -1243,13 +1232,6 @@ where
                             };
 
                             let cache = cached_transfers.clone();
-                            let elapsed = start.elapsed();
-                            if last_few_setup_times.len() > THRESHOLD {
-                                last_few_setup_times.pop_front();
-                            }
-                            last_few_setup_times.push_back(elapsed);
-                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             iso_transfers.spawn_local(async move {
                                 let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status =
@@ -1299,6 +1281,13 @@ where
                                     },
                                 }
                             });
+                            let elapsed = start.elapsed();
+                            if last_few_setup_times.len() > THRESHOLD {
+                                last_few_setup_times.pop_front();
+                            }
+                            last_few_setup_times.push_back(elapsed);
+                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                         }
                         UrbType::Int => {
                             let mut buf = {
@@ -1312,28 +1301,22 @@ where
                             }
 
                             let buf = buf.split_to(urb.actual_transfer_len as usize);
-                            let transfer = get_or_alloc_transfer(cached_transfers.borrow_mut(), 0);
+                            let transfer =
+                                get_or_alloc_transfer_no_iso(cached_small_transfers.borrow_mut());
                             let endpoint = urb.endpoint;
                             let interval = urb.interval;
 
                             // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
                             let transfer = unsafe { transfer.into_int(&device, endpoint.0, buf) };
 
-                            let cache = cached_transfers.clone();
-                            let elapsed = start.elapsed();
-                            if last_few_setup_times.len() > THRESHOLD {
-                                last_few_setup_times.pop_front();
-                            }
-                            last_few_setup_times.push_back(elapsed);
-                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
+                            let cache = cached_small_transfers.clone();
                             int_transfers.spawn_local(async move {
                                 let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status =
                                     convert_libusb_to_vhci(result, UrbType::Int, seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
-                                insert_spare_transfer(cache.borrow_mut(), transfer);
+                                insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
 
                                 Seq {
                                     seqnum,
@@ -1350,45 +1333,41 @@ where
                                     },
                                 }
                             });
+                            let elapsed = start.elapsed();
+                            if last_few_setup_times.len() > THRESHOLD {
+                                last_few_setup_times.pop_front();
+                            }
+                            last_few_setup_times.push_back(elapsed);
+                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                         }
                         UrbType::Ctrl => match lend::CtrlKind::parse(urb.ctrl_packet) {
                             lend::CtrlKind::Blocking(lend::blocking::CtrlReq::SetInterface {
                                 setting,
                                 interface,
                             }) => {
-                                let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
-                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                                last_few_setup_times.push_back(elapsed);
                                 blocking_transfers.spawn_local(
                                     device
                                         .set_alt_setting_async(seqnum, interface, setting)
                                         .instrument(trace_span!("transfer")),
                                 );
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
+                                last_few_setup_times.push_back(elapsed);
                             }
                             lend::CtrlKind::Blocking(lend::blocking::CtrlReq::SetConfig {
                                 desired,
                             }) => {
                                 let interfaces = Arc::clone(&claimed_interfaces);
-                                let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
-                                last_few_setup_times.push_back(elapsed);
-                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
                                 blocking_transfers.spawn_local(
                                     device
                                         .set_config_async(seqnum, desired, interfaces)
                                         .instrument(trace_span!("transfer")),
                                 );
-                            }
-                            lend::CtrlKind::Blocking(lend::blocking::CtrlReq::ClearStall {
-                                endpoint,
-                            }) => {
                                 let elapsed = start.elapsed();
                                 if last_few_setup_times.len() > THRESHOLD {
                                     last_few_setup_times.pop_front();
@@ -1396,11 +1375,22 @@ where
                                 last_few_setup_times.push_back(elapsed);
                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
+                            }
+                            lend::CtrlKind::Blocking(lend::blocking::CtrlReq::ClearStall {
+                                endpoint,
+                            }) => {
                                 blocking_transfers.spawn_local(
                                     device
                                         .clear_stall_async(seqnum, endpoint)
                                         .instrument(trace_span!("transfer")),
                                 );
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                last_few_setup_times.push_back(elapsed);
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             }
                             lend::CtrlKind::Async(ctrl_pkt) => {
                                 let is_get_status =
@@ -1425,7 +1415,7 @@ where
 
                                 let buf = buf.split_to(actual_transfer_len + size_of_pkt);
                                 let transfer =
-                                    get_or_alloc_transfer(cached_transfers.borrow_mut(), 0);
+                                    get_or_alloc_transfer_no_iso(cached_small_transfers.borrow_mut());
 
                                 // SAFETY: Transfer buffer is exactly the length needed for
                                 //         a control transfer, and matches w_length + 8.
@@ -1433,14 +1423,7 @@ where
                                     transfer.into_ctrl(&device, buf, Duration::from_millis(900))
                                 };
 
-                                let cache = cached_transfers.clone();
-                                let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
-                                last_few_setup_times.push_back(elapsed);
-                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
+                                let cache = cached_small_transfers.clone();
                                 ctrl_transfers.spawn_local(async move {
                                     let result = unsafe { transfer.submit(&cancel) }.await;
                                     let status =
@@ -1448,7 +1431,7 @@ where
 
                                     let mut buf = {
                                         let (transfer, mut buf) = transfer.into_parts().unwrap();
-                                        insert_spare_transfer(cache.borrow_mut(), transfer);
+                                        insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
                                         buf.split_off(size_of_pkt)
                                     };
 
@@ -1470,6 +1453,13 @@ where
                                         },
                                     }
                                 });
+                                let elapsed = start.elapsed();
+                                if last_few_setup_times.len() > THRESHOLD {
+                                    last_few_setup_times.pop_front();
+                                }
+                                last_few_setup_times.push_back(elapsed);
+                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             }
                         },
                         UrbType::Bulk => {
@@ -1482,7 +1472,7 @@ where
                             }
 
                             let buf = buf.split_to(urb.actual_transfer_len as usize);
-                            let transfer = get_or_alloc_transfer(cached_transfers.borrow_mut(), 0);
+                            let transfer = get_or_alloc_transfer_no_iso(cached_small_transfers.borrow_mut());
                             let endpoint = urb.endpoint;
 
                             // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
@@ -1490,21 +1480,14 @@ where
                                 transfer.into_bulk(&device, endpoint.0, TransferFlags::NONE, buf)
                             };
 
-                            let cache = cached_transfers.clone();
-                            let elapsed = start.elapsed();
-                            if last_few_setup_times.len() > THRESHOLD {
-                                last_few_setup_times.pop_front();
-                            }
-                            last_few_setup_times.push_back(elapsed);
-                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
+                            let cache = cached_small_transfers.clone();
                             bulk_transfers.spawn_local(async move {
                                 let result = unsafe { transfer.submit(&cancel) }.await;
                                 let status =
                                     convert_libusb_to_vhci(result, UrbType::Bulk, seqnum, dev_id);
 
                                 let (transfer, buf) = transfer.into_parts().unwrap();
-                                insert_spare_transfer(cache.borrow_mut(), transfer);
+                                insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
 
                                 Seq {
                                     seqnum,
@@ -1520,6 +1503,13 @@ where
                                     },
                                 }
                             });
+                            let elapsed = start.elapsed();
+                            if last_few_setup_times.len() > THRESHOLD {
+                                last_few_setup_times.pop_front();
+                            }
+                            last_few_setup_times.push_back(elapsed);
+                            min_setup_time = std::cmp::min(min_setup_time, elapsed);
+                            max_setup_time = std::cmp::max(max_setup_time, elapsed);
                         }
                     }
                 }
@@ -1980,7 +1970,7 @@ where
             let iter = list.into_iter();
             let len = iter.len();
             let sum: Duration = iter.sum();
-            sum.checked_div(len as u32).unwrap()
+            sum.checked_div(len as u32).unwrap_or(Duration::ZERO)
         }
 
         info!("==== STATS ====");
