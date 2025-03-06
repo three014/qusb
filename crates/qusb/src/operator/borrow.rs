@@ -60,10 +60,11 @@ impl<W> SendLoop<W> {
 
         let _guard = tracing::Span::current().entered();
         let mut timer = pin!(tokio_timerfd::Interval::new_interval(
-            Duration::from_micros(25)
+            Duration::from_micros(100)
         )?);
         let mut wait_to_send = poll_fn(|cx| timer.as_mut().poll_next(cx));
         let mut cancelled = pin!(cancel.cancelled());
+        let mut work = pin!(self.work_rx.recv());
 
         loop {
             let event = tokio::select! {
@@ -75,8 +76,9 @@ impl<W> SendLoop<W> {
                     result.unwrap().unwrap();
                     Event::FlushBuf
                 }
-                maybe_work = self.work_rx.recv() => {
-                    Event::Work(maybe_work)
+                maybe_work = &mut work => {
+                    work.set(self.work_rx.recv());
+                    Event::Work(maybe_work.ok())
                 }
             };
 
@@ -89,7 +91,7 @@ impl<W> SendLoop<W> {
                         && urb.address.is_for_unassigned()
                         && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                 {
-                    handler.set_address(urb, handle).in_current_span().await?;
+                    handler.set_address(urb, handle).await?;
                 }
                 Event::Work(Some(Work::ProcessUrb((urb, handle)))) => {
                     handler.process_urb(urb, handle)?;
@@ -100,7 +102,7 @@ impl<W> SendLoop<W> {
                 Event::FlushBuf => {
                     let mut bytes = handler.flush_buf();
                     assert_eq!(bytes.len() % 8, 0);
-                    self.tx.write_all_buf(&mut bytes).in_current_span().await?;
+                    self.tx.write_all_buf(&mut bytes).await?;
                 }
                 Event::Cancelled | Event::Work(None) => break Ok(()),
             }
@@ -156,7 +158,7 @@ impl<R> RecvLoop<R> {
                     },
                     data,
                 )) => {
-                    handler.urb_reply(seqnum, data).in_current_span().await?;
+                    handler.urb_reply(seqnum, data).await?;
                 }
                 super::Recv::PortReset(Header {
                     seqnum,

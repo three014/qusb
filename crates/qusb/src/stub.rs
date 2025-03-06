@@ -1,8 +1,11 @@
 use std::{
-    collections::VecDeque, io, pin::pin, sync::{Arc, Mutex}
+    collections::VecDeque,
+    io,
+    pin::pin,
+    sync::{Arc, Mutex},
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::{info, trace, warn};
 use vhci::{
     ioctl::{Address, UrbHandle},
@@ -28,8 +31,8 @@ pub struct Register {
     data_rate: DataRate,
 }
 
-pub type WorkReceiver = mpsc::Receiver<vhci::ioctl::Work>;
-type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::Sender<vhci::ioctl::Work>>;
+pub type WorkReceiver = Receiver<vhci::ioctl::Work>;
+type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, Sender<vhci::ioctl::Work>>;
 type Receiver<T> = kanal::AsyncReceiver<T>;
 type Sender<T> = kanal::AsyncSender<T>;
 
@@ -270,7 +273,7 @@ impl Demuxer {
                     }
                 }
                 Event::Task(Some(Ok(Continuation::Register((Ok(port), tx))))) => {
-                    let (work_tx, work_rx) = mpsc::channel(32);
+                    let (work_tx, work_rx) = kanal::bounded_async(32);
                     let mut mailer = ctx.mailer.lock().unwrap();
                     assert!(mailer.insert_by_key1(port, work_tx).is_none(), "{port:?}");
                     if tx.send(Ok((port, work_rx))).is_err() {
@@ -301,9 +304,9 @@ impl Demuxer {
         // drop(work_rx);
 
         info!("waiting on recv_work thread");
-        tokio::task::spawn_blocking(|| handle.join().expect("recv thread should not panic"))
-            .await
-            .unwrap()
+        let waiter = || handle.join().expect("recv thread should not panic");
+        _ = tokio::task::spawn_blocking(waiter).await;
+        Ok(())
     }
 }
 
