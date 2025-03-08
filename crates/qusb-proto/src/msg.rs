@@ -21,6 +21,7 @@ use std::{
     path::Path,
 };
 
+use compio_io::AsyncWrite;
 use thiserror::Error;
 use zerocopy::{try_transmute, FromBytes, IntoBytes, TryFromBytes};
 use zerocopy_derive::*;
@@ -134,6 +135,14 @@ pub struct ReqFrame {
     pub req: Req,
 }
 
+impl ReqFrame {
+    fn to_bytes(&self) -> [u8; size_of::<ReqFrame>()] {
+        let mut bytes = [0; size_of::<ReqFrame>()];
+        bytes.copy_from_slice(self.as_bytes());
+        bytes
+    }
+}
+
 #[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
 #[repr(u16)]
 pub enum VersionOpt {
@@ -168,23 +177,32 @@ pub enum Resp {
     } = 3,
 }
 
-#[inline]
-pub async fn send_req<W: tokio::io::AsyncWrite + Unpin>(mut tx: W, req: Req) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    tx.write_all_buf(
-        &mut ReqFrame {
-            version: crate::QUSB_VER,
-            req,
-        }
-        .as_bytes(),
-    )
-    .await
+impl Resp {
+    fn to_bytes(&self) -> [u8; size_of::<Resp>()] {
+        let mut bytes = [0; size_of::<Resp>()];
+        bytes.copy_from_slice(self.as_bytes());
+        bytes
+    }
 }
 
 #[inline]
-pub async fn send_resp<W: tokio::io::AsyncWrite + Unpin>(mut tx: W, resp: Resp) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    tx.write_all_buf(&mut resp.as_bytes()).await
+pub async fn send_req<W: AsyncWrite + Unpin>(mut tx: W, req: Req) -> io::Result<()> {
+    use compio_io::AsyncWriteExt;
+    tx.write_all(
+        ReqFrame {
+            version: crate::QUSB_VER,
+            req,
+        }
+        .to_bytes(),
+    )
+    .await
+    .0
+}
+
+#[inline]
+pub async fn send_resp<W: AsyncWrite + Unpin>(mut tx: W, resp: Resp) -> io::Result<()> {
+    use compio_io::AsyncWriteExt;
+    tx.write_all(resp.to_bytes()).await.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]

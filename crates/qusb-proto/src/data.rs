@@ -1,12 +1,12 @@
 use std::fmt::Debug;
 use std::{io, marker::PhantomData};
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf as _, BufMut};
 
 use bytes::BytesMut;
+use compio_buf::BufResult;
+use compio_io::AsyncRead;
 use thiserror::Error;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncReadExt;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
@@ -155,9 +155,63 @@ impl From<GetSliceLenErr> for ReadError {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Buf {
+    inner: Option<BytesMut>,
+}
+
+impl Buf {
+    #[inline(always)]
+    fn new(buf: BytesMut) -> Self {
+        Self { inner: Some(buf) }
+    }
+
+    #[inline]
+    fn with_owned<T>(&mut self, f: impl FnOnce(BytesMut) -> (BytesMut, T)) -> T {
+        let buf = self
+            .inner
+            .take()
+            .expect("should have been initialized with Some()");
+
+        let (buf, value) = f(buf);
+        self.inner = Some(buf);
+        value
+    }
+
+    #[inline]
+    async fn with_owned_async<T>(&mut self, f: impl AsyncFnOnce(BytesMut) -> (BytesMut, T)) -> T {
+        let buf = self
+            .inner
+            .take()
+            .expect("should have been initialized with Some()");
+
+        let (buf, value) = f(buf).await;
+        self.inner = Some(buf);
+        value
+    }
+
+    #[inline(always)]
+    fn as_ref(&self) -> &BytesMut {
+        self.inner.as_ref().unwrap()
+    }
+
+    #[inline(always)]
+    fn as_mut(&mut self) -> &mut BytesMut {
+        self.inner.as_mut().unwrap()
+    }
+
+    
+    #[inline(always)]
+    fn into_buf(mut self) -> BytesMut {
+        self.inner
+            .take()
+            .expect("every function that takes out the buf should put it back")
+    }
+}
+
 #[derive(Debug)]
 pub struct Ring {
-    buf: BytesMut,
+    buf: Buf,
 }
 
 impl Ring {
@@ -168,13 +222,13 @@ impl Ring {
     /// does not allocate from the heap.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            buf: BytesMut::with_capacity(cap),
+            buf: Buf::new(BytesMut::with_capacity(cap)),
         }
     }
 
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        self.buf.reserve(additional);
+        self.buf.as_mut().reserve(additional);
     }
 
     pub fn peek<T>(&self) -> Result<&T, ReadError>
@@ -182,20 +236,20 @@ impl Ring {
         T: TryFromBytes + KnownLayout + Immutable,
     {
         let size_of_t = std::mem::size_of::<T>();
-        if self.buf.len() < size_of_t {
+        if self.buf.as_ref().len() < size_of_t {
             return Err(ReadError::BufferShort {
-                num_bytes_needed: size_of_t - self.buf.len(),
+                num_bytes_needed: size_of_t - self.buf.as_ref().len(),
             });
         }
-        T::try_ref_from_bytes(&self.buf[..size_of_t]).map_err(|_| ReadError::CorruptedData)
+        T::try_ref_from_bytes(&self.buf.as_ref()[..size_of_t]).map_err(|_| ReadError::CorruptedData)
     }
 
     pub fn peek_dst<T>(&self) -> Result<&T, ReadError>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let len = T::get_slice_len(&self.buf).map_err(ReadError::from)?;
-        T::try_ref_from_prefix_with_elems(&self.buf, len)
+        let len = T::get_slice_len(&self.buf.as_ref()).map_err(ReadError::from)?;
+        T::try_ref_from_prefix_with_elems(&self.buf.as_ref(), len)
             .map_err(|_| ReadError::CorruptedData)
             .map(|(item, _)| item)
     }
@@ -205,20 +259,20 @@ impl Ring {
         T: TryFromBytes + KnownLayout + Immutable + IntoBytes,
     {
         let size_of = std::mem::size_of::<T>();
-        if self.buf.len() < size_of {
+        if self.buf.as_ref().len() < size_of {
             return Err(ReadError::BufferShort {
-                num_bytes_needed: size_of - self.buf.len(),
+                num_bytes_needed: size_of - self.buf.as_ref().len(),
             });
         }
-        T::try_mut_from_bytes(&mut self.buf[..size_of]).map_err(|_| ReadError::CorruptedData)
+        T::try_mut_from_bytes(&mut self.buf.as_mut()[..size_of]).map_err(|_| ReadError::CorruptedData)
     }
 
     pub fn peek_mut_dst<T>(&mut self) -> Result<&mut T, ReadError>
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let len = T::get_slice_len(&self.buf).map_err(ReadError::from)?;
-        T::try_mut_from_prefix_with_elems(&mut self.buf, len)
+        let len = T::get_slice_len(&self.buf.as_ref()).map_err(ReadError::from)?;
+        T::try_mut_from_prefix_with_elems(self.buf.as_mut(), len)
             .map_err(|_| ReadError::CorruptedData)
             .map(|(item, _)| item)
     }
@@ -236,14 +290,14 @@ impl Ring {
         T: TryFromBytes + KnownLayout + Immutable,
     {
         let size_of = std::mem::size_of::<T>();
-        if self.buf.len() < size_of {
+        if self.buf.as_ref().len() < size_of {
             return Err(ReadError::BufferShort {
-                num_bytes_needed: size_of - self.buf.len(),
+                num_bytes_needed: size_of - self.buf.as_ref().len(),
             });
         }
         let item =
-            T::try_read_from_bytes(&self.buf[..size_of]).map_err(|_| ReadError::CorruptedData)?;
-        self.buf.advance(size_of);
+            T::try_read_from_bytes(&self.buf.as_ref()[..size_of]).map_err(|_| ReadError::CorruptedData)?;
+        self.buf.as_mut().advance(size_of);
         Ok(item)
     }
 
@@ -261,7 +315,7 @@ impl Ring {
     ///
     /// This function panics if `num_bytes > self.remaining()`.
     pub fn consume(&mut self, num_bytes: usize) {
-        self.buf.advance(num_bytes);
+        self.buf.as_mut().advance(num_bytes);
     }
 
     // pub fn claim<T>(&mut self) -> Result<Data<T>, ReadError>
@@ -296,7 +350,7 @@ impl Ring {
     {
         let item: &T = self.peek_dst()?;
         let size_of = std::mem::size_of_val(item);
-        let buf = self.buf.split_to(size_of);
+        let buf = self.buf.as_mut().split_to(size_of);
         Ok(Data::new(buf))
     }
 
@@ -310,7 +364,7 @@ impl Ring {
     where
         T: TryFromBytes + KnownLayout + Immutable + 'a,
     {
-        self.buf
+        self.buf.as_ref()
             .chunks_exact(std::mem::size_of::<T>())
             .map_while(|chunk| T::try_ref_from_bytes(chunk).ok())
     }
@@ -329,7 +383,7 @@ impl Ring {
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
         IterDst {
-            buf: &self.buf,
+            buf: &self.buf.as_ref(),
             _p: PhantomData,
         }
     }
@@ -344,7 +398,7 @@ impl Ring {
     where
         T: TryFromBytes + KnownLayout + Immutable + IntoBytes + 'a,
     {
-        self.buf
+        self.buf.as_mut()
             .chunks_exact_mut(std::mem::size_of::<T>())
             .map_while(|chunk| T::try_mut_from_bytes(chunk).ok())
     }
@@ -363,7 +417,7 @@ impl Ring {
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
         IterMutDst {
-            buf: &mut self.buf,
+            buf: self.buf.as_mut(),
             _p: PhantomData,
         }
     }
@@ -378,32 +432,38 @@ impl Ring {
     where
         R: AsyncRead + Unpin,
     {
-        rx.read_buf(&mut self.buf).await
+        self.buf.with_owned_async(|buf| async move {
+            let BufResult(result, buf) = rx.read(buf).await;
+            (buf, result)
+        }).await
     }
 
     /// Attempts to cheaply reclaim the already allocated
     /// capacity by shifting the current data to the front
     /// of the `Ring`. Does not indicate to the user whether
     /// the transaction failed or succeeded.
+    #[inline]
     pub fn try_consolidate(&mut self) {
-        let size = self.buf.capacity() - self.buf.len();
-        let _ = self.buf.try_reclaim(size);
+        let size = self.buf.as_ref().capacity() - self.buf.as_ref().len();
+        let _ = self.buf.as_mut().try_reclaim(size);
     }
 
     /// Returns the number of bytes contained in this `Ring`.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.buf.len()
+        self.buf.as_ref().len()
     }
 
     /// Returns true if the `Ring` has a length of 0.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.buf.as_ref().is_empty()
     }
 
     /// Returns the number of bytes between the current position
     /// and the end of the buffer.
     pub fn remaining(&self) -> usize {
-        self.buf.remaining()
+        self.buf.as_ref().remaining()
     }
 
     pub async fn fill_until<R>(&mut self, mut rx: R, num_bytes: usize) -> io::Result<Option<()>>
@@ -413,7 +473,7 @@ impl Ring {
         const EXTRA: usize = 16 << 10;
         while num_bytes > self.len() {
             if 0 == self.fill_with_reader(&mut rx).await? {
-                if !self.buf.has_remaining_mut() {
+                if !self.buf.as_ref().has_remaining_mut() {
                     self.reserve(EXTRA);
                 } else {
                     return Ok(None);

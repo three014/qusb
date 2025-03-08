@@ -6,7 +6,7 @@ pub mod msg;
 
 pub const QUSB_VER: msg::Version = msg::Version {
     major: 0,
-    minor: 1,
+    minor: 3,
     patch: 0,
 };
 
