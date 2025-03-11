@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::{io, marker::PhantomData};
 
-use bytes::{Buf as _, BufMut};
+use bytes::Buf as _;
 
 use bytes::BytesMut;
 use compio_buf::BufResult;
@@ -200,7 +200,6 @@ impl Buf {
         self.inner.as_mut().unwrap()
     }
 
-    
     #[inline(always)]
     fn into_buf(mut self) -> BytesMut {
         self.inner
@@ -264,7 +263,8 @@ impl Ring {
                 num_bytes_needed: size_of - self.buf.as_ref().len(),
             });
         }
-        T::try_mut_from_bytes(&mut self.buf.as_mut()[..size_of]).map_err(|_| ReadError::CorruptedData)
+        T::try_mut_from_bytes(&mut self.buf.as_mut()[..size_of])
+            .map_err(|_| ReadError::CorruptedData)
     }
 
     pub fn peek_mut_dst<T>(&mut self) -> Result<&mut T, ReadError>
@@ -295,8 +295,8 @@ impl Ring {
                 num_bytes_needed: size_of - self.buf.as_ref().len(),
             });
         }
-        let item =
-            T::try_read_from_bytes(&self.buf.as_ref()[..size_of]).map_err(|_| ReadError::CorruptedData)?;
+        let item = T::try_read_from_bytes(&self.buf.as_ref()[..size_of])
+            .map_err(|_| ReadError::CorruptedData)?;
         self.buf.as_mut().advance(size_of);
         Ok(item)
     }
@@ -364,7 +364,8 @@ impl Ring {
     where
         T: TryFromBytes + KnownLayout + Immutable + 'a,
     {
-        self.buf.as_ref()
+        self.buf
+            .as_ref()
             .chunks_exact(std::mem::size_of::<T>())
             .map_while(|chunk| T::try_ref_from_bytes(chunk).ok())
     }
@@ -398,7 +399,8 @@ impl Ring {
     where
         T: TryFromBytes + KnownLayout + Immutable + IntoBytes + 'a,
     {
-        self.buf.as_mut()
+        self.buf
+            .as_mut()
             .chunks_exact_mut(std::mem::size_of::<T>())
             .map_while(|chunk| T::try_mut_from_bytes(chunk).ok())
     }
@@ -427,15 +429,25 @@ impl Ring {
     ///
     /// On success, returns the number of bytes read into
     /// the internal buffer.
+    ///
+    /// # Cancel Safety
+    ///
+    /// This function is NOT cancellation safe. If the future created
+    /// by this function gets dropped before completion it is all
+    /// but guaranteed that the inner buffer will be dropped.
     #[inline]
     pub async fn fill_with_reader<R>(&mut self, mut rx: R) -> io::Result<usize>
     where
         R: AsyncRead + Unpin,
     {
-        self.buf.with_owned_async(|buf| async move {
-            let BufResult(result, buf) = rx.read(buf).await;
-            (buf, result)
-        }).await
+        self.buf
+            .with_owned_async(|buf: BytesMut| async move {
+                // println!("before read: buf.len() = {}, buf.capacity() = {}", buf.len(), buf.capacity());
+                let BufResult(result, buf) = rx.read(buf).await;
+                // println!("after read: buf.len() = {}, buf.capacity() = {}", buf.len(), buf.capacity());
+                (buf, result)
+            })
+            .await
     }
 
     /// Attempts to cheaply reclaim the already allocated
@@ -471,13 +483,17 @@ impl Ring {
         R: AsyncRead + Unpin,
     {
         const EXTRA: usize = 16 << 10;
+        const SPACE: usize = 64;
         while num_bytes > self.len() {
+            let is_full = {
+                let buf = self.buf.as_ref();
+                buf.capacity() < buf.len() + SPACE
+            };
+            if is_full {
+                self.reserve(EXTRA);
+            }
             if 0 == self.fill_with_reader(&mut rx).await? {
-                if !self.buf.as_ref().has_remaining_mut() {
-                    self.reserve(EXTRA);
-                } else {
-                    return Ok(None);
-                }
+                return Ok(None);
             }
         }
 

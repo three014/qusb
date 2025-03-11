@@ -6,12 +6,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::StreamExt;
+use compio::{
+    io::{AsyncRead, AsyncWrite},
+    runtime::time::sleep,
+};
+use futures_concurrency::{future::Race, stream::Merge};
+use futures_lite::{stream, StreamExt};
 use proto::{
     data::{Data, Ring},
     msg::{Header, UrbFrame},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use vhci::{
     ioctl::{self, UrbType, Work},
@@ -49,60 +53,70 @@ impl<W> SendLoop<W> {
         W: AsyncWrite + Unpin + 'static,
         H: SendHandler,
     {
-        use tokio::io::AsyncWriteExt;
+        use compio::io::AsyncWriteExt;
 
         enum Event {
             Cancelled,
-            Work(Option<Work>),
+            Work(Work),
             FlushBuf,
         }
 
         let _guard = tracing::Span::current().entered();
-        let mut timer = pin!(tokio_timerfd::Interval::new_interval(
-            Duration::from_micros(100)
-        )?);
-        let mut cancelled = pin!(cancel.cancelled());
+        const TICK: Duration = Duration::from_micros(100);
+        let work_rx = self.work_rx.map(Event::Work);
+        let cancelled = stream::once_future(async move {
+            cancel.cancelled_owned().await;
+            Event::Cancelled
+        });
+        let mut timer = pin!(sleep(TICK));
+
+        let mut main_events = pin!((cancelled, work_rx).merge());
+        let mut main = main_events.next();
 
         loop {
-            let event = tokio::select! {
-                biased;
-                _ = &mut cancelled => {
-                    Event::Cancelled
-                }
-                result = timer.next(), if !handler.is_buf_empty() => {
-                    result.unwrap().unwrap();
-                    Event::FlushBuf
-                }
-                maybe_work = self.work_rx.next() => {
-                    Event::Work(maybe_work)
+            let event = {
+                if handler.is_buf_empty() {
+                    pin!(&mut main).await
+                } else {
+                    let timer = async {
+                        timer.as_mut().await;
+                        Some(Event::FlushBuf)
+                    };
+                    (pin!(&mut main), timer).race().await
                 }
             };
 
             match event {
-                Event::Work(Some(Work::PortStat(next))) => {
+                Some(Event::Work(Work::PortStat(next))) => {
                     handler.port_stat(next);
+                    main = main_events.next();
                 }
-                Event::Work(Some(Work::ProcessUrb((urb, handle))))
+                Some(Event::Work(Work::ProcessUrb((urb, handle))))
                     if UrbType::Ctrl == urb.typ
                         && urb.address.is_for_unassigned()
                         && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
                 {
                     handler.set_address(urb, handle).await?;
+                    main = main_events.next();
                 }
-                Event::Work(Some(Work::ProcessUrb((urb, handle)))) => {
+                Some(Event::Work(Work::ProcessUrb((urb, handle)))) => {
                     handler.process_urb(urb, handle)?;
+                    main = main_events.next();
                 }
-                Event::Work(Some(Work::CancelUrb(handle))) => {
+                Some(Event::Work(Work::CancelUrb(handle))) => {
                     handler.cancel_urb(handle);
+                    main = main_events.next();
                 }
-                Event::FlushBuf => {
-                    let mut bytes = handler.flush_buf();
+                Some(Event::FlushBuf) => {
+                    let bytes = handler.flush_buf();
                     assert_eq!(bytes.len() % 8, 0);
-                    self.tx.write_all_buf(&mut bytes).await?;
+                    self.tx.write_all(bytes).await.0?;
+                    timer.set(sleep(TICK));
                 }
-                Event::Cancelled | Event::Work(None) => break Ok(()),
+                Some(Event::Cancelled) | None => break,
             }
         }
+        Ok(())
     }
 }
 
@@ -126,64 +140,74 @@ impl<R> RecvLoop<R> {
         Self { rx, buf }
     }
 
-    pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
+    pub async fn run<H>(self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
         R: AsyncRead + Unpin + 'static,
         H: RecvHandler,
     {
-        let _guard = tracing::Span::current().entered();
-        loop {
-            let recv = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break Ok(()),
-                maybe_frame = super::recv_frame(&mut self.rx, &mut self.buf) => {
-                    match maybe_frame {
-                        Ok(Some(frame)) => frame,
-                        Ok(None) => break Ok(()),
-                        Err(err) => break Err(err),
-                    }
-                }
-            };
+        enum Event {
+            Cancelled,
+            Frame(io::Result<super::Recv>),
+        }
 
-            match recv {
-                super::Recv::Urb((
-                    Header {
+        let _guard = tracing::Span::current().entered();
+        let cancel = stream::once_future(async move {
+            cancel.cancelled_owned().await;
+            Event::Cancelled
+        });
+        let frame = stream::unfold((self.rx, self.buf), |(mut rx, mut buf)| async {
+            let result = super::recv_frame(&mut rx, &mut buf).await.transpose()?;
+            Some((Event::Frame(result), (rx, buf)))
+        });
+
+        let mut events = pin!((cancel, frame).merge());
+        while let Some(event) = events.next().await {
+            match event {
+                Event::Cancelled => break,
+                Event::Frame(Ok(recv)) => match recv {
+                    super::Recv::Urb((
+                        Header {
+                            seqnum,
+                            status: proto::msg::Status::Success,
+                            ..
+                        },
+                        data,
+                    )) => {
+                        handler.urb_reply(seqnum, data).await?;
+                    }
+                    super::Recv::PortReset(Header {
                         seqnum,
                         status: proto::msg::Status::Success,
                         ..
+                    }) => {
+                        handler.device_reset(seqnum)?;
                     },
-                    data,
-                )) => {
-                    handler.urb_reply(seqnum, data).await?;
-                }
-                super::Recv::PortReset(Header {
-                    seqnum,
-                    status: proto::msg::Status::Success,
-                    ..
-                }) => handler.device_reset(seqnum)?,
-                super::Recv::Unlink(_) => {
-                    break Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))
-                }
-                super::Recv::Urb((Header { status, .. }, _))
-                | super::Recv::PortReset(Header { status, .. }) => match status {
-                    proto::msg::Status::Success => unreachable!(),
-                    proto::msg::Status::Failed => todo!(),
-                    proto::msg::Status::DevBusy => todo!(),
-                    proto::msg::Status::DevErr => {
-                        break Err(io::Error::other("lender device in error state"))
+                    super::Recv::Unlink(_) => {
+                        Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))?;
                     }
-                    proto::msg::Status::NoDev => {
-                        break Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "device disconnected on lender side",
-                        ))
-                    }
-                    proto::msg::Status::Unexpected => todo!(),
-                    proto::msg::Status::VersionMismatch => todo!(),
-                    proto::msg::Status::Timeout => todo!(),
-                    proto::msg::Status::Proto => todo!(),
+                    super::Recv::Urb((Header { status, .. }, _))
+                    | super::Recv::PortReset(Header { status, .. }) => match status {
+                        proto::msg::Status::Success => unreachable!(),
+                        proto::msg::Status::Failed => todo!(),
+                        proto::msg::Status::DevBusy => todo!(),
+                        proto::msg::Status::DevErr => {
+                            Err(io::Error::other("lender device in error state"))?;
+                        }
+                        proto::msg::Status::NoDev => {
+                            Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "device disconnected on lender side",
+                            ))?;
+                        }
+                        proto::msg::Status::Unexpected => todo!(),
+                        proto::msg::Status::VersionMismatch => todo!(),
+                        proto::msg::Status::Timeout => todo!(),
+                        proto::msg::Status::Proto => todo!(),
+                    },
                 },
+                Event::Frame(Err(err)) => Err(err)?,
             }
         }
+        Ok(())
     }
 }

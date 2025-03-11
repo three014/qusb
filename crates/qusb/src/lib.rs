@@ -1,12 +1,15 @@
+use compio::quic::{Connection, ConnectionError, RecvStream, SendStream};
+use futures::SinkExt;
+use futures_concurrency::{future::Race, stream::Merge};
+use futures_lite::{stream, StreamExt};
 use operator::{BorrowDevice, LendDevice, SendDevices, ServerResp};
 use proto::{
     data::{IterDst, IterMutDst, ReadError, Ring},
     msg::{self, BUS_ID_MAX_LEN, PATH_MAX_LEN},
 };
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use std::{
     io,
-    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{Ipv6Addr, SocketAddr},
     num::NonZeroU64,
     ops::Deref,
     path::Path,
@@ -15,15 +18,13 @@ use std::{
         Arc, LazyLock,
     },
 };
-use std::{os::unix::ffi::OsStrExt, time::Duration};
+use std::{net::IpAddr, os::unix::ffi::OsStrExt, pin::pin};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn, Instrument};
 use usb_ids::UsbIds;
-use utils::CloseStream;
+use utils::mpsc;
 use zerocopy::FromZeros;
 
-pub use quinn;
-pub use quinn::rustls;
 pub use vhci::utils::BoundedU8;
 
 mod operator;
@@ -54,35 +55,35 @@ pub enum Error {
     Unknown,
 }
 
-impl From<quinn::StoppedError> for Error {
-    fn from(value: quinn::StoppedError) -> Self {
-        Error::Io(value.into())
-    }
-}
+// impl From<quinn::StoppedError> for Error {
+//     fn from(value: quinn::StoppedError) -> Self {
+//         Error::Io(value.into())
+//     }
+// }
 
-impl From<quinn::ConnectionError> for Error {
-    fn from(value: quinn::ConnectionError) -> Self {
-        Error::Io(value.into())
-    }
-}
+// impl From<quinn::ConnectionError> for Error {
+//     fn from(value: quinn::ConnectionError) -> Self {
+//         Error::Io(value.into())
+//     }
+// }
 
-impl From<quinn::WriteError> for Error {
-    fn from(value: quinn::WriteError) -> Self {
-        Error::Io(value.into())
-    }
-}
+// impl From<quinn::WriteError> for Error {
+//     fn from(value: quinn::WriteError) -> Self {
+//         Error::Io(value.into())
+//     }
+// }
 
-impl From<quinn::ReadError> for Error {
-    fn from(value: quinn::ReadError) -> Self {
-        Error::Io(value.into())
-    }
-}
+// impl From<quinn::ReadError> for Error {
+//     fn from(value: quinn::ReadError) -> Self {
+//         Error::Io(value.into())
+//     }
+// }
 
-impl From<quinn::ClosedStream> for Error {
-    fn from(value: quinn::ClosedStream) -> Self {
-        Error::Io(value.into())
-    }
-}
+// impl From<quinn::ClosedStream> for Error {
+//     fn from(value: quinn::ClosedStream) -> Self {
+//         Error::Io(value.into())
+//     }
+// }
 
 impl From<RusbError> for Error {
     fn from(value: RusbError) -> Self {
@@ -167,14 +168,14 @@ impl vhci::IsoPacketDataMut for UrbWithIsoData<'_> {
 }
 
 #[derive(Debug)]
-pub(crate) struct UrbWithIsoGiveback<'a> {
+pub(crate) struct _UrbWithIsoGiveback<'a> {
     pub handle: vhci::ioctl::UrbHandle,
     pub header: &'a msg::UrbHeader,
     pub transfer: &'a mut [u8],
     pub iso_giveback: &'a mut [vhci::ioctl::IocIsoPacketGiveback],
 }
 
-impl vhci::Urb for UrbWithIsoGiveback<'_> {
+impl vhci::Urb for _UrbWithIsoGiveback<'_> {
     fn kind(&self) -> vhci::ioctl::UrbType {
         self.header.kind
     }
@@ -196,13 +197,13 @@ impl vhci::Urb for UrbWithIsoGiveback<'_> {
     }
 }
 
-impl vhci::TransferMut for UrbWithIsoGiveback<'_> {
+impl vhci::TransferMut for _UrbWithIsoGiveback<'_> {
     fn transfer_mut(&mut self) -> &mut [u8] {
         self.transfer
     }
 }
 
-impl vhci::IsoPacketGivebackMut for UrbWithIsoGiveback<'_> {
+impl vhci::IsoPacketGivebackMut for _UrbWithIsoGiveback<'_> {
     fn iso_packet_giveback_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketGiveback] {
         self.iso_giveback
     }
@@ -227,12 +228,12 @@ impl UsbDevices {
 
 #[derive(Debug)]
 pub struct Session {
-    conn: quinn::Connection,
+    conn: compio::quic::Connection,
     dev: stub::Controller,
 }
 
 impl Session {
-    fn new(conn: quinn::Connection, dev: stub::Controller) -> Self {
+    fn new(conn: compio::quic::Connection, dev: stub::Controller) -> Self {
         Self { conn, dev }
     }
 
@@ -242,8 +243,8 @@ impl Session {
 
     #[tracing::instrument(skip_all, level = "trace")]
     #[must_use]
-    pub async fn accept_stream(&self) -> Result<ServerResp<quinn::SendStream, quinn::RecvStream>> {
-        let (mut tx, mut rx) = self.conn.accept_bi().await?;
+    pub async fn accept_stream(&self) -> Result<ServerResp<SendStream, RecvStream>> {
+        let (mut tx, mut rx) = self.conn.accept_bi().await.unwrap();
         let mut buf = Ring::with_capacity(32);
 
         buf.fill_until(&mut rx, size_of::<msg::ReqFrame>()).await?;
@@ -256,7 +257,6 @@ impl Session {
                     ver: msg::VersionOpt::Some(proto::QUSB_VER),
                 };
                 msg::send_resp(&mut tx, response).await?;
-                tx.close().await?;
                 return Err(Error::Unknown);
             }
             Err(ReadError::BufferShort { .. }) => {
@@ -271,7 +271,6 @@ impl Session {
                 ver: msg::VersionOpt::Some(proto::QUSB_VER),
             };
             msg::send_resp(&mut tx, response).await?;
-            tx.close().await?;
             return Err(Error::VersionMismatch(version));
         }
 
@@ -308,7 +307,6 @@ impl Session {
                         };
 
                         msg::send_resp(&mut tx, response).await?;
-                        tx.close().await?;
                         return Err(ret_err);
                     }
                 };
@@ -339,8 +337,8 @@ impl Session {
         let (tx, mut rx) = self
             .conn
             .open_bi()
-            .await
-            .inspect_err(|err| error!("{err}"))?;
+            .inspect_err(|err| error!("{err}"))
+            .unwrap();
         trace!("established stream with stream id {:?}", tx.id());
         let mut buf = Ring::with_capacity(1024);
 
@@ -380,13 +378,17 @@ impl Session {
     pub async fn req_borrow(
         &self,
         id: msg::UsbDeviceId,
-    ) -> Result<BorrowDevice<quinn::SendStream, quinn::RecvStream>> {
-        let (mut tx, mut rx) = self.conn.open_bi().await.inspect_err(|err| {
-            warn! {
-                %err,
-                "err while opening new request with peer"
-            }
-        })?;
+    ) -> Result<BorrowDevice<SendStream, RecvStream>> {
+        let (mut tx, mut rx) = self
+            .conn
+            .open_bi()
+            .inspect_err(|err| {
+                warn! {
+                    %err,
+                    "err while opening new request with peer"
+                }
+            })
+            .unwrap();
         let mut buf = Ring::with_capacity(1024);
 
         trace!("established stream with stream id {:?}", tx.id());
@@ -441,13 +443,17 @@ impl Session {
     pub async fn req_lend(
         &self,
         id: msg::UsbDeviceId,
-    ) -> Result<LendDevice<quinn::SendStream, quinn::RecvStream>> {
-        let (mut tx, mut rx) = self.conn.open_bi().await.inspect_err(|err| {
-            warn! {
-                %err,
-                "err while opening new request with peer"
-            }
-        })?;
+    ) -> Result<LendDevice<SendStream, RecvStream>> {
+        let (mut tx, mut rx) = self
+            .conn
+            .open_bi()
+            .inspect_err(|err| {
+                warn! {
+                    %err,
+                    "err while opening new request with peer"
+                }
+            })
+            .unwrap();
         let mut buf = Ring::with_capacity(1024);
         trace!("established stream with stream id {:?}", tx.id());
 
@@ -476,7 +482,6 @@ impl Session {
                     kind: err,
                     dev_id: id,
                 };
-                tx.close().await?;
                 return Err(Error::from(err));
             }
         };
@@ -524,29 +529,34 @@ impl Session {
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    endpoint: quinn::Endpoint,
+    endpoint: compio::quic::Endpoint,
     dev: stub::Controller,
 }
 
 impl Client {
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn connect(&self, peer_addr: SocketAddr, peer_name: &str) -> Result<Session> {
-        let conn = self.endpoint.connect(peer_addr, peer_name).unwrap().await?;
-        let conn2 = conn.clone();
-        tokio::task::spawn_local(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = conn2.closed() => {
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        let stats = conn2.stats();
-                        trace!("{stats:?}");
-                    }
-                }
-            }
-        });
+        let conn = self
+            .endpoint
+            .connect(peer_addr, peer_name, None)
+            .unwrap()
+            .await
+            .unwrap();
+        // let conn2 = conn.clone();
+        // compio::runtime::spawn(async move {
+        //     let mut interval = compio::runtime::time::interval(Duration::from_secs(30));
+        //     loop {
+        //         tokio::select! {
+        //             _ = conn2.closed() => {
+        //                 break;
+        //             }
+        //             _ = interval.tick() => {
+        //                 let stats = conn2.stats();
+        //                 trace!("{stats:?}");
+        //             }
+        //         }
+        //     }
+        // });
         Ok(Session::new(conn, self.dev.clone()))
     }
 }
@@ -651,14 +661,14 @@ fn get_usb_devices() -> io::Result<
 
 struct ReqHandler {
     vhci: stub::Controller,
-    incoming: quinn::Incoming,
+    incoming: compio::quic::Incoming,
     cancel_token: CancellationToken,
 }
 
 impl ReqHandler {
     const fn new(
         vhci: stub::Controller,
-        incoming: quinn::Incoming,
+        incoming: compio::quic::Incoming,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
@@ -670,15 +680,21 @@ impl ReqHandler {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn open_session(self) -> Result<()> {
-        let conn = tokio::select! {
-            biased;
-            conn = self.incoming => {
-                conn.inspect_err(|err| warn! { %err })?
-            }
-            _ = self.cancel_token.cancelled() => {
-                return Ok(())
-            }
+        enum Event {
+            Conn(std::result::Result<Connection, ConnectionError>),
+            Cancelled,
+        }
+
+        let connect = async { Event::Conn(self.incoming.await) };
+        let cancel = async {
+            self.cancel_token.cancelled().await;
+            Event::Cancelled
         };
+        let conn = match (connect, cancel).race().await {
+            Event::Conn(connection) => connection.unwrap(),
+            Event::Cancelled => return Ok(()),
+        };
+
         info!(
             "established new session with {} - RTT {:?}",
             conn.remote_address(),
@@ -703,12 +719,11 @@ impl ReqHandler {
     }
 }
 
-pub(crate) type ServerTaskResult =
-    std::result::Result<(NonZeroU64, Result<()>), tokio::task::JoinError>;
+pub(crate) type ServerTaskResult = (NonZeroU64, Result<()>);
 
 #[derive(Debug)]
 pub struct Server {
-    endpoint: quinn::Endpoint,
+    endpoint: compio::quic::Endpoint,
     dev: stub::Controller,
 }
 
@@ -718,60 +733,60 @@ impl Server {
         let cancel_for_handle = CancellationToken::new();
         let cancel_for_serve = cancel_for_handle.clone();
         let fut = async move {
-            let mut set = tokio::task::JoinSet::new();
+            let (task_tx, task_rx) = mpsc::channel(0);
+            let mut task_rx = task_rx.into_stream();
+            let task_tx = task_tx.into_sink();
             info!("Server ready to accept new connections");
 
             enum Event {
-                Incoming(Option<quinn::Incoming>),
-                Cancel,
-                MaybeCompletedTask(Option<ServerTaskResult>),
+                Incoming(compio::quic::Incoming),
+                Cancelled,
+                Task(ServerTaskResult),
             }
 
-            loop {
-                let is_empty = set.is_empty();
-                let event = tokio::select! {
-                    incoming = self.endpoint.accept() => {
-                        Event::Incoming(incoming)
-                    },
-                    _ = cancel_for_serve.cancelled() => {
-                        Event::Cancel
-                    },
-                    maybe_complete = set.join_next(), if !is_empty => {
-                        static ID: AtomicU64 = AtomicU64::new(1);
-                        let id = ID.fetch_add(1, Ordering::Relaxed);
-                        Event::MaybeCompletedTask(
-                            maybe_complete.map(|join| {
-                                join.map(|result| (NonZeroU64::new(id).unwrap(), result))
-                            })
-                        )
-                    }
-                };
+            let incoming = stream::unfold(self.endpoint, |endpoint| async {
+                let incoming = endpoint.wait_incoming().await?;
+                Some((Event::Incoming(incoming), endpoint))
+            });
+            let cancel = stream::once_future(async {
+                cancel_for_serve.cancelled().await;
+                Event::Cancelled
+            });
+            let task = (&mut task_rx).map(Event::Task);
 
+            let mut events = pin!((incoming, cancel, task).merge());
+            while let Some(event) = events.next().await {
                 match event {
-                    Event::Incoming(Some(incoming)) => {
-                        debug!("Incoming connection from {}", incoming.remote_address());
-                        set.spawn_local(
-                            ReqHandler::new(self.dev.clone(), incoming, cancel_for_serve.clone())
-                                .open_session(),
-                        );
+                    Event::Incoming(incoming) => {
+                        debug!("incoming connection from {}", incoming.remote_address());
+                        let handler =
+                            ReqHandler::new(self.dev.clone(), incoming, cancel_for_serve.clone());
+                        let mut task_tx = task_tx.clone();
+                        compio::runtime::spawn(async move {
+                            static ID: AtomicU64 = AtomicU64::new(1);
+                            let id = ID.fetch_add(1, Ordering::Relaxed);
+                            let id = NonZeroU64::new(id).unwrap();
+                            let result = handler.open_session().await;
+                            _ = task_tx.send((id, result)).await;
+                        })
+                        .detach();
                     }
-                    Event::MaybeCompletedTask(Some(Ok((id, Ok(_))))) => {
-                        info!("session {id} completed successfully")
+                    Event::Task((id, Ok(_))) => {
+                        info!("session {id} completed successfully");
                     }
-                    Event::MaybeCompletedTask(Some(Ok((id, Err(cause))))) => {
-                        warn! { %cause, "session {id} failed" }
+                    Event::Task((id, Err(err))) => {
+                        warn! { %err, "session {id} failed" };
                     }
-                    Event::MaybeCompletedTask(Some(Err(cause))) => error! { %cause },
-                    Event::Incoming(None) | Event::Cancel => break,
-                    _ => (),
+                    Event::Cancelled => break,
                 }
             }
 
-            while let Some(result) = set.join_next_with_id().await {
+            cancel_for_serve.cancel();
+            drop(task_tx);
+            while let Some(result) = task_rx.next().await {
                 match result {
-                    Ok((id, Ok(_))) => info!("session {id} completed successfully"),
-                    Ok((id, Err(cause))) => warn! { %cause, "session {id} failed" },
-                    Err(cause) => error! { %cause },
+                    (id, Ok(_)) => info!("session {id} completed successfully"),
+                    (id, Err(cause)) => warn! { %cause, "session {id} failed" },
                 }
             }
 
@@ -779,7 +794,7 @@ impl Server {
         }
         .in_current_span();
 
-        let handle = tokio::task::spawn_local(fut);
+        let handle = compio::runtime::spawn(fut);
         ServerHandle {
             handle,
             cancel_token: cancel_for_handle,
@@ -788,12 +803,12 @@ impl Server {
 }
 
 pub struct ServerHandle {
-    handle: tokio::task::JoinHandle<Result<()>>,
+    handle: compio::runtime::JoinHandle<Result<()>>,
     cancel_token: CancellationToken,
 }
 
 impl ServerHandle {
-    pub async fn shutdown(self) -> std::result::Result<Result<()>, tokio::task::JoinError> {
+    pub async fn shutdown(self) -> std::result::Result<Result<()>, Box<dyn std::any::Any + Send + 'static>> {
         self.cancel_token.cancel();
         self.handle.await
     }
@@ -819,26 +834,19 @@ impl ServerHandle {
 // }
 
 #[tracing::instrument(skip_all, level = "trace")]
-pub fn peer(
+pub async fn peer(
     server_tls: rustls::ServerConfig,
     client_tls: rustls::ClientConfig,
     bind: Option<SocketAddr>,
-    transport: quinn::TransportConfig,
+    transport: compio::quic::TransportConfig,
     num_ports: BoundedU8<1, 32>,
 ) -> (Client, Server) {
-    let server_tls =
-        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_tls).unwrap()));
-    let mut client_tls =
-        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_tls).unwrap()));
-    client_tls.transport_config(Arc::new(transport));
-
-    let mut endpoint = quinn::Endpoint::server(
-        server_tls,
-        bind.unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()),
-    )
-    .unwrap();
-    endpoint.set_default_client_config(client_tls);
-
+    let addr = bind.unwrap_or(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
+    let mut endpoint =
+        compio::quic::ServerBuilder::new_with_rustls_server_config(server_tls).bind(addr).await.unwrap();
+    let mut client_cfg = compio::quic::ClientBuilder::new_with_rustls_client_config(client_tls).build();
+    client_cfg.transport_config(Arc::new(transport));
+    endpoint.default_client_config = Some(client_cfg);
     let dev = stub::Controller::start(num_ports).unwrap();
 
     (

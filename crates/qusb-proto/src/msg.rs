@@ -348,8 +348,7 @@ pub enum Command {
     CmdUnlink = 1,
     CmdPort = 2,
     RetSubmit = 3,
-    RetUnlink = 4,
-    RetPort = 5,
+    RetPort = 4,
 }
 
 /// A Qusb frame header.

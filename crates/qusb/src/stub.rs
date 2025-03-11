@@ -1,13 +1,13 @@
 use futures::SinkExt;
-use futures::StreamExt;
+use futures_concurrency::stream::Merge;
+use futures_lite::StreamExt;
 use std::{
     collections::VecDeque,
     io,
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::oneshot;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 use vhci::{
     ioctl::{Address, UrbHandle},
     usbfs::Request,
@@ -15,7 +15,7 @@ use vhci::{
     DataRate, Port, PortChange, PortStatus,
 };
 
-use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap};
+use crate::utils::{mpsc, oneshot, Ctrl, LinkResult, NoHash, ThreeKeyMap};
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -32,24 +32,41 @@ pub struct Register {
     data_rate: DataRate,
 }
 
-pub type WorkReceiver = Receiver<vhci::ioctl::Work>;
-type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, Sender<vhci::ioctl::Work>>;
-type Receiver<T> = flume::r#async::RecvStream<'static, T>;
-type BlockingSender<T> = flume::Sender<T>;
-type Sender<T> = flume::r#async::SendSink<'static, T>;
+pub type WorkReceiver = mpsc::AsyncReceiver<vhci::ioctl::Work>;
+type Mailer = ThreeKeyMap<Port, NoHash<Address>, UrbHandle, mpsc::AsyncSender<vhci::ioctl::Work>>;
+
+type RegisterResult = (
+    io::Result<Port>,
+    oneshot::Sender<io::Result<RegisterPayload>>,
+);
+
+type DisconnectResult = (io::Result<()>, oneshot::Sender<io::Result<()>>);
+
+enum ControllerResult {
+    Register(RegisterResult),
+    Disconnect(DisconnectResult),
+}
+
+enum Event {
+    Register(Ctrl<Register, RegisterPayload>),
+    GivebackUrb(UrbHandle),
+    Disconnect(Ctrl<Port>),
+    Work(vhci::ioctl::IocWork),
+    Controller(ControllerResult),
+}
 
 struct Demuxer {
-    register_rx: Receiver<Ctrl<Register, RegisterPayload>>,
-    giveback_rx: Receiver<UrbHandle>,
-    disconnect_rx: Receiver<Ctrl<Port>>,
+    register_rx: mpsc::AsyncReceiver<Ctrl<Register, RegisterPayload>>,
+    giveback_rx: mpsc::AsyncReceiver<UrbHandle>,
+    disconnect_rx: mpsc::AsyncReceiver<Ctrl<Port>>,
     vhci: vhci::Controller,
 }
 
 impl Demuxer {
     fn new(
-        register_rx: Receiver<Ctrl<Register, RegisterPayload>>,
-        giveback_rx: Receiver<UrbHandle>,
-        disconnect_rx: Receiver<Ctrl<Port>>,
+        register_rx: mpsc::AsyncReceiver<Ctrl<Register, RegisterPayload>>,
+        giveback_rx: mpsc::AsyncReceiver<UrbHandle>,
+        disconnect_rx: mpsc::AsyncReceiver<Ctrl<Port>>,
         vhci: vhci::Controller,
     ) -> Self {
         Self {
@@ -61,130 +78,79 @@ impl Demuxer {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn demux_vhci(self) -> io::Result<()> {
+    async fn demux(self) {
         let Self {
-            mut register_rx,
-            mut giveback_rx,
-            mut disconnect_rx,
+            register_rx,
+            giveback_rx,
+            disconnect_rx,
             mut vhci,
         } = self;
 
-        let register_queue = Mutex::new(VecDeque::new());
-        let mailer = Mutex::new(Mailer::with_capacities(8, 8, 10, 1024));
-        let (work_tx, work_rx) = flume::bounded(0);
-        let mut work_rx = work_rx.into_stream();
-        let work_receiver = vhci.work_receiver().unwrap();
-        let handle = std::thread::spawn(move || recv_work(work_receiver, work_tx));
+        let mut register_queue: VecDeque<Port> = VecDeque::new();
+        let mut mailer = Mailer::with_capacities(8, 8, 10, 1024);
+        let (work_tx, work_rx) = mpsc::channel(32);
+        let work_rx: mpsc::AsyncReceiver<vhci::ioctl::IocWork> = work_rx.into_stream();
+        let vhci_work_rx = vhci.work_receiver().unwrap();
+        let vhci = Arc::new(Mutex::new(vhci));
+        let (controller_tx, controller_rx) = mpsc::channel::<ControllerResult>(0);
 
-        struct Context {
-            vhci: Mutex<vhci::Controller>,
-            mailer: Mutex<Mailer>,
-            register_queue: Mutex<VecDeque<Port>>,
-        }
+        let reg = register_rx.map(Event::Register);
+        let giveback = giveback_rx.map(Event::GivebackUrb);
+        let disconnect = disconnect_rx.map(Event::Disconnect);
+        let work = work_rx.map(Event::Work);
+        let controller = controller_rx.into_stream().map(Event::Controller);
 
-        type RegisterResult = (
-            io::Result<Port>,
-            oneshot::Sender<io::Result<RegisterPayload>>,
-        );
-
-        type DisconnectResult = (io::Result<()>, oneshot::Sender<io::Result<()>>);
-
-        enum Continuation {
-            Register(RegisterResult),
-            Disconnect(DisconnectResult),
-        }
-
-        enum Event {
-            Register(Option<Ctrl<Register, RegisterPayload>>),
-            GivebackUrb(Option<UrbHandle>),
-            Disconnect(Option<Ctrl<Port>>),
-            Work(vhci::ioctl::IocWork),
-            Task(Option<Result<Continuation, tokio::task::JoinError>>),
-        }
-
-        let ctx = Arc::new(Context {
-            vhci: Mutex::new(vhci),
-            mailer,
-            register_queue,
-        });
-
-        let mut set = tokio::task::JoinSet::new();
-
-        loop {
-            let events_in_progress = !set.is_empty();
-            let event = tokio::select! {
-                req = register_rx.next() => {
-                    Event::Register(req)
-                }
-                handle = giveback_rx.next() => {
-                    Event::GivebackUrb(handle)
-                }
-                req = disconnect_rx.next() => {
-                    Event::Disconnect(req)
-                }
-                new_work = work_rx.next() => {
-                    Event::Work(new_work.expect("we can only get here if we shutdown in the wrong order"))
-                }
-                task = set.join_next(), if events_in_progress => {
-                    Event::Task(task)
-                }
-            };
+        let mut events = (reg, giveback, disconnect, work, controller).merge();
+        let handle = compio::runtime::spawn_blocking(move || recv_work(vhci_work_rx, work_tx));
+        while let Some(event) = events.next().await {
             match event {
-                Event::Register(Some(Ctrl {
+                Event::Register(Ctrl {
                     data:
                         Register {
                             port: RegisterPort::Any,
                             data_rate,
                         },
                     tx,
-                })) => {
-                    let ctx = Arc::clone(&ctx);
-                    set.spawn_blocking(move || {
-                        Continuation::Register((
-                            ctx.vhci.lock().unwrap().port_connect_any(data_rate),
-                            tx,
-                        ))
-                    });
+                }) => {
+                    let vhci = Arc::clone(&vhci);
+                    let controller_tx = controller_tx.clone();
+                    compio::runtime::spawn_blocking(move || {
+                        let result = vhci.lock().unwrap().port_connect_any(data_rate);
+                        let msg = ControllerResult::Register((result, tx));
+                        _ = controller_tx.send(msg);
+                    })
+                    .detach();
                 }
-                Event::Register(Some(Ctrl {
+                Event::Register(Ctrl {
                     data:
                         Register {
                             port: RegisterPort::Port(port),
                             data_rate,
                         },
                     tx,
-                })) => {
-                    let ctx = Arc::clone(&ctx);
-                    set.spawn_blocking(move || {
-                        Continuation::Register((
-                            ctx.vhci
-                                .lock()
-                                .unwrap()
-                                .port_connect(port, data_rate)
-                                .map(|_| port),
-                            tx,
-                        ))
-                    });
+                }) => {
+                    let vhci = Arc::clone(&vhci);
+                    let controller_tx = controller_tx.clone();
+                    compio::runtime::spawn_blocking(move || {
+                        let result = vhci.lock().unwrap().port_connect(port, data_rate);
+                        let result = result.map(|_| port);
+                        let msg = ControllerResult::Register((result, tx));
+                        _ = controller_tx.send(msg);
+                    })
+                    .detach();
                 }
-                Event::GivebackUrb(Some(handle)) => {
-                    _ = ctx.mailer.lock().unwrap().remove_by_key3(&handle);
+                Event::GivebackUrb(handle) => {
+                    _ = mailer.remove_by_key3(&handle);
                 }
-                Event::Disconnect(Some(Ctrl { data: port, tx })) => {
-                    let ctx = Arc::clone(&ctx);
-                    set.spawn_blocking(move || {
-                        {
-                            let mut mailer = ctx.mailer.lock().unwrap();
-                            mailer.unlink_all_but_key1(&port);
-                            mailer.remove_by_key1(&port);
-                        }
-                        let mut queue = ctx.register_queue.lock().unwrap();
-                        if let Some(index) = queue.iter().position(|queue_port| port == *queue_port)
-                        {
-                            queue.remove(index);
-                        }
-                        let result = (ctx.vhci.lock().unwrap().port_disconnect(port), tx);
-                        Continuation::Disconnect(result)
-                    });
+                Event::Disconnect(Ctrl { data: port, tx }) => {
+                    let vhci = Arc::clone(&vhci);
+                    let controller_tx = controller_tx.clone();
+                    compio::runtime::spawn_blocking(move || {
+                        let result = vhci.lock().unwrap().port_disconnect(port);
+                        let msg = ControllerResult::Disconnect((result, tx));
+                        _ = controller_tx.send(msg);
+                    })
+                    .detach();
                 }
                 Event::Work(ioc_work) => {
                     // SAFETY: Per the function's safety contract,
@@ -192,8 +158,7 @@ impl Demuxer {
                     //         ioctl call.
                     let work = unsafe { ioc_work.into_inner() };
                     let tx = {
-                        let mut queue = ctx.register_queue.lock().unwrap();
-                        let mut mailer = ctx.mailer.lock().unwrap();
+                        let queue = &mut register_queue;
                         match work {
                             vhci::ioctl::Work::PortStat(ref stat) => {
                                 if stat.change().contains(PortChange::RESET)
@@ -265,9 +230,8 @@ impl Demuxer {
                         trace!("received work item that belonged to no port: {work:?}");
                     }
                 }
-                Event::Task(Some(Ok(Continuation::Register((Ok(port), tx))))) => {
-                    let (work_tx, work_rx) = flume::bounded(32);
-                    let mut mailer = ctx.mailer.lock().unwrap();
+                Event::Controller(ControllerResult::Register((Ok(port), tx))) => {
+                    let (work_tx, work_rx) = mpsc::channel(32);
                     assert!(
                         mailer.insert_by_key1(port, work_tx.into_sink()).is_none(),
                         "{port:?}"
@@ -276,60 +240,57 @@ impl Demuxer {
                         mailer.remove_by_key1(&port);
                     }
                 }
-                Event::Task(Some(Ok(Continuation::Register((Err(err), tx))))) => {
+                Event::Controller(ControllerResult::Register((Err(err), tx))) => {
                     _ = tx.send(Err(err));
                 }
-                Event::Task(Some(Ok(Continuation::Disconnect((result, tx))))) => {
+                Event::Controller(ControllerResult::Disconnect((result, tx))) => {
                     _ = tx.send(result);
                 }
-                Event::Task(Some(Err(_err))) => todo!(),
-                Event::Register(None) | Event::Disconnect(None) | Event::GivebackUrb(None) => break,
-                Event::Task(None) => (),
-            };
+            }
         }
 
         info!("disconnecting leftover devices and closing work_rx");
-        ctx.mailer.lock().unwrap().key1_iter().for_each(|port| {
-            let mut vhci = ctx.vhci.lock().unwrap();
+        mailer.key1_iter().for_each(|port| {
+            let mut vhci = vhci.lock().unwrap();
             if let Err(err) = vhci.port_disconnect(*port) {
                 warn!("error while disconnecting vhci device: {err}");
             }
         });
-        // work_rx.close();
-        // while (work_rx.recv().await).is_ok() {}
-        drop(work_rx);
 
         info!("waiting on recv_work thread");
-        let waiter = || handle.join().expect("recv thread should not panic");
-        _ = tokio::task::spawn_blocking(waiter).await;
-        Ok(())
+        drop(events);
+        match handle.await {
+            Ok(Err(err)) => warn!(%err, "vhci_recv_work thread failed"),
+            Err(err) => error!("vhci_recv_work thread panicked?? {err:?}"),
+            _ => (),
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    handle: Option<Arc<tokio::task::JoinHandle<io::Result<()>>>>,
-    register_tx: Sender<Ctrl<Register, (Port, WorkReceiver)>>,
-    giveback_tx: Sender<UrbHandle>,
-    disconnect_tx: Sender<Ctrl<Port>>,
+    handle: Option<Arc<compio::runtime::JoinHandle<()>>>,
+    register_tx: mpsc::AsyncSender<Ctrl<Register, (Port, WorkReceiver)>>,
+    giveback_tx: mpsc::AsyncSender<UrbHandle>,
+    disconnect_tx: mpsc::AsyncSender<Ctrl<Port>>,
     remote: vhci::Remote,
 }
 
 impl Controller {
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
-        let (register_tx, register_rx) = flume::bounded(0);
-        let (giveback_tx, giveback_rx) = flume::bounded(0);
-        let (disconnect_tx, disconnect_rx) = flume::bounded(0);
+        let (register_tx, register_rx) = mpsc::channel(0);
+        let (giveback_tx, giveback_rx) = mpsc::channel(512);
+        let (disconnect_tx, disconnect_rx) = mpsc::channel(0);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
-        let handle = Some(Arc::new(tokio::task::spawn(
+        let handle = Some(Arc::new(compio::runtime::spawn(
             Demuxer::new(
                 register_rx.into_stream(),
                 giveback_rx.into_stream(),
                 disconnect_rx.into_stream(),
                 vhci,
             )
-            .demux_vhci(),
+            .demux(),
         )));
 
         Ok(Self {
@@ -396,14 +357,7 @@ impl Drop for Controller {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take().and_then(Arc::into_inner) {
             info!("about to wait for vhci controller handle");
-            let rt = tokio::runtime::Handle::current();
-            rt.spawn(async move {
-                match handle.await {
-                    Ok(Ok(_)) => trace!("controller thread finished with no issues"),
-                    Ok(Err(_err)) => unimplemented!("i/o error? {_err}"),
-                    Err(_err) => unimplemented!("thread panicked? {_err}"),
-                }
-            });
+            handle.detach();
         }
     }
 }
@@ -411,7 +365,7 @@ impl Drop for Controller {
 #[derive(Debug, Clone)]
 pub struct VhciRemote {
     remote: vhci::Remote,
-    giveback_tx: Sender<UrbHandle>,
+    giveback_tx: mpsc::AsyncSender<UrbHandle>,
 }
 
 impl VhciRemote {
@@ -426,11 +380,14 @@ impl VhciRemote {
     #[inline]
     pub async fn giveback_urb<T>(&mut self, urb: T) -> io::Result<()>
     where
-        T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + 'static,
+        T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + Sync + 'static,
     {
         _ = self.giveback_tx.send(urb.handle()).await;
         let remote = self.remote.clone();
-        tokio::task::spawn_blocking(move || remote.giveback(urb));
+        compio::runtime::spawn_blocking(move || {
+            _ = remote.giveback(urb);
+        })
+        .detach();
         Ok(())
     }
 
@@ -443,7 +400,7 @@ impl VhciRemote {
 #[tracing::instrument(level = "trace", skip_all)]
 fn recv_work(
     work_rx: vhci::WorkReceiver,
-    work_tx: BlockingSender<vhci::ioctl::IocWork>,
+    work_tx: mpsc::Sender<vhci::ioctl::IocWork>,
 ) -> io::Result<()> {
     if work_tx.is_disconnected() {
         info!("done with receiving work for vhci");
@@ -452,7 +409,9 @@ fn recv_work(
 
     const TIMEOUT: TimeoutMillis = TimeoutMillis::Time(BoundedI16::new(999).unwrap());
     while (match work_rx.fetch_work_timeout(TIMEOUT) {
-        Ok(work) => work_tx.send(work).ok(),
+        Ok(work) => {
+            work_tx.send(work).ok()
+        },
         Err(err)
             if err.kind() == io::ErrorKind::TimedOut
                 || err.kind() == io::ErrorKind::Interrupted
@@ -476,16 +435,9 @@ mod tests {
     // use tracing::{debug, warn};
     // use vhci::{libc, PortChange, PortFlag, PortStatus};
 
-    use super::*;
-    use std::{thread, time::Duration};
+    // use super::*;
+    // use std::{thread, time::Duration};
     // use std::time::Instant;
-
-    #[tokio::test]
-    async fn controller_idles() {
-        let _controller = Controller::start(BoundedU8::new(3).unwrap()).unwrap();
-
-        thread::sleep(Duration::from_millis(500));
-    }
 
     // #[tokio::test]
     // #[tracing_test::traced_test]

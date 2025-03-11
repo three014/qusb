@@ -4,14 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quinn = { version = "0.11.6" }
 thiserror = "2.0.3"
-tokio = { version = "1.41.1", default-features = false, features = [
-    "io-util",
-    "sync",
-    "macros",
-    "rt",
-] }
 proto = { package = "qusb-proto", path = "../qusb-proto" }
 nohash-hasher = "0.2.0"
 rand = "0.8.5"
@@ -23,18 +16,20 @@ bytes = "1.9.0"
 zerocopy = "0.8.13"
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4" }
 fxhash = "0.2.1"
-rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.3.6" }
-tokio-timerfd = "0.2.0"
+rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.3.7", features = ["runtime-compio"] }
 futures = { version = "0.3.31", default-features = false }
 flume = { version = "0.11.1", default-features = false, features = ["async"] }
+compio = { version = "0.13.2", features = ["quic", "rustls", "ring", "io"] }
+futures-lite = { version = "2.6.0", default-features = false }
+futures-concurrency = { version = "7.6.3", default-features = false, features = ["alloc"] }
+rustls = { version = "0.23.23", features = ["ring"] }
 
 [dev-dependencies]
 tracing-test = { version = "0.2.5" }
 tracing-subscriber = "0.3.19"
 rcgen = "0.13.2"
-tokio = { version = "1.41.1", default-features = false, features = [
-    "sync",
-    "rt",
-    "rt-multi-thread",
-    "signal",
-] }
+rustls = "0.23.23"
+compio = { version = "0.13.2", features = ["quic", "rustls", "ring", "signal", "macros"] }
+
+[[example]]
+name = "borrow_self"

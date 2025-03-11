@@ -7,12 +7,63 @@ use std::{
     borrow::Borrow,
     collections::HashMap,
     fmt::Debug,
-    future::Future,
     hash::Hash,
-    io,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+
+pub mod mpsc {
+    pub type AsyncSender<T> = flume::r#async::SendSink<'static, T>;
+    pub type AsyncReceiver<T> = flume::r#async::RecvStream<'static, T>;
+    pub type Sender<T> = flume::Sender<T>;
+    pub type Receiver<T> = flume::Receiver<T>;
+
+    pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        flume::bounded(capacity)
+    }
+}
+
+pub mod oneshot {
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use futures_lite::FutureExt;
+
+    pub struct Sender<T> {
+        inner: flume::Sender<T>,
+    }
+
+    impl<T> Sender<T> {
+        #[inline]
+        pub fn send(self, item: T) -> Result<(), flume::SendError<T>> {
+            self.inner.send(item)
+        }
+    }
+
+    pub struct AsyncReceiver<T: 'static> {
+        inner: flume::r#async::RecvFut<'static, T>,
+    }
+
+    impl<T> Future for AsyncReceiver<T> {
+        type Output = Result<T, flume::RecvError>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.inner.poll(cx)
+        }
+    }
+
+    pub fn channel_async<T>() -> (Sender<T>, AsyncReceiver<T>) {
+        let (tx, rx) = flume::bounded(1);
+        (
+            Sender { inner: tx },
+            AsyncReceiver {
+                inner: rx.into_recv_async(),
+            },
+        )
+    }
+}
 
 pub struct Counter {
     inner: u32,
@@ -458,7 +509,7 @@ pub type SimpleMap<K, V> = HashMap<K, V, FxBuildHasher>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NoHash<T>(pub T);
 impl<T: Copy> Copy for NoHash<T> {}
-impl IsEnabled for NoHash<quinn::StreamId> {}
+// impl IsEnabled for NoHash<quinn::StreamId> {}
 impl IsEnabled for NoHash<vhci::ioctl::Address> {}
 
 pub struct Ctrl<S, R = (), E = std::io::Error> {
@@ -467,22 +518,10 @@ pub struct Ctrl<S, R = (), E = std::io::Error> {
 }
 
 impl<S, R, E> Ctrl<S, R, E> {
-    pub(crate) fn new(data: S) -> (oneshot::Receiver<Result<R, E>>, Ctrl<S, R, E>) {
-        let (tx, rx) = oneshot::channel();
+    pub(crate) fn new(data: S) -> (oneshot::AsyncReceiver<Result<R, E>>, Ctrl<S, R, E>) {
+        let (tx, rx) = oneshot::channel_async();
         let ctrl = Self { data, tx };
         (rx, ctrl)
-    }
-}
-
-pub trait CloseStream {
-    fn close(&mut self) -> impl Future<Output = io::Result<()>> + Send;
-}
-
-impl CloseStream for quinn::SendStream {
-    async fn close(&mut self) -> io::Result<()> {
-        self.finish().map_err(io::Error::from)?;
-        self.stopped().await.map_err(io::Error::from)?;
-        Ok(())
     }
 }
 
@@ -588,7 +627,6 @@ impl Timer {
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc;
     use vhci::{
         ioctl::{Address, UrbHandle},
         Port,
@@ -596,7 +634,7 @@ mod tests {
 
     use super::*;
 
-    type Mailer = ThreeKeyMap<Port, NoHash<Addr>, UrbHandle, mpsc::Sender<vhci::ioctl::IocWork>>;
+    type Mailer = ThreeKeyMap<Port, NoHash<Addr>, UrbHandle, mpsc::AsyncSender<vhci::ioctl::IocWork>>;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct Addr(Address);
@@ -611,8 +649,8 @@ mod tests {
     fn remove_last_tx_works() {
         let mut mailer = Mailer::with_capacities(8, 8, 10, 64);
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(20);
-        mailer.insert_by_key1(Port::new(1).unwrap(), tx);
+        let (tx, _rx) = mpsc::channel(20);
+        mailer.insert_by_key1(Port::new(1).unwrap(), tx.into_sink());
         mailer.remove_by_key1(&Port::new(1).unwrap());
 
         assert!(mailer.is_empty());
@@ -622,11 +660,11 @@ mod tests {
     fn remove_tx_works() {
         let mut mailer = Mailer::with_capacities(4, 4, 6, 32);
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(20);
-        mailer.insert_by_key1(Port::new(1).unwrap(), tx);
+        let (tx, _rx) = mpsc::channel(20);
+        mailer.insert_by_key1(Port::new(1).unwrap(), tx.into_sink());
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(20);
-        mailer.insert_by_key1(Port::new(5).unwrap(), tx);
+        let (tx, _rx) = mpsc::channel(20);
+        mailer.insert_by_key1(Port::new(5).unwrap(), tx.into_sink());
 
         mailer.remove_by_key1(&Port::new(1).unwrap());
         let index = mailer.key1_map.get(&Port::new(5).unwrap()).unwrap();

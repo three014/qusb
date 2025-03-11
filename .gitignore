@@ -7,3 +7,4 @@ sandbox/
 *perf*
 *.key
 *.pem
+RUN_TEST
