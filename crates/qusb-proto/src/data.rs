@@ -1,10 +1,10 @@
 use std::fmt::Debug;
 use std::{io, marker::PhantomData};
 
-use bytes::Buf as _;
+use bytes::{Buf as _, BufMut};
 
 use bytes::BytesMut;
-use compio_buf::BufResult;
+use compio_buf::{BufResult, IoBuf, IoBufMut, SetBufInit};
 use compio_io::AsyncRead;
 use thiserror::Error;
 
@@ -209,6 +209,71 @@ impl Buf {
 }
 
 #[derive(Debug)]
+#[repr(transparent)]
+struct BufWrapper(BytesMut);
+
+unsafe impl BufMut for BufWrapper {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        let buf = &self.0;
+        buf.capacity() - buf.len()
+    }
+
+    #[inline(always)]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.0.advance_mut(cnt);
+    }
+
+    #[inline(always)]
+    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        self.0.chunk_mut()
+    }
+
+    #[inline(always)]
+    fn put<T: bytes::buf::Buf>(&mut self, src: T)
+        where
+            Self: Sized, {
+        self.0.put(src);
+    }
+
+    #[inline(always)]
+    fn put_slice(&mut self, src: &[u8]) {
+        self.0.put_slice(src);
+    }
+
+    #[inline(always)]
+    fn put_bytes(&mut self, val: u8, cnt: usize) {
+        self.0.put_bytes(val, cnt);
+    }
+}
+
+unsafe impl IoBuf for BufWrapper {
+    fn as_buf_ptr(&self) -> *const u8 {
+        self.0.as_buf_ptr()
+    }
+
+    fn buf_len(&self) -> usize {
+        self.0.buf_len()
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.0.buf_capacity()
+    }
+}
+
+impl SetBufInit for BufWrapper {
+    unsafe fn set_buf_init(&mut self, len: usize) {
+        self.0.set_buf_init(len);
+    }
+}
+
+unsafe impl IoBufMut for BufWrapper {
+    fn as_buf_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_buf_mut_ptr()
+    }
+}
+
+#[derive(Debug)]
 pub struct Ring {
     buf: Buf,
 }
@@ -247,8 +312,8 @@ impl Ring {
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let len = T::get_slice_len(&self.buf.as_ref()).map_err(ReadError::from)?;
-        T::try_ref_from_prefix_with_elems(&self.buf.as_ref(), len)
+        let len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
+        T::try_ref_from_prefix_with_elems(self.buf.as_ref(), len)
             .map_err(|_| ReadError::CorruptedData)
             .map(|(item, _)| item)
     }
@@ -271,7 +336,7 @@ impl Ring {
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let len = T::get_slice_len(&self.buf.as_ref()).map_err(ReadError::from)?;
+        let len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
         T::try_mut_from_prefix_with_elems(self.buf.as_mut(), len)
             .map_err(|_| ReadError::CorruptedData)
             .map(|(item, _)| item)
@@ -384,7 +449,7 @@ impl Ring {
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
         IterDst {
-            buf: &self.buf.as_ref(),
+            buf: self.buf.as_ref(),
             _p: PhantomData,
         }
     }
@@ -441,11 +506,11 @@ impl Ring {
         R: AsyncRead + Unpin,
     {
         self.buf
-            .with_owned_async(|buf: BytesMut| async move {
-                // println!("before read: buf.len() = {}, buf.capacity() = {}", buf.len(), buf.capacity());
-                let BufResult(result, buf) = rx.read(buf).await;
-                // println!("after read: buf.len() = {}, buf.capacity() = {}", buf.len(), buf.capacity());
-                (buf, result)
+            .with_owned_async(|mut buf: BytesMut| async move {
+                let mut start = buf.split();
+                let BufResult(result, end) = rx.read(BufWrapper(buf)).await;
+                start.unsplit(end.0);
+                (start, result)
             })
             .await
     }
@@ -483,11 +548,11 @@ impl Ring {
         R: AsyncRead + Unpin,
     {
         const EXTRA: usize = 16 << 10;
-        const SPACE: usize = 64;
         while num_bytes > self.len() {
             let is_full = {
                 let buf = self.buf.as_ref();
-                buf.capacity() < buf.len() + SPACE
+                let len = buf.len();
+                buf.capacity() < len + num_bytes
             };
             if is_full {
                 self.reserve(EXTRA);

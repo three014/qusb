@@ -7,3 +7,13 @@ inherits = "release"
 debug = true
 lto = "fat"
 incremental = true
+
+[profile.release2]
+inherits = "release"
+opt-level = 3
+debug = false
+strip = true
+lto = true
+codegen-units = 1
+incremental = false
+panic = "abort"

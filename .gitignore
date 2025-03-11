@@ -8,3 +8,4 @@ sandbox/
 *.key
 *.pem
 RUN_TEST
+*dhat*

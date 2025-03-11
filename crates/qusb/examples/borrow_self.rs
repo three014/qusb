@@ -6,15 +6,21 @@ use std::{
 };
 
 use futures_concurrency::future::Race;
+use mimalloc::MiMalloc;
 use proto::msg;
 use qusb::BoundedU8;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[compio::main]
 async fn main() {
-    rustls::crypto::ring::default_provider().install_default().unwrap();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
     let log_path = "borrow_self_dev.log";
     let log_file = std::fs::File::options()
         .create(true)
@@ -24,7 +30,11 @@ async fn main() {
         .open(log_path)
         .unwrap();
     _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::builder().parse("none,borrow_self=info,qusb=trace").unwrap())
+        .with_env_filter(
+            EnvFilter::builder()
+                .parse("none,borrow_self=info,qusb=trace")
+                .unwrap(),
+        )
         .with_writer(Mutex::new(BufWriter::with_capacity(64, log_file)))
         .try_init();
 

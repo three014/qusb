@@ -136,7 +136,7 @@ pub struct ReqFrame {
 }
 
 impl ReqFrame {
-    fn to_bytes(&self) -> [u8; size_of::<ReqFrame>()] {
+    fn to_bytes(self) -> [u8; size_of::<ReqFrame>()] {
         let mut bytes = [0; size_of::<ReqFrame>()];
         bytes.copy_from_slice(self.as_bytes());
         bytes
@@ -178,7 +178,7 @@ pub enum Resp {
 }
 
 impl Resp {
-    fn to_bytes(&self) -> [u8; size_of::<Resp>()] {
+    fn to_bytes(self) -> [u8; size_of::<Resp>()] {
         let mut bytes = [0; size_of::<Resp>()];
         bytes.copy_from_slice(self.as_bytes());
         bytes

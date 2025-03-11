@@ -37,7 +37,7 @@ use zerocopy::{transmute, FromBytes, IntoBytes};
 
 use crate::{
     stub::{self, RegisterPort},
-    utils::{align_to_usize, mpsc, Counter, SimpleMap},
+    utils::{align_to_usize, metrics, mpsc, Counter, SimpleMap},
     Error, Result, UrbWithIsoData,
 };
 
@@ -61,7 +61,6 @@ async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Resu
             Ok(frame) => break frame,
             Err(ReadError::CorruptedData) => Err(io::Error::other("corrupted data from peer"))?,
             Err(ReadError::BufferShort { num_bytes_needed }) => {
-                trace!("need {num_bytes_needed} more bytes before I have a new frame; currently have {} bytes in buffer", buf.len());
                 buf.len() + num_bytes_needed
             }
         };
@@ -878,7 +877,7 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
     }
 
     pub fn reserve(&mut self, num_bytes: usize) -> UsbMemMut {
-        assert!(num_bytes <= DMA_LEN, "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {DMA_LEN} bytes)");
+        debug_assert!(num_bytes <= DMA_LEN, "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {DMA_LEN} bytes)");
         let queue = &mut self.queue;
         for _ in 0..queue.len() {
             let dma = queue.front_mut().unwrap();
@@ -952,10 +951,10 @@ fn convert_libusb_to_vhci(
     }
 }
 
-#[inline]
+#[inline(always)]
 fn write_transfer(src: &[u8], dst: &mut [u8]) {
-    let src = <[u64]>::ref_from_bytes(src).unwrap();
-    let dst = <[u64]>::mut_from_bytes(dst).unwrap();
+    // let src = <[u64]>::ref_from_bytes(src).unwrap();
+    // let dst = <[u64]>::mut_from_bytes(dst).unwrap();
     dst.copy_from_slice(src);
 }
 
@@ -1079,8 +1078,8 @@ where
         buf_rx.reserve(BUF_LEN);
         let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
         let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
-        let cached_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> = Rc::default();
-        let cached_small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
+        let iso_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> = Rc::default();
+        let small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
 
         // ---- Event Receivers ----
         const TICK: Duration = Duration::from_micros(50);
@@ -1127,10 +1126,11 @@ where
         let mut num_active_transfers = 0;
         let mut max_completed_transfers_before_flush = 0;
         let mut num_transfers_completed = 0;
-        let mut last_few_setup_times = VecDeque::with_capacity(THRESHOLD);
         let mut min_setup_time = Duration::MAX;
         let mut max_setup_time = Duration::ZERO;
-        const THRESHOLD: usize = 32;
+        const THRESHOLD: usize = 64;
+        let mut last_few_setup_times =
+            metrics::RollingAvg::<THRESHOLD, metrics::Duration>::preallocated();
 
         let mut main = main_events.next();
 
@@ -1220,7 +1220,7 @@ where
                             .unwrap();
 
                             let transfer = get_or_alloc_transfer(
-                                cached_transfers.borrow_mut(),
+                                iso_transfers.borrow_mut(),
                                 urb.iso_packet_count,
                             );
                             let endpoint = urb.endpoint;
@@ -1236,7 +1236,7 @@ where
                                 )
                             };
 
-                            let cache = cached_transfers.clone();
+                            let cache = iso_transfers.clone();
                             let iso_tx = iso_tx.clone();
                             compio::runtime::spawn(async move {
                                 let result = transfer.submit(&cancel).await;
@@ -1290,10 +1290,7 @@ where
                             })
                             .detach();
                             let elapsed = start.elapsed();
-                            if last_few_setup_times.len() > THRESHOLD {
-                                last_few_setup_times.pop_front();
-                            }
-                            last_few_setup_times.push_back(elapsed);
+                            last_few_setup_times.push(elapsed);
                             min_setup_time = std::cmp::min(min_setup_time, elapsed);
                             max_setup_time = std::cmp::max(max_setup_time, elapsed);
                         }
@@ -1310,14 +1307,14 @@ where
 
                             let buf = buf.split_to(urb.actual_transfer_len as usize);
                             let transfer =
-                                get_or_alloc_transfer_no_iso(cached_small_transfers.borrow_mut());
+                                get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
                             let endpoint = urb.endpoint;
                             let interval = urb.interval;
 
                             // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
                             let transfer = unsafe { transfer.into_int(&device, endpoint.0, buf) };
 
-                            let cache = cached_small_transfers.clone();
+                            let cache = small_transfers.clone();
                             let int_tx = int_tx.clone();
                             compio::runtime::spawn(async move {
                                 let result = transfer.submit(&cancel).await;
@@ -1345,10 +1342,7 @@ where
                             })
                             .detach();
                             let elapsed = start.elapsed();
-                            if last_few_setup_times.len() > THRESHOLD {
-                                last_few_setup_times.pop_front();
-                            }
-                            last_few_setup_times.push_back(elapsed);
+                            last_few_setup_times.push(elapsed);
                             min_setup_time = std::cmp::min(min_setup_time, elapsed);
                             max_setup_time = std::cmp::max(max_setup_time, elapsed);
                         }
@@ -1368,12 +1362,9 @@ where
                                 })
                                 .detach();
                                 let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
+                                last_few_setup_times.push(elapsed);
                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                                last_few_setup_times.push_back(elapsed);
                             }
                             lend::CtrlKind::Blocking(lend::blocking::CtrlReq::SetConfig {
                                 desired,
@@ -1390,10 +1381,7 @@ where
                                 })
                                 .detach();
                                 let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
-                                last_few_setup_times.push_back(elapsed);
+                                last_few_setup_times.push(elapsed);
                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             }
@@ -1411,10 +1399,7 @@ where
                                 })
                                 .detach();
                                 let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
-                                last_few_setup_times.push_back(elapsed);
+                                last_few_setup_times.push(elapsed);
                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             }
@@ -1440,9 +1425,8 @@ where
                                 }
 
                                 let buf = buf.split_to(actual_transfer_len + size_of_pkt);
-                                let transfer = get_or_alloc_transfer_no_iso(
-                                    cached_small_transfers.borrow_mut(),
-                                );
+                                let transfer =
+                                    get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
 
                                 // SAFETY: Transfer buffer is exactly the length needed for
                                 // a control transfer, and matches w_length + 8.
@@ -1450,7 +1434,7 @@ where
                                     transfer.into_ctrl(&device, buf, Duration::from_millis(900))
                                 };
 
-                                let cache = cached_small_transfers.clone();
+                                let cache = small_transfers.clone();
                                 let ctrl_tx = ctrl_tx.clone();
                                 compio::runtime::spawn(async move {
                                     let result = transfer.submit(&cancel).await;
@@ -1484,10 +1468,7 @@ where
                                 })
                                 .detach();
                                 let elapsed = start.elapsed();
-                                if last_few_setup_times.len() > THRESHOLD {
-                                    last_few_setup_times.pop_front();
-                                }
-                                last_few_setup_times.push_back(elapsed);
+                                last_few_setup_times.push(elapsed);
                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             }
@@ -1503,7 +1484,7 @@ where
 
                             let buf = buf.split_to(urb.actual_transfer_len as usize);
                             let transfer =
-                                get_or_alloc_transfer_no_iso(cached_small_transfers.borrow_mut());
+                                get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
                             let endpoint = urb.endpoint;
 
                             // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
@@ -1511,7 +1492,7 @@ where
                                 transfer.into_bulk(&device, endpoint.0, TransferFlags::NONE, buf)
                             };
 
-                            let cache = cached_small_transfers.clone();
+                            let cache = small_transfers.clone();
                             let bulk_tx = bulk_tx.clone();
                             compio::runtime::spawn(async move {
                                 let result = transfer.submit(&cancel).await;
@@ -1538,10 +1519,7 @@ where
                             })
                             .detach();
                             let elapsed = start.elapsed();
-                            if last_few_setup_times.len() > THRESHOLD {
-                                last_few_setup_times.pop_front();
-                            }
-                            last_few_setup_times.push_back(elapsed);
+                            last_few_setup_times.push(elapsed);
                             min_setup_time = std::cmp::min(min_setup_time, elapsed);
                             max_setup_time = std::cmp::max(max_setup_time, elapsed);
                         }
@@ -2042,26 +2020,15 @@ where
             dev_id.bus_number,
             dev_id.device_addr
         );
-        while let Some(_) = blocking_rx.next().await {}
-        while let Some(_) = iso_rx.next().await {}
-        while let Some(_) = int_rx.next().await {}
-        while let Some(_) = ctrl_rx.next().await {}
-        while let Some(_) = bulk_rx.next().await {}
+        while blocking_rx.next().await.is_some() {}
+        while iso_rx.next().await.is_some() {}
+        while int_rx.next().await.is_some() {}
+        while ctrl_rx.next().await.is_some() {}
+        while bulk_rx.next().await.is_some() {}
         event_handler.cancel();
         drop(device);
         trace!("joining event handler loop");
         libusb_handle.await.unwrap();
-
-        fn mean<I, E>(list: I) -> Duration
-        where
-            I: IntoIterator<Item = Duration, IntoIter = E>,
-            E: ExactSizeIterator<Item = Duration>,
-        {
-            let iter = list.into_iter();
-            let len = iter.len();
-            let sum: Duration = iter.sum();
-            sum.checked_div(len as u32).unwrap_or(Duration::ZERO)
-        }
 
         info!("==== STATS ====");
         info!("Max active transfers: {max_active_transfers}");
@@ -2071,7 +2038,7 @@ where
         info!("Max time to setup transfer: {max_setup_time:?}");
         info!(
             "Avg setup time for last {THRESHOLD} transfers: {:?}",
-            mean(last_few_setup_times)
+            Duration::from(last_few_setup_times.mean().unwrap_or_default())
         );
 
         result

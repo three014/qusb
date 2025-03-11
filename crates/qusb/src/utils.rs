@@ -65,6 +65,77 @@ pub mod oneshot {
     }
 }
 
+pub mod metrics {
+    use std::{collections::VecDeque, iter::Sum, ops::Div};
+
+    pub struct RollingAvg<const N: usize, T> {
+        inner: VecDeque<T>,
+    }
+
+    impl<const N: usize, T> RollingAvg<N, T> {
+        pub const fn new() -> Self {
+            Self {
+                inner: VecDeque::new(),
+            }
+        }
+
+        pub fn preallocated() -> Self {
+            Self {
+                inner: VecDeque::with_capacity(N),
+            }
+        }
+
+        pub fn push(&mut self, item: impl Into<T>) {
+            if self.inner.len() >= N {
+                self.inner.pop_front();
+            }
+            self.inner.push_back(item.into());
+        }
+
+        pub fn mean<'a>(&'a self) -> Option<T>
+        where
+            T: Sum<&'a T> + Div<usize, Output = T>,
+        {
+            if self.inner.is_empty() {
+                return None;
+            }
+            let len = self.inner.len();
+            let sum: T = self.inner.iter().sum();
+            Some(sum / len)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    #[repr(transparent)]
+    pub struct Duration(std::time::Duration);
+
+    impl<'a> Sum<&'a Duration> for Duration {
+        fn sum<I: Iterator<Item = &'a Duration>>(iter: I) -> Self {
+            Duration(iter.map(|dur| dur.0).sum())
+        }
+    }
+
+    impl Div<usize> for Duration {
+        type Output = Duration;
+
+        fn div(self, rhs: usize) -> Self::Output {
+            Duration(self.0.checked_div(rhs.try_into().unwrap()).unwrap())
+        }
+    }
+
+    impl From<std::time::Duration> for Duration {
+        fn from(value: std::time::Duration) -> Self {
+            Duration(value)
+        }
+    }
+
+    impl From<Duration> for std::time::Duration {
+        fn from(value: Duration) -> Self {
+            value.0
+        }
+    }
+}
+
 pub struct Counter {
     inner: u32,
 }
@@ -634,7 +705,8 @@ mod tests {
 
     use super::*;
 
-    type Mailer = ThreeKeyMap<Port, NoHash<Addr>, UrbHandle, mpsc::AsyncSender<vhci::ioctl::IocWork>>;
+    type Mailer =
+        ThreeKeyMap<Port, NoHash<Addr>, UrbHandle, mpsc::AsyncSender<vhci::ioctl::IocWork>>;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct Addr(Address);
