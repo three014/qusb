@@ -7,7 +7,6 @@ use std::{
 
 use compio::net::ToSocketAddrsAsync;
 use futures_concurrency::future::Race;
-use mimalloc::MiMalloc;
 use proto::msg;
 use qusb::BoundedU8;
 use tokio_util::sync::CancellationToken;

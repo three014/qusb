@@ -37,7 +37,7 @@ use zerocopy::{transmute, FromBytes, IntoBytes};
 
 use crate::{
     stub::{self, RegisterPort},
-    utils::{align_to_usize, cold, metrics, mpsc, CloseStream, Counter, SimpleMap},
+    utils::{align, align_to_usize, cold, metrics, mpsc, CloseStream, Counter, SimpleMap},
     Error, Result, UrbWithIsoData,
 };
 
@@ -797,8 +797,8 @@ fn get_or_alloc_transfer(
     mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
     num_iso_packets: u16,
 ) -> InnerTransfer {
-    let maybe_entry = cache.range_mut(num_iso_packets..).next().map(|(_k, v)| v);
-    if let Some(entry) = maybe_entry {
+    let maybe_entry = cache.range_mut(num_iso_packets..).next();
+    if let Some((&num_pkts, entry)) = maybe_entry {
         const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
         let (transfer, remove_entry) = {
             match std::mem::replace(entry, EMPTY) {
@@ -815,7 +815,7 @@ fn get_or_alloc_transfer(
             }
         };
         if remove_entry {
-            cache.remove(&(transfer.num_iso_packets() as u16));
+            cache.remove(&num_pkts);
         }
         transfer
     } else {
@@ -865,7 +865,7 @@ struct DmaAllocator<C: rusb::UsbContext> {
     handle: Arc<rusb::DeviceHandle<C>>,
 }
 
-const DMA_LEN: usize = 16 << 12;
+const DMA_LEN: usize = u16::MAX as usize;
 
 impl<C: rusb::UsbContext> DmaAllocator<C> {
     pub fn with_capacity(capacity: usize, handle: Arc<rusb::DeviceHandle<C>>) -> Self {
@@ -877,15 +877,22 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
 
     pub fn reserve(&mut self, num_bytes: usize) -> UsbMemMut {
         debug_assert!(num_bytes <= DMA_LEN, "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {DMA_LEN} bytes)");
+
+        // From libusb, a transfer that uses device mapped memory
+        // must exist in its own cache line for a reason that I forgot.
+        // So we'll always round up to the next cache line size.
+        const CACHE_LINE: usize = 64;
+        let aligned_bytes = align(num_bytes, CACHE_LINE);
         let queue = &mut self.queue;
         for _ in 0..queue.len() {
             let dma = queue.front_mut().unwrap();
-            let additional = num_bytes.saturating_sub(dma.len());
+            let additional = aligned_bytes.saturating_sub(dma.len());
             if dma.try_reclaim(additional) {
                 // SAFETY: We won't go over the capacity due to the
                 // assertion at the beginning of the function.
-                unsafe { dma.set_len(num_bytes) };
-                let mem = dma.split_to(num_bytes);
+                unsafe { dma.set_len(aligned_bytes) };
+                let mut mem = dma.split_to(aligned_bytes);
+                mem.truncate(num_bytes);
 
                 return mem;
             } else {
@@ -904,9 +911,10 @@ impl<C: rusb::UsbContext> DmaAllocator<C> {
 
         // SAFETY: We won't go over the capacity due to the
         // assertion at the beginning of the function.
-        unsafe { dma.set_len(num_bytes) };
-        let mem = dma.split_to(num_bytes);
+        unsafe { dma.set_len(aligned_bytes) };
+        let mut mem = dma.split_to(aligned_bytes);
         queue.push_front(dma);
+        mem.truncate(num_bytes);
         mem
     }
 }
@@ -1081,7 +1089,7 @@ where
         let small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
 
         // ---- Event Receivers ----
-        const TICK: Duration = Duration::from_micros(50);
+        const TICK: Duration = Duration::from_micros(897);
         let (blocking_tx, blocking_rx) = mpsc::channel::<Seq<vhci::Status>>(0);
         let mut blocking_rx = blocking_rx.into_stream();
         let (iso_tx, iso_rx) = mpsc::channel::<Seq<Iso>>(512);

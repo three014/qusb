@@ -4,7 +4,13 @@ use core::fmt;
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
 use std::{
-    borrow::Borrow, collections::HashMap, fmt::Debug, future::Future, hash::Hash, io, time::{Duration, Instant}
+    borrow::Borrow,
+    collections::HashMap,
+    fmt::Debug,
+    future::Future,
+    hash::Hash,
+    io,
+    time::{Duration, Instant},
 };
 
 pub mod mpsc {
@@ -597,8 +603,13 @@ impl<S, R, E> Ctrl<S, R, E> {
 }
 
 #[inline]
+pub const fn align(val: usize, alignment: usize) -> usize {
+    (val + (alignment - 1)) & !(alignment - 1)
+}
+
+#[inline]
 pub const fn align_to_usize(val: usize) -> usize {
-    (val + (size_of::<usize>() - 1)) & !(size_of::<usize>() - 1)
+    align(val, size_of::<usize>())
 }
 
 // /// A synchronous sleep function that uses
@@ -715,8 +726,8 @@ impl Timer {
 #[cfg(test)]
 mod tests {
     use vhci::{
-        ioctl::{Address, UrbHandle},
         Port,
+        ioctl::{Address, UrbHandle},
     };
 
     use super::*;
@@ -772,5 +783,11 @@ mod tests {
     #[test]
     fn align_eight_to_eight() {
         assert_eq!(align_to_usize(8), 8);
+    }
+
+    #[test]
+    fn align_to_cache() {
+        assert_eq!(align(0, 64), 0);
+        assert_eq!(align(3, 64), 64);
     }
 }
