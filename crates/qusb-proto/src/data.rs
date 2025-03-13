@@ -88,7 +88,11 @@ where
 
     #[inline]
     fn new(mut buf: BytesMut) -> Result<Self, ReadError> {
-        let ptr = T::try_mut_from_bytes(&mut buf).map_err(|_| ReadError::CorruptedData)?;
+        let ptr = T::try_mut_from_bytes(&mut buf).map_err(|err| {
+            println!("{err}");
+            dbg!(err.into_src());
+            ReadError::CorruptedData
+        })?;
         // SAFETY: We own the buffer so we ensure that
         // its data never gets mutated nor moved.
         let value = unsafe { NonNull::new_unchecked(ptr) };
@@ -118,14 +122,14 @@ where
     /// so that the first `Data` contains the header, and the second `Data`
     /// contains the remainder of the data interpreted as type `U`.
     #[inline]
-    pub fn split<U>(mut self) -> (T::Header, Data<U>)
+    pub fn split<U>(mut self) -> (T::Header, Option<Data<U>>)
     where
         T: GetSliceLen,
         U: TryFromBytes + Immutable + KnownLayout + ?Sized + IntoBytes,
     {
         let header = self.get().header();
         self.buf.advance(size_of::<T::Header>());
-        (header, Data::new(self.buf).unwrap())
+        (header, Data::new(self.buf).ok())
     }
 }
 

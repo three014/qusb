@@ -45,7 +45,7 @@ mod borrow;
 mod lend;
 
 enum Recv {
-    Urb((Header, Data<UrbFrame>)),
+    Urb((Header, Option<Data<UrbFrame>>)),
     PortReset(Header),
     Unlink(Header),
 }
@@ -542,7 +542,7 @@ impl borrow::RecvHandler for BorrowRecvHandler {
             handle
         };
         let (urb, data) = data.split::<[u8]>();
-        let mut data = data.into_bytes_mut();
+        let mut data = data.unwrap().into_bytes_mut();
 
         let actual_transfer_len = urb.actual_transfer_len as usize;
 
@@ -1171,8 +1171,8 @@ where
                     let cancel = CancellationToken::new();
                     cancel_tokens.insert(seqnum, cancel.clone());
 
-                    let (urb, data) = urb_frame.split::<[u8]>();
-                    let mut data = data.into_bytes_mut();
+                    let (urb, data) = urb_frame.unwrap().split::<[u8]>();
+                    let mut data = data.unwrap().into_bytes_mut();
                     match urb.kind {
                         UrbType::Iso => {
                             let padded_transfer_len = urb.padded_transfer_len();

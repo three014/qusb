@@ -175,7 +175,7 @@ impl<R> RecvLoop<R> {
                         },
                         data,
                     )) => {
-                        handler.urb_reply(seqnum, data).await?;
+                        handler.urb_reply(seqnum, data.unwrap()).await?;
                     }
                     super::Recv::PortReset(Header {
                         seqnum,
