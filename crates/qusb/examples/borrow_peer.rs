@@ -14,9 +14,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
 #[compio::main]
 async fn main() {
     rustls::crypto::ring::default_provider()
@@ -55,8 +52,8 @@ async fn main() {
     info!("connected to {}", session.remote_address());
 
     let dev = msg::UsbDeviceId {
-        bus_number: 1,
-        device_addr: 2,
+        bus_number: 3,
+        device_addr: 8,
     };
     let usb = session.req_borrow(dev).await.unwrap();
     let cancel_token = CancellationToken::new();

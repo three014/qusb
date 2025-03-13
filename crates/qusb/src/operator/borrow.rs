@@ -22,7 +22,7 @@ use vhci::{
     usbfs::Request,
 };
 
-use crate::stub::WorkReceiver;
+use crate::{stub::WorkReceiver, utils::CloseStream};
 
 pub trait SendHandler {
     fn port_stat(&mut self, stat: ioctl::IocPortStat);
@@ -50,7 +50,7 @@ impl<W> SendLoop<W> {
 
     pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
-        W: AsyncWrite + Unpin + 'static,
+        W: AsyncWrite + CloseStream + Unpin + 'static,
         H: SendHandler,
     {
         use compio::io::AsyncWriteExt;
@@ -116,6 +116,8 @@ impl<W> SendLoop<W> {
                 Some(Event::Cancelled) | None => break,
             }
         }
+
+        _ = self.tx.close();
         Ok(())
     }
 }

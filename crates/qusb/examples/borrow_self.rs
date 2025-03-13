@@ -6,15 +6,11 @@ use std::{
 };
 
 use futures_concurrency::future::Race;
-use mimalloc::MiMalloc;
 use proto::msg;
 use qusb::BoundedU8;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 #[compio::main]
 async fn main() {
@@ -51,7 +47,7 @@ async fn main() {
 
         let dev = msg::UsbDeviceId {
             bus_number: 1,
-            device_addr: 2,
+            device_addr: 3,
         };
         let usb = session.req_borrow(dev).await.unwrap();
         let cancel_token = CancellationToken::new();

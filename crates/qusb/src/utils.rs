@@ -4,11 +4,7 @@ use core::fmt;
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
 use std::{
-    borrow::Borrow,
-    collections::HashMap,
-    fmt::Debug,
-    hash::Hash,
-    time::{Duration, Instant},
+    borrow::Borrow, collections::HashMap, fmt::Debug, future::Future, hash::Hash, io, time::{Duration, Instant}
 };
 
 pub mod mpsc {
@@ -21,7 +17,6 @@ pub mod mpsc {
         flume::bounded(capacity)
     }
 }
-
 pub mod oneshot {
     use std::{
         future::Future,
@@ -64,7 +59,6 @@ pub mod oneshot {
         )
     }
 }
-
 pub mod metrics {
     use std::{collections::VecDeque, iter::Sum, ops::Div};
 
@@ -134,6 +128,12 @@ pub mod metrics {
             value.0
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+pub fn cold<T>(t: T) -> T {
+    t
 }
 
 pub struct Counter {
@@ -678,6 +678,22 @@ pub const fn align_to_usize(val: usize) -> usize {
 //     buf.clear();
 //     Ok(Some(recv))
 // }
+
+pub trait CloseStream {
+    fn close(&mut self) -> io::Result<()>;
+    fn stopped(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+impl CloseStream for compio::quic::SendStream {
+    fn close(&mut self) -> io::Result<()> {
+        self.finish().map_err(io::Error::from)
+    }
+
+    async fn stopped(&mut self) -> io::Result<()> {
+        self.stopped().await.map_err(io::Error::from)?;
+        Ok(())
+    }
+}
 
 pub struct Timer(Instant);
 

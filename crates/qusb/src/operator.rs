@@ -37,7 +37,7 @@ use zerocopy::{transmute, FromBytes, IntoBytes};
 
 use crate::{
     stub::{self, RegisterPort},
-    utils::{align_to_usize, metrics, mpsc, Counter, SimpleMap},
+    utils::{align_to_usize, cold, metrics, mpsc, CloseStream, Counter, SimpleMap},
     Error, Result, UrbWithIsoData,
 };
 
@@ -54,15 +54,15 @@ async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Resu
     let mut min_len = size_of::<Header>();
     let frame: Data<QusbFrame> = loop {
         if buf.fill_until(&mut rx, min_len).await?.is_none() {
-            return Ok(None);
+            return cold(Ok(None));
         }
 
         min_len = match buf.claim_dst() {
             Ok(frame) => break frame,
-            Err(ReadError::CorruptedData) => Err(io::Error::other("corrupted data from peer"))?,
-            Err(ReadError::BufferShort { num_bytes_needed }) => {
-                buf.len() + num_bytes_needed
+            Err(ReadError::CorruptedData) => {
+                cold(Err(io::Error::other("corrupted data from peer"))?)
             }
+            Err(ReadError::BufferShort { num_bytes_needed }) => buf.len() + num_bytes_needed,
         };
     };
 
@@ -542,7 +542,6 @@ impl borrow::RecvHandler for BorrowRecvHandler {
             handle
         };
         let (urb, data) = data.split::<[u8]>();
-        let urb = urb.try_read();
         let mut data = data.into_bytes_mut();
 
         let actual_transfer_len = urb.actual_transfer_len as usize;
@@ -624,7 +623,7 @@ impl<W, R> BorrowDevice<W, R> {
 
 impl<W, R> BorrowDevice<W, R>
 where
-    W: AsyncWrite + Unpin + Send + 'static,
+    W: AsyncWrite + CloseStream + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
     /// Runs the logic for sending URBs from a VHCI
@@ -1030,14 +1029,14 @@ impl<W, R> LendDevice<W, R> {
 
 impl<W, R> LendDevice<W, R>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + CloseStream + Unpin,
     R: AsyncRead + Unpin,
 {
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn lend(self, cancel_token: CancellationToken) -> Result<()> {
         let Self {
             mut tx,
-            rx,
+            mut rx,
             mut buf_rx,
             device,
             id: dev_id,
@@ -1114,7 +1113,7 @@ where
             cancel_token.cancelled_owned().await;
             Event::Cancelled
         });
-        let frame = stream::unfold((rx, buf_rx), |(mut rx, mut buf)| async {
+        let frame = stream::unfold((&mut rx, buf_rx), |(mut rx, mut buf)| async {
             let result = recv_frame(&mut rx, &mut buf).await.transpose()?;
             Some((Event::RecvFrame2(result), (rx, buf)))
         });
@@ -1134,7 +1133,7 @@ where
 
         let mut main = main_events.next();
 
-        let result: std::result::Result<(), (Header, io::Error)> = loop {
+        let result: std::result::Result<(), (Option<Header>, io::Error)> = loop {
             let event = if buf_tx.is_empty() {
                 pin!(&mut main).await
             } else {
@@ -1165,7 +1164,6 @@ where
                     cancel_tokens.insert(seqnum, cancel.clone());
 
                     let (urb, data) = urb_frame.split::<[u8]>();
-                    let urb = urb.try_read();
                     let mut data = data.into_bytes_mut();
                     match urb.kind {
                         UrbType::Iso => {
@@ -1571,13 +1569,14 @@ where
                         buf_tx.put_slice(&buf);
                         buf_tx.put_slice(padding);
                     } else {
-                        break Err(make_error_header(
+                        let (header, err) = make_error_header(
                             seqnum,
                             status,
                             vhci_status,
                             UrbType::Ctrl,
                             ioctl::Endpoint(0x80),
-                        ));
+                        );
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1619,13 +1618,14 @@ where
                         buf_tx.put_slice(header.as_bytes());
                         buf_tx.put_slice(urb_header.as_bytes());
                     } else {
-                        break Err(make_error_header(
+                        let (header, err) = make_error_header(
                             seqnum,
                             status,
                             vhci_status,
                             UrbType::Ctrl,
                             ioctl::Endpoint(0),
-                        ));
+                        );
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1676,13 +1676,14 @@ where
                         buf_tx.put_slice(&buf);
                         buf_tx.put_slice(padding);
                     } else {
-                        break Err(make_error_header(
+                        let (header, err) = make_error_header(
                             seqnum,
                             status,
                             vhci_status,
                             UrbType::Int,
                             endpoint,
-                        ));
+                        );
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1726,13 +1727,14 @@ where
                         buf_tx.put_slice(header.as_bytes());
                         buf_tx.put_slice(urb_header.as_bytes());
                     } else {
-                        break Err(make_error_header(
+                        let (header, err) = make_error_header(
                             seqnum,
                             status,
                             vhci_status,
                             UrbType::Int,
                             endpoint,
-                        ));
+                        );
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1782,13 +1784,14 @@ where
                         buf_tx.put_slice(&buf);
                         buf_tx.put_slice(padding);
                     } else {
-                        break Err(make_error_header(
+                        let (header, err) = make_error_header(
                             seqnum,
                             status,
                             vhci_status,
                             UrbType::Bulk,
                             endpoint,
-                        ));
+                        );
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1831,13 +1834,9 @@ where
                         buf_tx.put_slice(header.as_bytes());
                         buf_tx.put_slice(urb_header.as_bytes());
                     } else {
-                        break Err(make_error_header(
-                            seqnum,
-                            status,
-                            vhci_status,
-                            UrbType::Bulk,
-                            endpoint,
-                        ));
+                        let (header, err) =
+                            make_error_header(seqnum, status, vhci_status, UrbType::Bulk, endpoint);
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1893,13 +1892,9 @@ where
                         buf_tx.put_slice(padding);
                         buf_tx.put_slice(&raw_iso_buf);
                     } else {
-                        break Err(make_error_header(
-                            seqnum,
-                            status,
-                            vhci_status,
-                            UrbType::Iso,
-                            endpoint,
-                        ));
+                        let (header, err) =
+                            make_error_header(seqnum, status, vhci_status, UrbType::Iso, endpoint);
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1948,13 +1943,9 @@ where
                         buf_tx.put_slice(urb_header.as_bytes());
                         buf_tx.put_slice(&raw_iso_buf);
                     } else {
-                        break Err(make_error_header(
-                            seqnum,
-                            status,
-                            vhci_status,
-                            UrbType::Iso,
-                            endpoint,
-                        ));
+                        let (header, err) =
+                            make_error_header(seqnum, status, vhci_status, UrbType::Iso, endpoint);
+                        break Err((Some(header), err));
                     }
                     main = main_events.next();
                 }
@@ -1979,7 +1970,7 @@ where
                     if msg::Status::Success == header.status {
                         buf_tx.put_u64_le(transmute!(header));
                     } else {
-                        break Err((header, io::ErrorKind::ResourceBusy.into()));
+                        break Err((Some(header), io::ErrorKind::ResourceBusy.into()));
                     }
                     main = main_events.next();
                 }
@@ -1990,16 +1981,20 @@ where
                     main = main_events.next();
                 }
                 Some(Event::Cancelled) | None => break Ok(()),
-                Some(Event::RecvFrame2(Err(_err))) => todo!(),
+                Some(Event::RecvFrame2(Err(_err))) => break Err((None, _err)),
             }
         };
 
-        let result = if let Err((header, err)) = result {
-            tx.write_u64_le(transmute!(header)).await?;
-            Err(Error::Io(err))
-        } else {
-            Ok(())
+        let result = match result {
+            Ok(_) => Ok(()),
+            Err((Some(header), err)) => {
+                tx.write_u64_le(transmute!(header)).await?;
+                Err(Error::Io(err))
+            }
+            Err((None, err)) => Err(Error::Io(err)),
         };
+
+        _ = tx.close();
 
         // ---- Cleanup ----
         info!(

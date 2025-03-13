@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::ptr::NonNull;
 use std::{io, marker::PhantomData};
 
 use bytes::{Buf as _, BufMut};
@@ -8,7 +9,7 @@ use compio_buf::{BufResult, IoBuf, IoBufMut, SetBufInit};
 use compio_io::AsyncRead;
 use thiserror::Error;
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::GetSliceLen;
 use crate::GetSliceLenErr;
@@ -55,18 +56,9 @@ where
 }
 
 pub struct Data<T: ?Sized> {
+    value: NonNull<T>,
     buf: BytesMut,
     _p: PhantomData<T>,
-}
-
-impl<T> Data<T>
-where
-    T: KnownLayout + FromBytes + Immutable + Sized + IntoBytes,
-{
-    #[inline]
-    pub fn read(&self) -> T {
-        T::read_from_bytes(&self.buf).unwrap()
-    }
 }
 
 impl<T> Data<T>
@@ -74,56 +66,66 @@ where
     T: KnownLayout + TryFromBytes + Immutable + ?Sized + IntoBytes,
 {
     pub fn get(&self) -> &T {
-        T::try_ref_from_bytes(&self.buf).unwrap()
+        // SAFETY: The value is accessible as long as we hold the buffer.
+        unsafe { self.value.as_ref() }
     }
 
     pub fn get_mut(&mut self) -> &mut T {
-        T::try_mut_from_bytes(&mut self.buf).unwrap()
+        // SAFETY: The value is accessible as long as we hold the buffer.
+        unsafe { self.value.as_mut() }
     }
 
     #[inline]
-    pub fn try_read(&self) -> T
+    pub fn read(&self) -> T
     where
-        T: Sized + Clone,
+        T: Sized,
     {
-        T::try_read_from_bytes(&self.buf).unwrap()
+        // SAFETY: The value is accessible as long as we hold the buffer.
+        // Plus, we already verified that type T can be trivially read
+        // when we created Data<T>.
+        unsafe { self.value.read() }
     }
 
     #[inline]
-    fn new(buf: BytesMut) -> Self {
-        Self {
+    fn new(mut buf: BytesMut) -> Result<Self, ReadError> {
+        let ptr = T::try_mut_from_bytes(&mut buf).map_err(|_| ReadError::CorruptedData)?;
+        // SAFETY: We own the buffer so we ensure that
+        // its data never gets mutated nor moved.
+        let value = unsafe { NonNull::new_unchecked(ptr) };
+        Ok(Self {
             buf,
+            value,
             _p: PhantomData,
-        }
+        })
     }
 
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf
-    }
+    // #[inline]
+    // pub fn as_bytes(&self) -> &[u8] {
+    //     &self.buf
+    // }
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.buf.len()
-    }
+    // #[inline]
+    // pub fn len(&self) -> usize {
+    //     self.buf.len()
+    // }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
+    // #[inline]
+    // pub fn is_empty(&self) -> bool {
+    //     self.buf.is_empty()
+    // }
 
     /// Splits the internal slice at `size_of::<<T as GetSliceLen>::Header>()`,
     /// so that the first `Data` contains the header, and the second `Data`
     /// contains the remainder of the data interpreted as type `U`.
     #[inline]
-    pub fn split<U>(mut self) -> (Data<T::Header>, Data<U>)
+    pub fn split<U>(mut self) -> (T::Header, Data<U>)
     where
         T: GetSliceLen,
         U: TryFromBytes + Immutable + KnownLayout + ?Sized + IntoBytes,
     {
-        let rest = self.buf.split_off(size_of::<T::Header>());
-        let header = self.buf;
-        (Data::new(header), Data::new(rest))
+        let header = self.get().header();
+        self.buf.advance(size_of::<T::Header>());
+        (header, Data::new(self.buf).unwrap())
     }
 }
 
@@ -166,17 +168,17 @@ impl Buf {
         Self { inner: Some(buf) }
     }
 
-    #[inline]
-    fn with_owned<T>(&mut self, f: impl FnOnce(BytesMut) -> (BytesMut, T)) -> T {
-        let buf = self
-            .inner
-            .take()
-            .expect("should have been initialized with Some()");
+    // #[inline]
+    // fn with_owned<T>(&mut self, f: impl FnOnce(BytesMut) -> (BytesMut, T)) -> T {
+    //     let buf = self
+    //         .inner
+    //         .take()
+    //         .expect("should have been initialized with Some()");
 
-        let (buf, value) = f(buf);
-        self.inner = Some(buf);
-        value
-    }
+    //     let (buf, value) = f(buf);
+    //     self.inner = Some(buf);
+    //     value
+    // }
 
     #[inline]
     async fn with_owned_async<T>(&mut self, f: impl AsyncFnOnce(BytesMut) -> (BytesMut, T)) -> T {
@@ -200,12 +202,12 @@ impl Buf {
         self.inner.as_mut().unwrap()
     }
 
-    #[inline(always)]
-    fn into_buf(mut self) -> BytesMut {
-        self.inner
-            .take()
-            .expect("every function that takes out the buf should put it back")
-    }
+    // #[inline(always)]
+    // fn into_buf(mut self) -> BytesMut {
+    //     self.inner
+    //         .take()
+    //         .expect("every function that takes out the buf should put it back")
+    // }
 }
 
 #[derive(Debug)]
@@ -221,7 +223,7 @@ unsafe impl BufMut for BufWrapper {
 
     #[inline(always)]
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        self.0.advance_mut(cnt);
+        unsafe { self.0.advance_mut(cnt) };
     }
 
     #[inline(always)]
@@ -231,8 +233,9 @@ unsafe impl BufMut for BufWrapper {
 
     #[inline(always)]
     fn put<T: bytes::buf::Buf>(&mut self, src: T)
-        where
-            Self: Sized, {
+    where
+        Self: Sized,
+    {
         self.0.put(src);
     }
 
@@ -263,7 +266,7 @@ unsafe impl IoBuf for BufWrapper {
 
 impl SetBufInit for BufWrapper {
     unsafe fn set_buf_init(&mut self, len: usize) {
-        self.0.set_buf_init(len);
+        unsafe { self.0.set_buf_init(len) };
     }
 }
 
@@ -413,10 +416,11 @@ impl Ring {
     where
         T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
     {
-        let item: &T = self.peek_dst()?;
-        let size_of = std::mem::size_of_val(item);
-        let buf = self.buf.as_mut().split_to(size_of);
-        Ok(Data::new(buf))
+        let slice_len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
+        let size_of_header = size_of::<T::Header>();
+        let data_byte_len = slice_len * size_of::<T::Data>();
+        let buf = self.buf.as_mut().split_to(size_of_header + data_byte_len);
+        Data::new(buf)
     }
 
     /// Returns a lazy iterator into the ring's internal

@@ -291,6 +291,7 @@ impl UsbDeviceInfo {
 
 impl GetSliceLen for UsbDeviceInfo {
     type Header = UsbDeviceInfoHeader;
+    type Data = UsbInterfaceInfo;
 
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const SIZE_OF_BASE: usize = size_of::<UsbDeviceInfoHeader>();
@@ -313,6 +314,10 @@ impl GetSliceLen for UsbDeviceInfo {
         } else {
             Ok(padded_len)
         }
+    }
+
+    fn header(&self) -> Self::Header {
+        todo!()
     }
 }
 
@@ -594,6 +599,7 @@ impl UrbFrame {
 
 impl GetSliceLen for UrbFrame {
     type Header = UrbHeader;
+    type Data = u8;
 
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const BASE_LEN: usize = size_of::<UrbHeader>();
@@ -619,6 +625,10 @@ impl GetSliceLen for UrbFrame {
             Ok(required_byte_len - BASE_LEN)
         }
     }
+
+    fn header(&self) -> Self::Header {
+        self.header()
+    }
 }
 
 #[derive(KnownLayout, Immutable, FromZeros, IntoBytes)]
@@ -630,6 +640,7 @@ pub struct QusbFrame {
 
 impl GetSliceLen for QusbFrame {
     type Header = Header;
+    type Data = u8;
 
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const BASE_LEN: usize = size_of::<Header>();
@@ -648,6 +659,10 @@ impl GetSliceLen for QusbFrame {
         } else {
             Ok(frame_len - BASE_LEN)
         }
+    }
+
+    fn header(&self) -> Self::Header {
+        self.header
     }
 }
 

@@ -60,6 +60,7 @@ where
     Self: KnownLayout<PointerMetadata = usize> + IntoBytes,
 {
     type Header: TryFromBytes + KnownLayout + Immutable + Sized + IntoBytes;
+    type Data;
 
     /// If `buf` was some DST `T`, then this
     /// function returns the number of elements
@@ -76,6 +77,7 @@ where
     /// - `buf` may not be exactly the length of
     ///   the DST and its trailing slice.
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr>;
+    fn header(&self) -> Self::Header;
 }
 
 #[cfg(test)]
