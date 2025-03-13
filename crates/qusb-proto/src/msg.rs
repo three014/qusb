@@ -23,7 +23,7 @@ use std::{
 
 use compio_io::AsyncWrite;
 use thiserror::Error;
-use zerocopy::{try_transmute, FromBytes, IntoBytes, TryFromBytes};
+use zerocopy::{FromBytes, IntoBytes, TryFromBytes, try_transmute};
 use zerocopy_derive::*;
 
 use crate::{GetSliceLen, GetSliceLenErr};
@@ -472,10 +472,11 @@ struct UrbRequestHeader {
     actual_transfer_len: u16,
     kind_and_iso_packet_count: KindAndPacketCnt,
     endpoint: vhci::ioctl::Endpoint,
-    _padding: [u8; 4],
+    interval: u8,
+    _padding: [u8; 3],
     ctrl_packet: vhci::ioctl::IocSetupPacket,
 }
-Request: 2 + 1 + 1 + 4 + 8 = 16
+Request: 2 + 1 + 1 + 1 + 3 + 8 = 16
 
 struct UrbReplyHeader {
     actual_transfer_len: u16,
@@ -544,14 +545,24 @@ impl PackedKind {
 
     #[inline]
     pub const fn get(&self) -> UrbKind {
-        let num_pkts = self.inner & PKT_MASK;
-        let kind = self.inner & KIND_MASK;
-        match kind {
-            KIND_ISO..=0b11 => UrbKind::Iso(num_pkts),
-            KIND_INT => UrbKind::Int,
-            KIND_CTRL => UrbKind::Ctrl,
-            KIND_BULK => UrbKind::Bulk,
-            _ => unreachable!(),
+        if self.inner & (1 << 7) == 0 {
+            UrbKind::Iso(self.inner & PKT_MASK)
+        } else {
+            match self.inner & KIND_MASK {
+                KIND_INT => UrbKind::Int,
+                KIND_CTRL => UrbKind::Ctrl,
+                KIND_BULK => UrbKind::Bulk,
+                _ => unreachable!()
+            }
+        }
+    }
+
+    #[inline]
+    pub const fn num_pkts(&self) -> u8 {
+        if self.inner & (1 << 7) != 0 {
+            0
+        } else {
+            self.inner & PKT_MASK
         }
     }
 }
@@ -708,5 +719,43 @@ pub mod mass_storage {
         pub d_cbw_tag: U32,
         pub d_cbw_data_residue: U32,
         pub bm_cbw_status: u8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urb_kind_works() {
+        let iso = PackedKind::iso(42);
+        assert!(matches!(iso.get(), UrbKind::Iso(42)));
+
+        let iso = PackedKind::iso(1);
+        assert!(matches!(iso.get(), UrbKind::Iso(1)));
+
+        let int = PackedKind::int();
+        assert!(matches!(int.get(), UrbKind::Int));
+
+        let ctrl = PackedKind::ctrl();
+        assert!(matches!(ctrl.get(), UrbKind::Ctrl));
+
+        let bulk = PackedKind::bulk();
+        assert!(matches!(bulk.get(), UrbKind::Bulk));
+    }
+
+    #[test]
+    fn num_pkts_is_correct() {
+        let iso = PackedKind::iso(94);
+        assert_eq!(iso.num_pkts(), 94);
+
+        let int = PackedKind::int();
+        assert_eq!(int.num_pkts(), 0);
+
+        let ctrl = PackedKind::ctrl();
+        assert_eq!(ctrl.num_pkts(), 0);
+
+        let bulk = PackedKind::bulk();
+        assert_eq!(bulk.num_pkts(), 0);
     }
 }
