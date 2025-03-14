@@ -321,10 +321,7 @@ impl borrow::SendHandler for BorrowSendHandler {
         // as we make space for our data.
 
         // Step 1: Reserve enough space for our data.
-        {
-            let additional = total_frame_len.saturating_sub(self.buf.len());
-            self.buf.reserve(additional);
-        }
+        self.buf.reserve(total_frame_len);
 
         // Step 2: Split off the head and the tail
         let mut head = self.buf.split();

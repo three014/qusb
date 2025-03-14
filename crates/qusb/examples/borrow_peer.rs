@@ -18,7 +18,7 @@ async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
-    let log_path = "borrow_self_dev.log";
+    let log_path = "borrow_peer.log";
     let log_file = std::fs::File::options()
         .create(true)
         .read(true)
@@ -52,7 +52,7 @@ async fn main() {
 
     let dev = msg::UsbDeviceId {
         bus_number: 3,
-        device_addr: 11,
+        device_addr: 140,
     };
     let usb = session.req_borrow(dev).await.unwrap();
     let cancel_token = CancellationToken::new();

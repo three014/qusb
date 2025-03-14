@@ -88,11 +88,7 @@ where
 
     #[inline]
     fn new(mut buf: BytesMut) -> Result<Self, ReadError> {
-        let ptr = T::try_mut_from_bytes(&mut buf).map_err(|err| {
-            println!("{err}");
-            dbg!(err.into_src());
-            ReadError::CorruptedData
-        })?;
+        let ptr = T::try_mut_from_bytes(&mut buf).map_err(|_| ReadError::CorruptedData)?;
         // SAFETY: We own the buffer so we ensure that
         // its data never gets mutated nor moved.
         let value = unsafe { NonNull::new_unchecked(ptr) };
@@ -232,15 +228,21 @@ unsafe impl BufMut for BufWrapper {
 
     #[inline(always)]
     fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
-        self.0.chunk_mut()
+        self.0.spare_capacity_mut().into()
     }
 
     #[inline(always)]
-    fn put<T: bytes::buf::Buf>(&mut self, src: T)
+    fn put<T: bytes::buf::Buf>(&mut self, mut src: T)
     where
         Self: Sized,
     {
-        self.0.put(src);
+
+        while src.has_remaining() {
+            let s = src.chunk();
+            let l = s.len();
+            self.0.extend_from_slice(s);
+            src.advance(l);
+        }
     }
 
     #[inline(always)]
@@ -251,6 +253,10 @@ unsafe impl BufMut for BufWrapper {
     #[inline(always)]
     fn put_bytes(&mut self, val: u8, cnt: usize) {
         self.0.put_bytes(val, cnt);
+    }
+
+    fn has_remaining_mut(&self) -> bool {
+        self.remaining_mut() > 0
     }
 }
 
