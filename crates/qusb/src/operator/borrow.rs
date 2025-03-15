@@ -1,9 +1,4 @@
-use std::{
-    future::Future,
-    io,
-    pin::pin,
-    time::Duration,
-};
+use std::{future::Future, io, pin::pin, time::Duration};
 
 use bytes::Bytes;
 use compio::{
@@ -11,7 +6,7 @@ use compio::{
     runtime::time::sleep,
 };
 use futures_concurrency::{future::Race, stream::Merge};
-use futures_lite::{stream, StreamExt};
+use futures_lite::{StreamExt, stream};
 use proto::{
     data::{Data, Ring},
     msg::{Header, UrbFrame},
@@ -118,6 +113,7 @@ impl<W> SendLoop<W> {
         }
 
         _ = self.tx.close();
+        _ = self.tx.stopped().await;
         Ok(())
     }
 }
@@ -142,7 +138,7 @@ impl<R> RecvLoop<R> {
         Self { rx, buf }
     }
 
-    pub async fn run<H>(self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
+    pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
     where
         R: AsyncRead + Unpin + 'static,
         H: RecvHandler,
@@ -157,59 +153,66 @@ impl<R> RecvLoop<R> {
             cancel.cancelled_owned().await;
             Event::Cancelled
         });
-        let frame = stream::unfold((self.rx, self.buf), |(mut rx, mut buf)| async {
+        let frame = stream::unfold((&mut self.rx, self.buf), |(mut rx, mut buf)| async {
             let result = super::recv_frame(&mut rx, &mut buf).await.transpose()?;
             Some((Event::Frame(result), (rx, buf)))
         });
 
-        let mut events = pin!((cancel, frame).merge());
-        while let Some(event) = events.next().await {
-            match event {
-                Event::Cancelled => break,
-                Event::Frame(Ok(recv)) => match recv {
-                    super::Recv::Urb((
-                        Header {
+        {
+            let mut events = pin!((cancel, frame).merge());
+            while let Some(event) = events.next().await {
+                match event {
+                    Event::Cancelled => break,
+                    Event::Frame(Ok(recv)) => match recv {
+                        super::Recv::Urb((
+                            Header {
+                                seqnum,
+                                status: proto::msg::Status::Success,
+                                ..
+                            },
+                            data,
+                        )) => {
+                            handler.urb_reply(seqnum, data.unwrap()).await?;
+                        }
+                        super::Recv::PortReset(Header {
                             seqnum,
                             status: proto::msg::Status::Success,
                             ..
+                        }) => {
+                            handler.device_reset(seqnum)?;
+                        }
+                        super::Recv::Unlink(_) => {
+                            Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))?;
+                        }
+                        super::Recv::Urb((Header { status, .. }, _))
+                        | super::Recv::PortReset(Header { status, .. }) => match status {
+                            proto::msg::Status::Success => unreachable!(),
+                            proto::msg::Status::Failed => todo!(),
+                            proto::msg::Status::DevBusy => todo!(),
+                            proto::msg::Status::DevErr => {
+                                Err(io::Error::other("lender device in error state"))?;
+                            }
+                            proto::msg::Status::NoDev => {
+                                Err(io::Error::new(
+                                    io::ErrorKind::NotFound,
+                                    "device disconnected on lender side",
+                                ))?;
+                            }
+                            proto::msg::Status::Unexpected => todo!(),
+                            proto::msg::Status::VersionMismatch => todo!(),
+                            proto::msg::Status::Timeout => todo!(),
+                            proto::msg::Status::Proto => todo!(),
                         },
-                        data,
-                    )) => {
-                        handler.urb_reply(seqnum, data.unwrap()).await?;
-                    }
-                    super::Recv::PortReset(Header {
-                        seqnum,
-                        status: proto::msg::Status::Success,
-                        ..
-                    }) => {
-                        handler.device_reset(seqnum)?;
                     },
-                    super::Recv::Unlink(_) => {
-                        Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))?;
-                    }
-                    super::Recv::Urb((Header { status, .. }, _))
-                    | super::Recv::PortReset(Header { status, .. }) => match status {
-                        proto::msg::Status::Success => unreachable!(),
-                        proto::msg::Status::Failed => todo!(),
-                        proto::msg::Status::DevBusy => todo!(),
-                        proto::msg::Status::DevErr => {
-                            Err(io::Error::other("lender device in error state"))?;
-                        }
-                        proto::msg::Status::NoDev => {
-                            Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "device disconnected on lender side",
-                            ))?;
-                        }
-                        proto::msg::Status::Unexpected => todo!(),
-                        proto::msg::Status::VersionMismatch => todo!(),
-                        proto::msg::Status::Timeout => todo!(),
-                        proto::msg::Status::Proto => todo!(),
-                    },
-                },
-                Event::Frame(Err(err)) => Err(err)?,
+                    Event::Frame(Err(err)) => Err(err)?,
+                }
             }
         }
+
+        // Done! Drain the streams
+        let mut buf = Ring::with_capacity(32);
+        while 0 != buf.fill_with_reader(&mut self.rx).await? {}
+
         Ok(())
     }
 }

@@ -52,7 +52,7 @@ async fn main() {
 
     let dev = msg::UsbDeviceId {
         bus_number: 3,
-        device_addr: 140,
+        device_addr: 14,
     };
     let usb = session.req_borrow(dev).await.unwrap();
     let cancel_token = CancellationToken::new();
