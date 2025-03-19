@@ -113,6 +113,12 @@ pub struct UsbDeviceId {
     pub device_addr: u8,
 }
 
+impl std::fmt::Display for UsbDeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:03}/{:03}", self.bus_number, self.device_addr)
+    }
+}
+
 #[derive(Debug, Clone, Copy, FromZeros, IntoBytes, KnownLayout, Immutable)]
 #[repr(u8)]
 pub enum Req {

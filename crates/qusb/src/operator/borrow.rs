@@ -1,23 +1,27 @@
 use std::{future::Future, io, pin::pin, time::Duration};
 
 use bytes::Bytes;
-use compio::{
-    io::{AsyncRead, AsyncWrite},
-    runtime::time::sleep,
-};
-use futures_concurrency::{future::Race, stream::Merge};
-use futures_lite::{StreamExt, stream};
+use compio::io::{AsyncRead, AsyncWrite};
+use futures::stream::FuturesUnordered;
+use futures_concurrency::future::Race;
+use futures_lite::{Stream, StreamExt, stream};
 use proto::{
     data::{Data, Ring},
     msg::{Header, UrbFrame},
 };
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Span};
 use vhci::{
     ioctl::{self, UrbType, Work},
     usbfs::Request,
 };
 
-use crate::{stub::WorkReceiver, utils::CloseStream};
+use crate::{
+    stub::WorkReceiver,
+    utils::{CloseStream, Interval, blocker},
+};
+
+const TICK: Duration = Duration::from_micros(487);
 
 pub trait SendHandler {
     fn port_stat(&mut self, stat: ioctl::IocPortStat);
@@ -25,11 +29,45 @@ pub trait SendHandler {
         &mut self,
         urb: ioctl::IocUrb,
         handle: ioctl::UrbHandle,
-    ) -> impl Future<Output = io::Result<()>>;
+    ) -> impl Future<Output = io::Result<()>> + 'static;
     fn process_urb(&mut self, urb: ioctl::IocUrb, handle: ioctl::UrbHandle) -> io::Result<()>;
     fn cancel_urb(&mut self, handle: ioctl::UrbHandle);
     fn is_buf_empty(&self) -> bool;
     fn flush_buf(&mut self) -> Bytes;
+}
+
+trait SendHandlerExt {
+    fn handle_work(
+        &mut self,
+        work: Work,
+    ) -> io::Result<Option<impl Future<Output = io::Result<()>> + 'static>>;
+}
+
+impl<T: SendHandler> SendHandlerExt for T {
+    fn handle_work(
+        &mut self,
+        work: Work,
+    ) -> io::Result<Option<impl Future<Output = io::Result<()>> + 'static>> {
+        match work {
+            Work::PortStat(next) => {
+                self.port_stat(next);
+                Ok(None)
+            }
+            Work::ProcessUrb((urb, handle))
+                if UrbType::Ctrl == urb.typ
+                    && urb.address.is_for_unassigned()
+                    && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
+            {
+                let fut = self.set_address(urb, handle).in_current_span();
+                Ok(Some(fut))
+            }
+            Work::ProcessUrb((urb, handle)) => self.process_urb(urb, handle).map(|_| None),
+            Work::CancelUrb(handle) => {
+                self.cancel_urb(handle);
+                Ok(None)
+            }
+        }
+    }
 }
 
 pub struct SendLoop<W> {
@@ -43,79 +81,210 @@ impl<W> SendLoop<W> {
         Self { tx, work_rx }
     }
 
-    pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
+    pub async fn do_loop<H>(
+        tx: &mut W,
+        work_rx: impl Stream<Item = Work> + Unpin,
+        mut handler: H,
+    ) -> Result<(), Option<io::Error>>
     where
-        W: AsyncWrite + CloseStream + Unpin + 'static,
+        W: AsyncWrite + Unpin + CloseStream + 'static,
         H: SendHandler,
     {
         use compio::io::AsyncWriteExt;
 
-        enum Event {
-            Cancelled,
+        enum Event<W> {
+            SetAddress(io::Result<()>),
             Work(Work),
             FlushBuf,
+            FlushComplete(io::Result<W>),
         }
 
-        let _guard = tracing::Span::current().entered();
-        const TICK: Duration = Duration::from_micros(100);
-        let work_rx = self.work_rx.map(Event::Work);
-        let cancelled = stream::once_future(async move {
-            cancel.cancelled_owned().await;
-            Event::Cancelled
-        });
-        let mut timer = pin!(sleep(TICK));
+        enum State {
+            /// In this state, the writer is not available as it
+            /// is in the process of writing data asynchronously.
+            ///
+            /// When the write is complete, the state moves to
+            /// `Solicit` or `Timer` depending on whether the
+            /// buffer is empty or not.
+            Flush,
+            /// The buffer is empty and we are waiting on work.
+            /// From here we can only transition to `Timer` once
+            /// there is data in the buffer.
+            Solicit,
+            /// The buffer has data in it and we are waiting for our
+            /// timer to complete before we flush the buffer, which
+            /// gives time for more data to be written to the buffer.
+            ///
+            /// From here we can only transition to the `Flush` state.
+            Timer,
+        }
 
-        let mut main_events = pin!((cancelled, work_rx).merge());
-        let mut main = main_events.next();
+        // State Transitions:
+        // Solicit -> [Solicit(SetAddress, Work), Timer(Work)]
+        // Timer -> [Timer(SetAddress, Work), Flush(FlushBuf)]
+        // Flush -> [Solicit(FlushComplete), Timer(FlushComplete), Flush(SetAddress, Work)]
 
+        let interval = Interval::new(TICK);
+        let mut tx_holder = Some(tx);
+        let mut sleeper = pin!(blocker(None));
+        let mut flush_op = pin!(blocker(None));
+        let mut set_addr = pin!(blocker(None));
+        let mut work_rx = work_rx.map(Event::Work);
+
+        let mut state = State::Solicit;
         loop {
             let event = {
-                if handler.is_buf_empty() {
-                    pin!(&mut main).await
-                } else {
-                    let timer = async {
-                        timer.as_mut().await;
-                        Some(Event::FlushBuf)
-                    };
-                    (pin!(&mut main), timer).race().await
-                }
+                let flush = async {
+                    let result: Option<io::Result<&mut W>> = flush_op.as_mut().await;
+                    result.map(Event::FlushComplete)
+                };
+                let timer = async {
+                    sleeper.as_mut().await;
+                    Some(Event::FlushBuf)
+                };
+                let set_addr = async { Some(Event::SetAddress(set_addr.as_mut().await)) };
+                let race = (work_rx.next(), timer, flush, set_addr).race();
+                race.await.ok_or(None)?
             };
-
-            match event {
-                Some(Event::Work(Work::PortStat(next))) => {
-                    handler.port_stat(next);
-                    main = main_events.next();
+            state = match event {
+                Event::Work(work) => {
+                    if let Some(fut) = handler.handle_work(work)? {
+                        set_addr.set(blocker(Some(fut)));
+                        state
+                    } else {
+                        match state {
+                            State::Solicit if !handler.is_buf_empty() => {
+                                sleeper.set(blocker(Some(interval.tick())));
+                                State::Timer
+                            }
+                            current => current,
+                        }
+                    }
                 }
-                Some(Event::Work(Work::ProcessUrb((urb, handle))))
-                    if UrbType::Ctrl == urb.typ
-                        && urb.address.is_for_unassigned()
-                        && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
-                {
-                    handler.set_address(urb, handle).await?;
-                    main = main_events.next();
-                }
-                Some(Event::Work(Work::ProcessUrb((urb, handle)))) => {
-                    handler.process_urb(urb, handle)?;
-                    main = main_events.next();
-                }
-                Some(Event::Work(Work::CancelUrb(handle))) => {
-                    handler.cancel_urb(handle);
-                    main = main_events.next();
-                }
-                Some(Event::FlushBuf) => {
+                Event::FlushBuf => {
+                    sleeper.set(blocker(None));
+                    let tx = tx_holder.take().unwrap();
                     let bytes = handler.flush_buf();
-                    assert_eq!(bytes.len() % 8, 0);
-                    self.tx.write_all(bytes).await.0?;
-                    timer.set(sleep(TICK));
+                    flush_op.set(blocker(Some(async move {
+                        match tx.write_all(bytes).await.0 {
+                            Ok(_) => Some(Ok(tx)),
+                            Err(err) => Some(Err(err)),
+                        }
+                    })));
+                    State::Flush
                 }
-                Some(Event::Cancelled) | None => break,
+                Event::FlushComplete(Ok(tx)) => {
+                    flush_op.set(blocker(None));
+                    tx_holder = Some(tx);
+                    if handler.is_buf_empty() {
+                        State::Solicit
+                    } else {
+                        sleeper.set(blocker(Some(interval.tick())));
+                        State::Timer
+                    }
+                }
+                Event::SetAddress(Ok(_)) => {
+                    set_addr.set(blocker(None));
+                    state
+                }
+                Event::SetAddress(Err(err)) | Event::FlushComplete(Err(err)) => {
+                    return Err(Some(err));
+                }
             }
         }
-
-        _ = self.tx.close();
-        _ = self.tx.stopped().await;
-        Ok(())
     }
+
+    pub async fn run2(self, handler: impl SendHandler, cancel: CancellationToken) -> io::Result<()>
+    where
+        W: AsyncWrite + CloseStream + Unpin + 'static,
+    {
+        let Self { mut tx, work_rx } = self;
+        let work_rx = pin!(futures_lite::stream::stop_after_future(
+            work_rx,
+            cancel.cancelled_owned()
+        ));
+        let result = match Self::do_loop(&mut tx, work_rx, handler).await {
+            Ok(_) | Err(None) => Ok(()),
+            Err(Some(err)) => Err(err),
+        };
+
+        _ = tx.close();
+        _ = tx.stopped().await;
+        result
+    }
+
+    // pub async fn _run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
+    // where
+    //     W: AsyncWrite + CloseStream + Unpin + 'static,
+    //     H: SendHandler,
+    // {
+    //     use compio::io::AsyncWriteExt;
+
+    //     enum Event {
+    //         Cancelled,
+    //         Work(Work),
+    //         FlushBuf,
+    //     }
+
+    //     let _guard = tracing::Span::current().entered();
+    //     let work_rx = self.work_rx.map(Event::Work);
+    //     let cancelled = stream::once_future(async move {
+    //         cancel.cancelled_owned().await;
+    //         Event::Cancelled
+    //     });
+    //     let mut timer = pin!(sleep(TICK));
+
+    //     let mut main_events = pin!((cancelled, work_rx).merge());
+    //     let mut main = main_events.next();
+
+    //     loop {
+    //         let event = {
+    //             if handler.is_buf_empty() {
+    //                 pin!(&mut main).await
+    //             } else {
+    //                 let timer = async {
+    //                     timer.as_mut().await;
+    //                     Some(Event::FlushBuf)
+    //                 };
+    //                 (pin!(&mut main), timer).race().await
+    //             }
+    //         };
+
+    //         match event {
+    //             Some(Event::Work(Work::PortStat(next))) => {
+    //                 handler.port_stat(next);
+    //                 main = main_events.next();
+    //             }
+    //             Some(Event::Work(Work::ProcessUrb((urb, handle))))
+    //                 if UrbType::Ctrl == urb.typ
+    //                     && urb.address.is_for_unassigned()
+    //                     && Request::STANDARD_DEVICE_SET_ADDRESS == urb.setup_packet.req() =>
+    //             {
+    //                 handler.set_address(urb, handle).await?;
+    //                 main = main_events.next();
+    //             }
+    //             Some(Event::Work(Work::ProcessUrb((urb, handle)))) => {
+    //                 handler.process_urb(urb, handle)?;
+    //                 main = main_events.next();
+    //             }
+    //             Some(Event::Work(Work::CancelUrb(handle))) => {
+    //                 handler.cancel_urb(handle);
+    //                 main = main_events.next();
+    //             }
+    //             Some(Event::FlushBuf) => {
+    //                 let bytes = handler.flush_buf();
+    //                 assert_eq!(bytes.len() % 8, 0);
+    //                 self.tx.write_all(bytes).await.0?;
+    //                 timer.set(sleep(TICK));
+    //             }
+    //             Some(Event::Cancelled) | None => break,
+    //         }
+    //     }
+
+    //     _ = self.tx.close();
+    //     _ = self.tx.stopped().await;
+    //     Ok(())
+    // }
 }
 
 pub trait RecvHandler {
@@ -124,7 +293,7 @@ pub trait RecvHandler {
         &mut self,
         seqnum: u32,
         data: Data<UrbFrame>,
-    ) -> impl Future<Output = io::Result<()>>;
+    ) -> impl Future<Output = io::Result<()>> + 'static;
 }
 
 pub struct RecvLoop<R> {
@@ -138,81 +307,177 @@ impl<R> RecvLoop<R> {
         Self { rx, buf }
     }
 
-    pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
+    async fn do_loop<H>(
+        frame_rx: impl Stream<Item = io::Result<super::Recv>> + Unpin,
+        mut handler: H,
+    ) -> Result<(), Option<io::Error>>
     where
-        R: AsyncRead + Unpin + 'static,
         H: RecvHandler,
     {
         enum Event {
-            Cancelled,
-            Frame(io::Result<super::Recv>),
+            Frame(super::Recv),
+            GivebackComplete,
         }
 
-        let _guard = tracing::Span::current().entered();
-        let cancel = stream::once_future(async move {
-            cancel.cancelled_owned().await;
-            Event::Cancelled
-        });
-        let frame = stream::unfold((&mut self.rx, self.buf), |(mut rx, mut buf)| async {
-            let result = super::recv_frame(&mut rx, &mut buf).await.transpose()?;
-            Some((Event::Frame(result), (rx, buf)))
-        });
+        let _guard = Span::current().entered();
+        let mut replies = FuturesUnordered::new();
+        let mut frame_rx = frame_rx.map(|result| result.map(Event::Frame));
 
-        {
-            let mut events = pin!((cancel, frame).merge());
-            while let Some(event) = events.next().await {
-                match event {
-                    Event::Cancelled => break,
-                    Event::Frame(Ok(recv)) => match recv {
-                        super::Recv::Urb((
-                            Header {
-                                seqnum,
-                                status: proto::msg::Status::Success,
-                                ..
-                            },
-                            data,
-                        )) => {
-                            handler.urb_reply(seqnum, data.unwrap()).await?;
-                        }
-                        super::Recv::PortReset(Header {
-                            seqnum,
-                            status: proto::msg::Status::Success,
-                            ..
-                        }) => {
-                            handler.device_reset(seqnum)?;
-                        }
-                        super::Recv::Unlink(_) => {
-                            Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))?;
-                        }
-                        super::Recv::Urb((Header { status, .. }, _))
-                        | super::Recv::PortReset(Header { status, .. }) => match status {
-                            proto::msg::Status::Success => unreachable!(),
-                            proto::msg::Status::Failed => todo!(),
-                            proto::msg::Status::DevBusy => todo!(),
-                            proto::msg::Status::DevErr => {
-                                Err(io::Error::other("lender device in error state"))?;
-                            }
-                            proto::msg::Status::NoDev => {
-                                Err(io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "device disconnected on lender side",
-                                ))?;
-                            }
-                            proto::msg::Status::Unexpected => todo!(),
-                            proto::msg::Status::VersionMismatch => todo!(),
-                            proto::msg::Status::Timeout => todo!(),
-                            proto::msg::Status::Proto => todo!(),
-                        },
+        replies.push(blocker(None));
+
+        loop {
+            let event = {
+                let race = (frame_rx.next(), replies.next()).race();
+                race.await.ok_or(None)??
+            };
+            match event {
+                Event::GivebackComplete => {}
+                Event::Frame(super::Recv::Urb((
+                    Header {
+                        seqnum,
+                        status: proto::msg::Status::Success,
+                        ..
                     },
-                    Event::Frame(Err(err)) => Err(err)?,
+                    data,
+                ))) => {
+                    let reply = handler.urb_reply(seqnum, data.unwrap());
+                    let fut = async move { reply.await.map(|_| Event::GivebackComplete) };
+                    replies.push(blocker(Some(fut)));
                 }
-            }
+                Event::Frame(super::Recv::PortReset(Header {
+                    seqnum,
+                    status: proto::msg::Status::Success,
+                    ..
+                })) => {
+                    handler.device_reset(seqnum)?;
+                }
+                Event::Frame(super::Recv::Unlink(_)) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))?;
+                }
+                Event::Frame(super::Recv::Urb((Header { status, .. }, _)))
+                | Event::Frame(super::Recv::PortReset(Header { status, .. })) => match status {
+                    proto::msg::Status::Success => unreachable!(),
+                    proto::msg::Status::Failed => todo!(),
+                    proto::msg::Status::DevBusy => todo!(),
+                    proto::msg::Status::DevErr => {
+                        Err(io::Error::other("lender device in error state"))?;
+                    }
+                    proto::msg::Status::NoDev => {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "device disconnected on lender side",
+                        ))?;
+                    }
+                    proto::msg::Status::Unexpected => todo!(),
+                    proto::msg::Status::VersionMismatch => todo!(),
+                    proto::msg::Status::Timeout => todo!(),
+                    proto::msg::Status::Proto => todo!(),
+                },
+            };
         }
+    }
+
+    pub async fn run2(self, handler: impl RecvHandler, cancel: CancellationToken) -> io::Result<()>
+    where
+        R: AsyncRead + Unpin + 'static,
+    {
+        let Self { mut rx, buf } = self;
+        let result = {
+            let frame_rx = stream::unfold((&mut rx, buf), |(mut rx, mut buf)| async {
+                let result = super::recv_frame(&mut rx, &mut buf).await.transpose()?;
+                Some((result, (rx, buf)))
+            });
+            let frame_rx = pin!(stream::stop_after_future(
+                frame_rx,
+                cancel.cancelled_owned()
+            ));
+            match Self::do_loop(frame_rx, handler).await {
+                Ok(_) | Err(None) => Ok(()),
+                Err(Some(err)) => Err(err),
+            }
+        };
 
         // Done! Drain the streams
         let mut buf = Ring::with_capacity(32);
-        while 0 != buf.fill_with_reader(&mut self.rx).await? {}
-
-        Ok(())
+        while 0 != buf.fill_with_reader(&mut rx).await? {}
+        result
     }
+
+    // pub async fn run<H>(mut self, mut handler: H, cancel: CancellationToken) -> io::Result<()>
+    // where
+    //     R: AsyncRead + Unpin + 'static,
+    //     H: RecvHandler,
+    // {
+    //     enum Event {
+    //         Cancelled,
+    //         Frame(io::Result<super::Recv>),
+    //     }
+
+    //     let _guard = tracing::Span::current().entered();
+    //     let cancel = stream::once_future(async move {
+    //         cancel.cancelled_owned().await;
+    //         Event::Cancelled
+    //     });
+    //     let frame = stream::unfold((&mut self.rx, self.buf), |(mut rx, mut buf)| async {
+    //         let result = super::recv_frame(&mut rx, &mut buf).await.transpose()?;
+    //         Some((Event::Frame(result), (rx, buf)))
+    //     });
+
+    //     {
+    //         let mut events = pin!((cancel, frame).merge());
+    //         while let Some(event) = events.next().await {
+    //             match event {
+    //                 Event::Cancelled => break,
+    //                 Event::Frame(Ok(recv)) => match recv {
+    //                     super::Recv::Urb((
+    //                         Header {
+    //                             seqnum,
+    //                             status: proto::msg::Status::Success,
+    //                             ..
+    //                         },
+    //                         data,
+    //                     )) => {
+    //                         handler.urb_reply(seqnum, data.unwrap()).await?;
+    //                     }
+    //                     super::Recv::PortReset(Header {
+    //                         seqnum,
+    //                         status: proto::msg::Status::Success,
+    //                         ..
+    //                     }) => {
+    //                         handler.device_reset(seqnum)?;
+    //                     }
+    //                     super::Recv::Unlink(_) => {
+    //                         Err(io::Error::new(io::ErrorKind::InvalidData, "unlink"))?;
+    //                     }
+    //                     super::Recv::Urb((Header { status, .. }, _))
+    //                     | super::Recv::PortReset(Header { status, .. }) => match status {
+    //                         proto::msg::Status::Success => unreachable!(),
+    //                         proto::msg::Status::Failed => todo!(),
+    //                         proto::msg::Status::DevBusy => todo!(),
+    //                         proto::msg::Status::DevErr => {
+    //                             Err(io::Error::other("lender device in error state"))?;
+    //                         }
+    //                         proto::msg::Status::NoDev => {
+    //                             Err(io::Error::new(
+    //                                 io::ErrorKind::NotFound,
+    //                                 "device disconnected on lender side",
+    //                             ))?;
+    //                         }
+    //                         proto::msg::Status::Unexpected => todo!(),
+    //                         proto::msg::Status::VersionMismatch => todo!(),
+    //                         proto::msg::Status::Timeout => todo!(),
+    //                         proto::msg::Status::Proto => todo!(),
+    //                     },
+    //                 },
+    //                 Event::Frame(Err(err)) => Err(err)?,
+    //             }
+    //         }
+    //     }
+
+    //     // Done! Drain the streams
+    //     let mut buf = Ring::with_capacity(32);
+    //     while 0 != buf.fill_with_reader(&mut self.rx).await? {}
+
+    //     Ok(())
+    // }
 }

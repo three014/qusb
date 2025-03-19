@@ -136,6 +136,41 @@ pub mod metrics {
     }
 }
 
+pub struct Interval {
+    start: Instant,
+    period: Duration,
+}
+
+impl Interval {
+    pub fn new(period: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            period,
+        }
+    }
+
+    pub async fn tick(&self) {
+        let time_til_next_tick = {
+            let elapsed = self.start.elapsed().as_secs_f64();
+            let period = self.period.as_secs_f64();
+            period - (elapsed % period)
+        };
+        compio::runtime::time::sleep(Duration::from_secs_f64(time_til_next_tick)).await
+    }
+}
+
+#[inline(always)]
+pub async fn blocker<T, F>(f: Option<F>) -> T
+where
+    F: Future<Output = T>,
+{
+    if let Some(f) = f {
+        f.await
+    } else {
+        cold(std::future::pending()).await
+    }
+}
+
 #[cold]
 #[inline(never)]
 pub fn cold<T>(t: T) -> T {

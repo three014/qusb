@@ -127,9 +127,7 @@ where
         self.buf.advance(size_of::<T::Header>());
         (header, Data::new(self.buf).ok())
     }
-}
 
-impl Data<[u8]> {
     /// Consumes the `Data` and returns the underlying
     /// slice as a `BytesMut`.
     #[inline(always)]

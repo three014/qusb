@@ -32,6 +32,7 @@ enum State {
 }
 
 impl BlockingOps for Arc<rusb::DeviceHandle<rusb::Context>> {
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn set_alt_setting_async(&self, seqnum: u32, interface: u8, setting: u8) -> SetInterface {
         SetInterface {
             seqnum,
@@ -43,6 +44,7 @@ impl BlockingOps for Arc<rusb::DeviceHandle<rusb::Context>> {
         }
     }
 
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn set_config_async(
         &self,
         seqnum: u32,
@@ -69,6 +71,7 @@ impl BlockingOps for Arc<rusb::DeviceHandle<rusb::Context>> {
         }
     }
 
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn clear_stall_async(&self, seqnum: u32, endpoint: u8) -> ClearStall {
         ClearStall {
             seqnum,
@@ -80,7 +83,6 @@ impl BlockingOps for Arc<rusb::DeviceHandle<rusb::Context>> {
     }
 }
 
-#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SetInterface {
     seqnum: u32,
     interface: u8,
@@ -229,10 +231,4 @@ impl Future for ClearStall {
             }
         }
     }
-}
-
-pub enum CtrlReq {
-    SetInterface { setting: u8, interface: u8 },
-    SetConfig { desired: u8 },
-    ClearStall { endpoint: u8 },
 }

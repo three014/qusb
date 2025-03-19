@@ -9,13 +9,13 @@ use std::{
 
 use tracing::{error, info, trace, warn};
 use vhci::{
+    DataRate, Port, PortChange, PortStatus,
     ioctl::{Address, UrbHandle},
     usbfs::Request,
     utils::{BoundedI16, BoundedU8, TimeoutMillis},
-    DataRate, Port, PortChange, PortStatus,
 };
 
-use crate::utils::{mpsc, oneshot, Ctrl, LinkResult, NoHash, ThreeKeyMap};
+use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, mpsc, oneshot};
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -205,13 +205,13 @@ impl Demuxer {
                                 _ => {
                                     let address = NoHash(urb.address);
                                     match mailer.link_key3_to_key2(*handle, &address) {
-                                            LinkResult::Success | LinkResult::NewKeyAlreadyExists => {
-                                                mailer.get_by_key2(&address).cloned()
-                                            }
-                                            LinkResult::ExistingKeyDoesNotExist => panic!(
-                                                "key {address:?} does not exist, was trying to link {handle:?}"
-                                            ),
+                                        LinkResult::Success | LinkResult::NewKeyAlreadyExists => {
+                                            mailer.get_by_key2(&address).cloned()
                                         }
+                                        LinkResult::ExistingKeyDoesNotExist => panic!(
+                                            "key {address:?} does not exist, was trying to link {handle:?}"
+                                        ),
+                                    }
                                 }
                             },
                             vhci::ioctl::Work::CancelUrb(ref handle) => {
@@ -384,11 +384,8 @@ impl VhciRemote {
     {
         _ = self.giveback_tx.send(urb.handle()).await;
         let remote = self.remote.clone();
-        compio::runtime::spawn_blocking(move || {
-            _ = remote.giveback(urb);
-        })
-        .detach();
-        Ok(())
+        let op = compio::runtime::spawn_blocking(move || remote.giveback(urb));
+        op.await.unwrap()
     }
 
     #[inline(always)]
@@ -409,9 +406,7 @@ fn recv_work(
 
     const TIMEOUT: TimeoutMillis = TimeoutMillis::Time(BoundedI16::new(999).unwrap());
     while (match work_rx.fetch_work_timeout(TIMEOUT) {
-        Ok(work) => {
-            work_tx.send(work).ok()
-        },
+        Ok(work) => work_tx.send(work).ok(),
         Err(err)
             if err.kind() == io::ErrorKind::TimedOut
                 || err.kind() == io::ErrorKind::Interrupted

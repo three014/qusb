@@ -5,8 +5,8 @@ use std::{
     ops::DerefMut,
     pin::pin,
     rc::Rc,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, atomic::AtomicU32},
+    time::{Duration, Instant},
 };
 // use std::collections::VecDeque;
 
@@ -17,7 +17,9 @@ use compio::{
 };
 use futures_concurrency::{future::Race, stream::Merge};
 use futures_lite::{StreamExt, stream};
-use lend::{Bulk, Ctrl, Int, Iso, ResultData, blocking::BlockingOps};
+use lend::{
+    Bulk, ClearStall, Ctrl, Int, Iso, ResultData, SetConfig, SetInterface, blocking::BlockingOps,
+};
 use nohash_hasher::{IntMap, IntSet};
 use proto::{
     data::{Data, ReadError, Ring},
@@ -37,9 +39,12 @@ use zerocopy::{FromBytes, IntoBytes, transmute};
 use crate::{
     Error, Result, UrbWithIsoData,
     stub::{self, RegisterPort},
-    utils::{CloseStream, Counter, SimpleMap, align_to_usize, cold, metrics, mpsc},
+    utils::{
+        CloseStream, Counter, SimpleMap, align_to_usize, cold,
+        metrics::{self, RollingAvg},
+        mpsc,
+    },
 };
-// use crate::utils::align;
 
 mod borrow;
 mod lend;
@@ -173,9 +178,10 @@ impl BorrowSendHandler {
         id: BorrowId,
         handle_seqnum_map: HandleSeqnumLinker,
     ) -> Self {
-        const BUF_LEN: usize = 16 << 12;
+        const BUF_LEN: usize = 16 << 14;
         Self {
             buf: BytesMut::with_capacity(BUF_LEN),
+            // scratch: vec![0u8; u16::MAX as usize],
             vhci,
             id,
             cur_seq: Counter::new(0),
@@ -241,20 +247,21 @@ impl borrow::SendHandler for BorrowSendHandler {
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn set_address(
+    fn set_address(
         &mut self,
         urb: ioctl::IocUrb,
         handle: ioctl::UrbHandle,
-    ) -> io::Result<()> {
+    ) -> impl Future<Output = io::Result<()>> + 'static {
         self.addr = urb.setup_packet.value() as u8;
         debug!("({}) set local dev address to {:03}", self.id, self.addr);
-
-        let urb = EmptyUrb {
-            handle,
-            ioctl_urb: urb,
-        };
-
-        self.vhci.giveback_urb(urb).await
+        let mut remote = self.vhci.clone();
+        async move {
+            let urb = EmptyUrb {
+                handle,
+                ioctl_urb: urb,
+            };
+            remote.giveback_urb(urb).await
+        }
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -351,6 +358,7 @@ impl borrow::SendHandler for BorrowSendHandler {
 
                 // TEST: We're gonna see if VHCI needs
                 // an actual buffer for this part.
+                // let transfr = &mut self.scratch[..actual_transfer_len];
                 let transfer = &mut [][..];
 
                 // CONTRACT: All of `data` is the isochronous packet buffer.
@@ -370,48 +378,6 @@ impl borrow::SendHandler for BorrowSendHandler {
             // the entire USB connection.
             self.vhci.fetch_data(borrower_urb)?;
         }
-
-        // if needs_fetch {
-        //     let data = &mut buf[header_len..header_len + data_len];
-        //     let (transfer, iso_data) = if is_out {
-        //         // This is an OUT transfer, therefore we have already reserved
-        //         // the right buffer size for the data. Now we just split the
-        //         // buffer into the transfer and iso data.
-        //         let (transfer, rest) = data.split_at_mut(real_transfer_len);
-        //         let iso_data =
-        //             <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(rest, packet_count)
-        //                 .unwrap();
-        //         (&mut transfer[..actual_transfer_len], iso_data)
-        //     } else {
-        //         // This is an Isochronous IN transfer, therefore we don't need
-        //         // to grab the transfer data since there is none.
-        //         // So we use the rest of the scratch space as buffer!
-        //         // let additional = actual_transfer_len.saturating_sub(self.buf.len());
-        //         // self.buf.reserve(additional);
-
-        //         // // SAFETY: Data will never be read.
-        //         // unsafe { self.buf.set_len(actual_transfer_len) };
-        //         // let transfer = &mut self.buf[..actual_transfer_len];
-
-        //         // TEST: We're gonna see if VHCI needs an actual buffer.
-        //         let transfer = &mut [][..];
-
-        //         // CONTRACT: All of `data` is the isochronous packet buffer.
-        //         let iso_data =
-        //             <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(data, packet_count)
-        //                 .unwrap();
-        //         (transfer, iso_data)
-        //     };
-
-        //     let borrower_urb = UrbWithIsoData {
-        //         handle,
-        //         header: &urb_header,
-        //         transfer,
-        //         iso_data,
-        //     };
-
-        //     self.vhci.fetch_data(borrower_urb)?;
-        // }
 
         // Step 5: Create and write our headers to their reserved spaces.
         let header = Header {
@@ -542,7 +508,13 @@ impl BorrowRecvHandler {
 }
 
 impl borrow::RecvHandler for BorrowRecvHandler {
-    async fn urb_reply(&mut self, seqnum: u32, data: Data<UrbFrame>) -> io::Result<()> {
+    fn urb_reply(
+        &mut self,
+        seqnum: u32,
+        data: Data<UrbFrame>,
+    ) -> impl Future<Output = io::Result<()>> + 'static {
+        let mut vhci = self.vhci.clone();
+        let id = self.id;
         let handle = {
             let mut guard = self.handle_seqnum_map.lock().unwrap();
             let (seqnums, handles) = guard.deref_mut();
@@ -550,39 +522,40 @@ impl borrow::RecvHandler for BorrowRecvHandler {
             _ = seqnums.remove(&handle).unwrap();
             handle
         };
-        let (urb, data) = data.split::<[u8]>();
-        let mut data = data.unwrap().into_bytes_mut();
+        async move {
+            let (urb, data) = data.split::<[u8]>();
+            let mut data = data.unwrap().into_bytes_mut();
 
-        let actual_transfer_len = urb.actual_transfer_len as usize;
+            let actual_transfer_len = urb.actual_transfer_len as usize;
 
-        // We might not be expecting data if we sent some to the usb device
-        let giveback = OwnedUrbGiveback {
-            handle,
-            kind: urb.kind,
-            status: urb.status,
-            data: match urb.is_out() {
-                true => GivebackData::Out(urb.actual_transfer_len),
-                false => GivebackData::In({
-                    let mut data = data.split_to(urb.padded_transfer_len());
-                    data.truncate(actual_transfer_len);
-                    data
-                }),
-            },
-            iso_packets: data,
-        };
+            // We might not be expecting data if we sent some to the usb device
+            let giveback = OwnedUrbGiveback {
+                handle,
+                kind: urb.kind,
+                status: urb.status,
+                data: match urb.is_out() {
+                    true => GivebackData::Out(urb.actual_transfer_len),
+                    false => GivebackData::In({
+                        let mut data = data.split_to(urb.padded_transfer_len());
+                        data.truncate(actual_transfer_len);
+                        data
+                    }),
+                },
+                iso_packets: data,
+            };
 
-        self.vhci.giveback_urb(giveback).await?;
-        if vhci::Status::Success != urb.status {
-            let _guard = warn_span!("urb_reply").entered();
-            warn!(
-                "({}) {:?} {:?} transfer {seqnum} failed: {:?}",
-                self.id,
-                urb.kind,
-                urb.endpoint.direction(),
-                urb.status
-            );
+            vhci.giveback_urb(giveback).await?;
+            if vhci::Status::Success != urb.status {
+                let _guard = warn_span!("urb_reply").entered();
+                warn!(
+                    "({id}) {:?} {:?} transfer {seqnum} failed: {:?}",
+                    urb.kind,
+                    urb.endpoint.direction(),
+                    urb.status
+                );
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -682,14 +655,14 @@ where
         let send_handler = BorrowSendHandler::new(vhci.remote(), id, map);
         let send = compio::runtime::spawn(
             send_loop
-                .run(send_handler, cancel_token.clone())
+                .run2(send_handler, cancel_token.clone())
                 .in_current_span(),
         );
         let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
         let recv_handler = BorrowRecvHandler::new(vhci.remote(), id, cloned_map);
         let recv = compio::runtime::spawn(
             recv_loop
-                .run(recv_handler, cancel_token.clone())
+                .run2(recv_handler, cancel_token.clone())
                 .in_current_span(),
         );
 
@@ -1020,6 +993,605 @@ const fn compress_frame_len(len: usize) -> u16 {
     (len / size_of::<u64>()) as u16
 }
 
+struct LendSendHandler {
+    id: msg::UsbDeviceId,
+}
+
+#[derive(Default, Debug, Clone)]
+struct BigTransfers {
+    inner: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>>,
+}
+
+impl BigTransfers {
+    fn insert(&mut self, transfer: InnerTransfer) {
+        const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
+        let mut cache = self.inner.borrow_mut();
+        let key = transfer.num_iso_packets() as u16;
+        let entry = cache.get_mut(&key);
+        match entry {
+            Some(entry) => match std::mem::replace(entry, EMPTY) {
+                OneOrMany::One(other) => {
+                    *entry = OneOrMany::Many(vec![transfer, other]);
+                }
+
+                OneOrMany::Many(mut vec) => {
+                    vec.push(transfer);
+                    *entry = OneOrMany::Many(vec);
+                }
+            },
+            None => {
+                let value = OneOrMany::One(transfer);
+                cache.insert(key, value);
+            }
+        }
+    }
+
+    fn remove(&mut self, num_iso_packets: u16) -> Option<InnerTransfer> {
+        let mut cache = self.inner.borrow_mut();
+        let maybe_entry = cache.range_mut(num_iso_packets..).next();
+        if let Some((&num_pkts, entry)) = maybe_entry {
+            const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
+            let (transfer, remove_entry) = {
+                match std::mem::replace(entry, EMPTY) {
+                    OneOrMany::One(transfer) => (transfer, true),
+                    OneOrMany::Many(mut vec) => {
+                        let transfer = vec.pop().expect("shouldn't be an empty vec");
+                        if vec.is_empty() {
+                            (transfer, true)
+                        } else {
+                            *entry = OneOrMany::Many(vec);
+                            (transfer, false)
+                        }
+                    }
+                }
+            };
+            if remove_entry {
+                cache.remove(&num_pkts);
+            }
+            Some(transfer)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+struct SmallTransfers {
+    inner: Rc<RefCell<Vec<InnerTransfer>>>,
+}
+
+impl SmallTransfers {
+    fn remove(&mut self) -> Option<InnerTransfer> {
+        self.inner.borrow_mut().pop()
+    }
+
+    fn insert(&mut self, transfer: InnerTransfer) {
+        self.inner.borrow_mut().push(transfer);
+    }
+}
+
+struct LendRecvHandler {
+    dev_id: msg::UsbDeviceId,
+    device: Arc<rusb::DeviceHandle<rusb::Context>>,
+    libusb: compio::runtime::JoinHandle<()>,
+    interfaces: Arc<Mutex<IntSet<u8>>>,
+    cancel_tokens: Rc<RefCell<IntMap<u32, CancellationToken>>>,
+    scratch: BytesMut,
+    isos: BigTransfers,
+    smalls: SmallTransfers,
+}
+
+impl LendRecvHandler {
+    fn register_cancel_token(&mut self, seqnum: u32) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        self.cancel_tokens
+            .borrow_mut()
+            .insert(seqnum, cancel.clone());
+        cancel
+    }
+}
+
+impl lend::RecvHandler for LendRecvHandler {
+    fn cancel_urb(&mut self, seqnum: u32) {
+        if let Some(transfer) = self.cancel_tokens.borrow_mut().remove(&seqnum) {
+            transfer.cancel();
+        }
+    }
+
+    fn device_reset(
+        &mut self,
+        seqnum: u32,
+    ) -> impl Future<Output = Seq<proto::msg::Status>> + 'static {
+        async move {
+            Seq {
+                seqnum,
+                data: msg::Status::Success,
+            }
+        }
+    }
+
+    fn set_config(
+        &mut self,
+        Seq {
+            seqnum,
+            data: SetConfig { desired },
+        }: Seq<SetConfig>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let interfaces = Arc::clone(&self.interfaces);
+        let device = Arc::clone(&self.device);
+        async move {
+            let Seq {
+                seqnum,
+                data: status,
+            } = device.set_config_async(seqnum, desired, interfaces).await;
+            Seq {
+                seqnum,
+                data: Ctrl {
+                    res: ResultData::Out {
+                        bytes_transferred: 0,
+                    },
+                    status,
+                },
+            }
+        }
+    }
+
+    fn set_interface(
+        &mut self,
+        Seq {
+            seqnum,
+            data: SetInterface { setting, interface },
+        }: Seq<SetInterface>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let device = Arc::clone(&self.device);
+        async move {
+            let Seq {
+                seqnum,
+                data: status,
+            } = device
+                .set_alt_setting_async(seqnum, interface, setting)
+                .await;
+            Seq {
+                seqnum,
+                data: Ctrl {
+                    res: ResultData::Out {
+                        bytes_transferred: 0,
+                    },
+                    status,
+                },
+            }
+        }
+    }
+
+    fn clear_stall(
+        &mut self,
+        Seq {
+            seqnum,
+            data: ClearStall { endpoint },
+        }: Seq<ClearStall>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let device = Arc::clone(&self.device);
+        async move {
+            let Seq {
+                seqnum,
+                data: status,
+            } = device.clear_stall_async(seqnum, endpoint).await;
+            Seq {
+                seqnum,
+                data: Ctrl {
+                    res: ResultData::Out {
+                        bytes_transferred: 0,
+                    },
+                    status,
+                },
+            }
+        }
+    }
+
+    fn new_ctrl(
+        &mut self,
+        Seq {
+            seqnum,
+            data: urb_frame,
+        }: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let cancel = self.register_cancel_token(seqnum);
+        let header = urb_frame.get().header();
+        let actual_transfer_len = header.actual_transfer_len as usize;
+        let ctrl_pkt = header.ctrl_packet;
+        let mut buf = if header.is_out() {
+            let w_length = ctrl_pkt.length() as usize;
+            let mut buf = urb_frame.into_bytes_mut();
+            buf.advance(16);
+            debug_assert_eq!(w_length + size_of::<ioctl::IocSetupPacket>(), buf.len());
+            buf
+        } else {
+            self.scratch.put_slice(ctrl_pkt.as_bytes());
+            self.scratch.put_bytes(0, header.padded_transfer_len());
+            self.scratch.split()
+        };
+        let is_get_status = Request::STANDARD_DEVICE_GET_STATUS == ctrl_pkt.req();
+
+        let buf = buf.split_to(size_of::<ioctl::IocSetupPacket>() + actual_transfer_len);
+        let transfer = self
+            .smalls
+            .remove()
+            .unwrap_or_else(|| InnerTransfer::new(0));
+
+        // SAFETY: Transfer buf is exactly the length needed for a control
+        // transfer, and its capacity matches w_length + 8.
+        let transfer = unsafe { transfer.into_ctrl(&self.device, buf, Duration::from_millis(900)) };
+
+        let mut cache = self.smalls.clone();
+        let dev_id = self.dev_id;
+        async move {
+            let result = transfer.submit(&cancel).await;
+            let status = convert_libusb_to_vhci(result, UrbType::Ctrl, seqnum, dev_id);
+
+            let mut buf = {
+                let (transfer, mut buf) = transfer.into_parts().unwrap();
+                cache.insert(transfer);
+                buf.advance(size_of::<ioctl::IocSetupPacket>());
+                buf
+            };
+
+            if is_get_status {
+                // Indicate that our fake USB device is self powered.
+                buf[0] = 0x01;
+            }
+
+            let res = ResultData::new(buf, ctrl_pkt.req().dir());
+            Seq {
+                seqnum,
+                data: Ctrl { res, status },
+            }
+        }
+    }
+
+    fn new_int(
+        &mut self,
+        Seq {
+            seqnum,
+            data: urb_frame,
+        }: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Int>> + 'static {
+        let cancel = self.register_cancel_token(seqnum);
+        let (header, data) = urb_frame.split::<[u8]>();
+        let buf = if header.is_out() {
+            data.unwrap()
+                .into_bytes_mut()
+                .split_to(header.actual_transfer_len as usize)
+        } else {
+            self.scratch.reserve(header.padded_transfer_len());
+            unsafe { self.scratch.set_len(header.padded_transfer_len()) };
+            self.scratch
+                .split()
+                .split_to(header.actual_transfer_len as usize)
+        };
+
+        let transfer = self
+            .smalls
+            .remove()
+            .unwrap_or_else(|| InnerTransfer::new(0));
+        let endpoint = header.endpoint;
+        let interval = header.interval;
+
+        // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
+        let transfer = unsafe { transfer.into_int(&self.device, endpoint.0, buf) };
+
+        let mut cache = self.smalls.clone();
+        let dev_id = self.dev_id;
+        async move {
+            let result = transfer.submit(&cancel).await;
+            let status = convert_libusb_to_vhci(result, UrbType::Int, seqnum, dev_id);
+
+            let (transfer, buf) = transfer.into_parts().unwrap();
+            cache.insert(transfer);
+
+            let res = ResultData::new(buf, endpoint.direction());
+            Seq {
+                seqnum,
+                data: Int {
+                    res,
+                    endpoint,
+                    interval,
+                    status,
+                },
+            }
+        }
+    }
+
+    fn new_iso(
+        &mut self,
+        Seq {
+            seqnum,
+            data: urb_frame,
+        }: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Iso>> + 'static {
+        #[repr(transparent)]
+        struct Pkt(ioctl::IocIsoPacketData);
+        impl IsoPacket for Pkt {
+            fn len(&self) -> u32 {
+                self.0.packet_length
+            }
+        }
+
+        #[repr(transparent)]
+        struct Iter<'a> {
+            pkts: std::slice::Iter<'a, ioctl::IocIsoPacketData>,
+        }
+        impl Iterator for Iter<'_> {
+            type Item = Pkt;
+            fn next(&mut self) -> Option<Self::Item> {
+                self.pkts.next().map(|pkt| Pkt(*pkt))
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.pkts.size_hint()
+            }
+        }
+        impl ExactSizeIterator for Iter<'_> {
+            fn len(&self) -> usize {
+                self.pkts.len()
+            }
+        }
+
+        let cancel = self.register_cancel_token(seqnum);
+
+        let (header, data) = urb_frame.split::<[u8]>();
+        let mut data = data.unwrap().into_bytes_mut();
+        let padded_transfer_len = header.padded_transfer_len();
+
+        let (transfer_buf, mut raw_iso_buf) = if header.is_out() {
+            let transfer_buf = data
+                .split_to(padded_transfer_len)
+                .split_to(header.actual_transfer_len as usize);
+            (transfer_buf, data)
+        } else {
+            self.scratch.reserve(padded_transfer_len);
+            unsafe { self.scratch.set_len(padded_transfer_len) };
+            let transfer_buf = self
+                .scratch
+                .split()
+                .split_to(header.actual_transfer_len as usize);
+            (transfer_buf, data)
+        };
+
+        let num_iso_pkts = header.iso_packet_count as usize;
+        let iso_pkts =
+            <[ioctl::IocIsoPacketData]>::ref_from_bytes_with_elems(&raw_iso_buf[..], num_iso_pkts)
+                .unwrap();
+        let transfer = self
+            .isos
+            .remove(header.iso_packet_count)
+            .unwrap_or_else(|| InnerTransfer::new(num_iso_pkts));
+        let endpoint = header.endpoint;
+        let interval = header.interval;
+        let transfer = unsafe {
+            transfer.into_iso(
+                &self.device,
+                endpoint.0,
+                transfer_buf,
+                Iter {
+                    pkts: iso_pkts.iter(),
+                },
+            )
+        };
+
+        let mut cache = self.isos.clone();
+        let dev_id = self.dev_id;
+
+        async move {
+            let result = transfer.submit(&cancel).await;
+            let status = convert_libusb_to_vhci(result, UrbType::Iso, seqnum, dev_id);
+
+            let our_pkts = <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
+                &mut raw_iso_buf[..],
+                num_iso_pkts,
+            )
+            .unwrap();
+            let their_pkts = transfer
+                .iso_packets()
+                .expect("why wouldn't a transfer be done by this point?");
+
+            let mut num_errors = 0;
+            for (our_pkt, libusb_pkt) in our_pkts.iter_mut().zip(their_pkts) {
+                our_pkt.packet_actual = libusb_pkt.actual_len();
+                our_pkt.status = vhci_from_transfer_status(libusb_pkt.status()).to_errno_raw(true);
+                if our_pkt.status != 0 {
+                    num_errors += 1;
+                }
+            }
+
+            let (transfer, mut buf) = transfer.into_parts().unwrap();
+            cache.insert(transfer);
+
+            // SAFETY: Isochronous transfer requires that the full
+            // buffer be sent back to the caller.
+            unsafe { buf.set_len(buf.capacity()) };
+
+            let res = ResultData::new(buf, endpoint.direction());
+            Seq {
+                seqnum,
+                data: Iso {
+                    res,
+                    endpoint,
+                    interval,
+                    raw_iso_buf,
+                    num_errors,
+                    num_iso_packets: num_iso_pkts as u16,
+                    status,
+                },
+            }
+        }
+    }
+
+    fn new_bulk(
+        &mut self,
+        Seq {
+            seqnum,
+            data: urb_frame,
+        }: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Bulk>> + 'static {
+        let cancel = self.register_cancel_token(seqnum);
+        let (header, data) = urb_frame.split::<[u8]>();
+        let buf = if header.is_out() {
+            data.unwrap()
+                .into_bytes_mut()
+                .split_to(header.actual_transfer_len as usize)
+        } else {
+            self.scratch.reserve(header.padded_transfer_len());
+            unsafe { self.scratch.set_len(header.padded_transfer_len()) };
+            self.scratch
+                .split()
+                .split_to(header.actual_transfer_len as usize)
+        };
+
+        let transfer = self
+            .smalls
+            .remove()
+            .unwrap_or_else(|| InnerTransfer::new(0));
+        let endpoint = header.endpoint;
+
+        // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
+        let transfer =
+            unsafe { transfer.into_bulk(&self.device, endpoint.0, TransferFlags::NONE, buf) };
+
+        let mut cache = self.smalls.clone();
+        let dev_id = self.dev_id;
+        async move {
+            let result = transfer.submit(&cancel).await;
+            let status = convert_libusb_to_vhci(result, UrbType::Bulk, seqnum, dev_id);
+
+            let (transfer, buf) = transfer.into_parts().unwrap();
+            cache.insert(transfer);
+
+            let res = ResultData::new(buf, endpoint.direction());
+            Seq {
+                seqnum,
+                data: Bulk {
+                    res,
+                    endpoint,
+                    status,
+                },
+            }
+        }
+    }
+}
+
+const THRESHOLD: usize = 64;
+
+struct LendStats {
+    last_few_setup_times: RollingAvg<THRESHOLD, metrics::Duration>,
+    min_setup_time: Duration,
+    max_setup_time: Duration,
+    num_active_transfers: Arc<AtomicU32>,
+    max_active_transfers: u32,
+}
+
+impl LendStats {
+    fn new() -> Self {
+        Self {
+            last_few_setup_times: RollingAvg::preallocated(),
+            min_setup_time: Duration::MAX,
+            max_setup_time: Duration::ZERO,
+            num_active_transfers: Arc::new(AtomicU32::new(0)),
+            max_active_transfers: 0,
+        }
+    }
+
+    fn mark_start(&mut self) -> Instant {
+        let num_active = self
+            .num_active_transfers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.max_active_transfers = std::cmp::max(self.max_active_transfers, num_active + 1);
+        Instant::now()
+    }
+
+    fn mark_end(&mut self, start: Instant) {
+        let elapsed = start.elapsed();
+        self.last_few_setup_times.push(elapsed);
+        self.min_setup_time = std::cmp::min(self.min_setup_time, elapsed);
+        self.max_setup_time = std::cmp::max(self.max_setup_time, elapsed);
+    }
+}
+
+struct StatLendRecvHandler {
+    inner: LendRecvHandler,
+    stats: LendStats,
+}
+
+impl lend::RecvHandler for StatLendRecvHandler {
+    fn cancel_urb(&mut self, seqnum: u32) {
+        self.inner.cancel_urb(seqnum);
+    }
+
+    fn device_reset(
+        &mut self,
+        seqnum: u32,
+    ) -> impl Future<Output = Seq<proto::msg::Status>> + 'static {
+        self.inner.device_reset(seqnum)
+    }
+
+    fn set_config(&mut self, data: Seq<SetConfig>) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.set_config(data);
+        self.stats.mark_end(start);
+        fut
+    }
+
+    fn set_interface(
+        &mut self,
+        data: Seq<SetInterface>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.set_interface(data);
+        self.stats.mark_end(start);
+        fut
+    }
+
+    fn clear_stall(&mut self, data: Seq<ClearStall>) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.clear_stall(data);
+        self.stats.mark_end(start);
+        fut
+    }
+
+    fn new_ctrl(
+        &mut self,
+        frame: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.new_ctrl(frame);
+        self.stats.mark_end(start);
+        fut
+    }
+
+    fn new_int(&mut self, frame: Seq<Data<UrbFrame>>) -> impl Future<Output = Seq<Int>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.new_int(frame);
+        self.stats.mark_end(start);
+        fut
+    }
+
+    fn new_iso(&mut self, frame: Seq<Data<UrbFrame>>) -> impl Future<Output = Seq<Iso>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.new_iso(frame);
+        self.stats.mark_end(start);
+        fut
+    }
+
+    fn new_bulk(
+        &mut self,
+        frame: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Bulk>> + 'static {
+        let start = self.stats.mark_start();
+        let fut = self.inner.new_bulk(frame);
+        self.stats.mark_end(start);
+        fut
+    }
+}
+
 pub struct LendDevice<W, R> {
     tx: W,
     rx: R,
@@ -1051,6 +1623,33 @@ where
     W: AsyncWrite + CloseStream + Unpin,
     R: AsyncRead + Unpin,
 {
+    pub async fn lend2(
+        Self {
+            tx,
+            rx,
+            buf_rx,
+            device,
+            id: dev_id,
+        }: Self,
+        cancel_token: CancellationToken,
+    ) -> Result<()> {
+        let device = Arc::new(device);
+        let ctx = device.context().clone();
+        let span = warn_span!("libusb_event_handler");
+        let runtime = cancel_token.clone();
+        let libusb = compio::runtime::spawn_blocking(move || {
+            let _guard = span.entered();
+            while !runtime.is_cancelled() {
+                if let Err(err) = ctx.handle_events(Some(Duration::from_secs(5))) {
+                    warn! { %err };
+                }
+            }
+        });
+
+        
+        todo!()
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn lend(self, cancel_token: CancellationToken) -> Result<()> {
         let Self {
@@ -1092,11 +1691,11 @@ where
         ));
 
         // ---- Cache ----
-        const BUF_LEN: usize = 16 << 10;
+        const BUF_LEN: usize = 16 << 14;
         buf_rx.reserve(BUF_LEN);
         let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
         // let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
-        let mut scratch_dma = BytesMut::with_capacity(usize::from(u16::MAX));
+        let mut scratch = BytesMut::with_capacity(usize::from(u16::MAX));
         let iso_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> = Rc::default();
         let small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
 
@@ -1146,8 +1745,7 @@ where
         let mut min_setup_time = Duration::MAX;
         let mut max_setup_time = Duration::ZERO;
         const THRESHOLD: usize = 64;
-        let mut last_few_setup_times =
-            metrics::RollingAvg::<THRESHOLD, metrics::Duration>::preallocated();
+        let mut last_few_setup_times = RollingAvg::<THRESHOLD, metrics::Duration>::preallocated();
 
         let result: std::result::Result<(), (Option<Header>, io::Error)> = {
             let mut main_events = pin!((cancel, frame, iso, int, ctrl, blocking, bulk).merge());
@@ -1199,10 +1797,10 @@ where
 
                                     (transfer_buf, data)
                                 } else {
-                                    scratch_dma.reserve(padded_transfer_len);
-                                    unsafe { scratch_dma.set_len(padded_transfer_len) };
+                                    scratch.reserve(padded_transfer_len);
+                                    unsafe { scratch.set_len(padded_transfer_len) };
                                     let transfer_buf =
-                                        scratch_dma.split_to(urb.actual_transfer_len as usize);
+                                        scratch.split_to(urb.actual_transfer_len as usize);
                                     (transfer_buf, data)
                                 };
 
@@ -1337,9 +1935,9 @@ where
                                 let buf = if is_out {
                                     data.split_to(urb.actual_transfer_len as usize)
                                 } else {
-                                    scratch_dma.reserve(urb.padded_transfer_len());
-                                    unsafe { scratch_dma.set_len(urb.padded_transfer_len()) };
-                                    scratch_dma
+                                    scratch.reserve(urb.padded_transfer_len());
+                                    unsafe { scratch.set_len(urb.padded_transfer_len()) };
+                                    scratch
                                         .split_to(urb.padded_transfer_len())
                                         .split_to(urb.actual_transfer_len as usize)
                                 };
@@ -1389,9 +1987,9 @@ where
                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
                             }
                             UrbType::Ctrl => match lend::CtrlKind::parse(urb.ctrl_packet) {
-                                lend::CtrlKind::Blocking(
-                                    lend::blocking::CtrlReq::SetInterface { setting, interface },
-                                ) => {
+                                lend::CtrlKind::Blocking(lend::CtrlReq::SetInterface(
+                                    SetInterface { setting, interface },
+                                )) => {
                                     let blocking_tx = blocking_tx.clone();
                                     let device = Arc::clone(&device);
                                     compio::runtime::spawn(async move {
@@ -1407,9 +2005,9 @@ where
                                     min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                     max_setup_time = std::cmp::max(max_setup_time, elapsed);
                                 }
-                                lend::CtrlKind::Blocking(lend::blocking::CtrlReq::SetConfig {
+                                lend::CtrlKind::Blocking(lend::CtrlReq::SetConfig(SetConfig {
                                     desired,
-                                }) => {
+                                })) => {
                                     let interfaces = Arc::clone(&claimed_interfaces);
                                     let blocking_tx = blocking_tx.clone();
                                     let device = Arc::clone(&device);
@@ -1426,9 +2024,9 @@ where
                                     min_setup_time = std::cmp::min(min_setup_time, elapsed);
                                     max_setup_time = std::cmp::max(max_setup_time, elapsed);
                                 }
-                                lend::CtrlKind::Blocking(lend::blocking::CtrlReq::ClearStall {
-                                    endpoint,
-                                }) => {
+                                lend::CtrlKind::Blocking(lend::CtrlReq::ClearStall(
+                                    ClearStall { endpoint },
+                                )) => {
                                     let blocking_tx = blocking_tx.clone();
                                     let device = Arc::clone(&device);
                                     compio::runtime::spawn(async move {
@@ -1453,9 +2051,9 @@ where
                                         let w_length = ctrl_pkt.length() as usize;
                                         debug_assert_eq!(w_length, actual_transfer_len);
                                         let needed = size_of_pkt + urb.padded_transfer_len();
-                                        scratch_dma.reserve(needed);
-                                        unsafe { scratch_dma.set_len(needed) };
-                                        scratch_dma.split_to(needed)
+                                        scratch.reserve(needed);
+                                        unsafe { scratch.set_len(needed) };
+                                        scratch.split_to(needed)
                                     };
 
                                     let (setup_space, rest) =
@@ -1535,9 +2133,9 @@ where
                                 let buf = if is_out {
                                     data.split_to(urb.actual_transfer_len as usize)
                                 } else {
-                                    scratch_dma.reserve(urb.padded_transfer_len());
-                                    unsafe { scratch_dma.set_len(urb.padded_transfer_len()) };
-                                    scratch_dma
+                                    scratch.reserve(urb.padded_transfer_len());
+                                    unsafe { scratch.set_len(urb.padded_transfer_len()) };
+                                    scratch
                                         .split_to(urb.padded_transfer_len())
                                         .split_to(urb.actual_transfer_len as usize)
                                 };
