@@ -156,7 +156,7 @@ impl Interval {
             let period = self.period.as_secs_f64();
             period - (elapsed % period)
         };
-        compio::runtime::time::sleep(Duration::from_secs_f64(time_til_next_tick)).await
+        compio_runtime::time::sleep(Duration::from_secs_f64(time_til_next_tick)).await
     }
 }
 
@@ -738,7 +738,7 @@ pub trait CloseStream {
     fn stopped(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
-impl CloseStream for compio::quic::SendStream {
+impl CloseStream for compio_quic::SendStream {
     fn close(&mut self) -> io::Result<()> {
         self.finish().map_err(io::Error::from)
     }

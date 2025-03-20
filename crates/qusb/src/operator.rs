@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_concurrency::future::Join;
 use lend::{
     Bulk, ClearStall, Ctrl, Int, Iso, ResultData, SetConfig, SetInterface, blocking::BlockingOps,
@@ -650,14 +650,14 @@ where
         let cloned_map = Arc::clone(&map);
         let send_loop = borrow::SendLoop::new(tx, work_rx);
         let send_handler = BorrowSendHandler::new(vhci.remote(), id, map);
-        let send = compio::runtime::spawn(
+        let send = compio_runtime::spawn(
             send_loop
                 .run2(send_handler, cancel_token.clone())
                 .in_current_span(),
         );
         let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
         let recv_handler = BorrowRecvHandler::new(vhci.remote(), id, cloned_map);
-        let recv = compio::runtime::spawn(
+        let recv = compio_runtime::spawn(
             recv_loop
                 .run2(recv_handler, cancel_token.clone())
                 .in_current_span(),
@@ -2064,7 +2064,7 @@ where
         let ctx = device.context().clone();
         let span = warn_span!("libusb_event_handler");
         let runtime = cancel_token.clone();
-        let libusb = compio::runtime::spawn_blocking(move || {
+        let libusb = compio_runtime::spawn_blocking(move || {
             let _guard = span.entered();
             while !runtime.is_cancelled() {
                 if let Err(err) = ctx.handle_events(Some(Duration::from_secs(5))) {
@@ -2109,8 +2109,8 @@ where
 
         let (send, recv) = lend::loops(tx, rx, buf_rx);
 
-        let recv = compio::runtime::spawn(recv.run(recv_handler, cancel_token.clone()));
-        let send = compio::runtime::spawn(send.run(send_handler, cancel_token.clone()));
+        let recv = compio_runtime::spawn(recv.run(recv_handler, cancel_token.clone()));
+        let send = compio_runtime::spawn(send.run(send_handler, cancel_token.clone()));
         let (recv_result, send_result) = (recv, send).join().await;
 
         info!("({dev_id}) shutting down");

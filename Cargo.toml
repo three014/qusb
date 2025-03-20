@@ -22,3 +22,6 @@ panic = "abort"
 compio = { git = "https://github.com/three014/compio.git" }
 compio-buf = { git = "https://github.com/three014/compio.git" }
 compio-io = { git = "https://github.com/three014/compio.git" }
+compio-driver = { git = "https://github.com/three014/compio.git" }
+compio-quic = { git = "https://github.com/three014/compio.git" }
+compio-runtime = { git = "https://github.com/three014/compio.git" }

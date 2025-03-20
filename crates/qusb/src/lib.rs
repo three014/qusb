@@ -1,6 +1,6 @@
-use compio::quic::{Connection, ConnectionError, RecvStream, SendStream};
+use compio_quic::{Connection, ConnectionError, RecvStream, SendStream};
 use futures_concurrency::{future::Race, stream::Merge};
-use futures_lite::{stream, StreamExt};
+use futures_lite::{StreamExt, stream};
 use futures_util::SinkExt;
 use operator::{BorrowDevice, LendDevice, SendDevices, ServerResp};
 use proto::{
@@ -14,13 +14,13 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use std::{net::IpAddr, os::unix::ffi::OsStrExt, pin::pin};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn, Instrument};
+use tracing::{Instrument, debug, error, info, trace, warn};
 use usb_ids::UsbIds;
 use utils::mpsc;
 use zerocopy::FromZeros;
@@ -228,12 +228,12 @@ impl UsbDevices {
 
 #[derive(Debug)]
 pub struct Session {
-    conn: compio::quic::Connection,
+    conn: compio_quic::Connection,
     dev: stub::Controller,
 }
 
 impl Session {
-    fn new(conn: compio::quic::Connection, dev: stub::Controller) -> Self {
+    fn new(conn: compio_quic::Connection, dev: stub::Controller) -> Self {
         Self { conn, dev }
     }
 
@@ -529,7 +529,7 @@ impl Session {
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    endpoint: compio::quic::Endpoint,
+    endpoint: compio_quic::Endpoint,
     dev: stub::Controller,
 }
 
@@ -542,21 +542,6 @@ impl Client {
             .unwrap()
             .await
             .unwrap();
-        // let conn2 = conn.clone();
-        // compio::runtime::spawn(async move {
-        //     let mut interval = compio::runtime::time::interval(Duration::from_secs(30));
-        //     loop {
-        //         tokio::select! {
-        //             _ = conn2.closed() => {
-        //                 break;
-        //             }
-        //             _ = interval.tick() => {
-        //                 let stats = conn2.stats();
-        //                 trace!("{stats:?}");
-        //             }
-        //         }
-        //     }
-        // });
         Ok(Session::new(conn, self.dev.clone()))
     }
 }
@@ -661,14 +646,14 @@ fn get_usb_devices() -> io::Result<
 
 struct ReqHandler {
     vhci: stub::Controller,
-    incoming: compio::quic::Incoming,
+    incoming: compio_quic::Incoming,
     cancel_token: CancellationToken,
 }
 
 impl ReqHandler {
     const fn new(
         vhci: stub::Controller,
-        incoming: compio::quic::Incoming,
+        incoming: compio_quic::Incoming,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
@@ -707,10 +692,10 @@ impl ReqHandler {
                     operator.send_device_list(get_usb_devices).await?;
                 }
                 ServerResp::BorrowDevice(operator) => {
-                    operator.lend(self.cancel_token.clone()).await?
+                    operator.lend(self.cancel_token.clone()).await?;
                 }
                 ServerResp::LendDevice(operator) => {
-                    operator.borrow(self.cancel_token.clone()).await?
+                    operator.borrow(self.cancel_token.clone()).await?;
                 }
             }
         }
@@ -723,7 +708,7 @@ pub(crate) type ServerTaskResult = (NonZeroU64, Result<()>);
 
 #[derive(Debug)]
 pub struct Server {
-    endpoint: compio::quic::Endpoint,
+    endpoint: compio_quic::Endpoint,
     dev: stub::Controller,
 }
 
@@ -739,7 +724,7 @@ impl Server {
             info!("Server ready to accept new connections");
 
             enum Event {
-                Incoming(compio::quic::Incoming),
+                Incoming(compio_quic::Incoming),
                 Cancelled,
                 Task(ServerTaskResult),
             }
@@ -762,7 +747,7 @@ impl Server {
                         let handler =
                             ReqHandler::new(self.dev.clone(), incoming, cancel_for_serve.clone());
                         let mut task_tx = task_tx.clone();
-                        compio::runtime::spawn(async move {
+                        compio_runtime::spawn(async move {
                             static ID: AtomicU64 = AtomicU64::new(1);
                             let id = ID.fetch_add(1, Ordering::Relaxed);
                             let id = NonZeroU64::new(id).unwrap();
@@ -794,7 +779,7 @@ impl Server {
         }
         .in_current_span();
 
-        let handle = compio::runtime::spawn(fut);
+        let handle = compio_runtime::spawn(fut);
         ServerHandle {
             handle,
             cancel_token: cancel_for_handle,
@@ -803,12 +788,14 @@ impl Server {
 }
 
 pub struct ServerHandle {
-    handle: compio::runtime::JoinHandle<Result<()>>,
+    handle: compio_runtime::JoinHandle<Result<()>>,
     cancel_token: CancellationToken,
 }
 
 impl ServerHandle {
-    pub async fn shutdown(self) -> std::result::Result<Result<()>, Box<dyn std::any::Any + Send + 'static>> {
+    pub async fn shutdown(
+        self,
+    ) -> std::result::Result<Result<()>, Box<dyn std::any::Any + Send + 'static>> {
         self.cancel_token.cancel();
         self.handle.await
     }
@@ -838,13 +825,16 @@ pub async fn peer(
     server_tls: rustls::ServerConfig,
     client_tls: rustls::ClientConfig,
     bind: Option<SocketAddr>,
-    transport: compio::quic::TransportConfig,
+    transport: compio_quic::TransportConfig,
     num_ports: BoundedU8<1, 32>,
 ) -> (Client, Server) {
     let addr = bind.unwrap_or(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
-    let mut endpoint =
-        compio::quic::ServerBuilder::new_with_rustls_server_config(server_tls).bind(addr).await.unwrap();
-    let mut client_cfg = compio::quic::ClientBuilder::new_with_rustls_client_config(client_tls).build();
+    let mut endpoint = compio_quic::ServerBuilder::new_with_rustls_server_config(server_tls)
+        .bind(addr)
+        .await
+        .unwrap();
+    let mut client_cfg =
+        compio_quic::ClientBuilder::new_with_rustls_client_config(client_tls).build();
     client_cfg.transport_config(Arc::new(transport));
     endpoint.default_client_config = Some(client_cfg);
     let dev = stub::Controller::start(num_ports).unwrap();

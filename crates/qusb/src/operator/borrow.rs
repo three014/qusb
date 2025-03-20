@@ -1,7 +1,7 @@
 use std::{future::Future, io, pin::pin, time::Duration};
 
 use bytes::Bytes;
-use compio::io::{AsyncRead, AsyncWrite};
+use compio_io::{AsyncRead, AsyncWrite};
 use futures_concurrency::future::Race;
 use futures_lite::{Stream, StreamExt, stream};
 use futures_util::stream::FuturesUnordered;
@@ -21,7 +21,7 @@ use crate::{
     utils::{CloseStream, Interval, blocker},
 };
 
-const TICK: Duration = Duration::from_micros(487);
+const TICK: Duration = Duration::from_micros(43);
 
 pub trait SendHandler {
     fn port_stat(&mut self, stat: ioctl::IocPortStat);
@@ -91,7 +91,7 @@ impl<W> SendLoop<W> {
         W: AsyncWrite + Unpin + CloseStream + 'static,
         H: SendHandler,
     {
-        use compio::io::AsyncWriteExt;
+        use compio_io::AsyncWriteExt;
 
         enum Event<W> {
             SetAddress(io::Result<()>),

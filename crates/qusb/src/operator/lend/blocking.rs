@@ -26,7 +26,7 @@ enum State {
         handle: Option<Arc<rusb::DeviceHandle<rusb::Context>>>,
     },
     Waiting {
-        join: compio::runtime::JoinHandle<rusb::Result<()>>,
+        join: compio_runtime::JoinHandle<rusb::Result<()>>,
     },
     Complete(vhci::Status),
 }
@@ -103,7 +103,7 @@ impl Future for SetInterface {
                     let device = handle.take().unwrap();
                     let interface = self.interface;
                     let setting = self.setting;
-                    let join = compio::runtime::spawn_blocking(move || {
+                    let join = compio_runtime::spawn_blocking(move || {
                         device.set_alternate_setting(interface, setting)
                     });
                     State::Waiting { join }
@@ -155,7 +155,7 @@ impl Future for SetConfig {
                     let handle = handle.take().unwrap();
                     let config = self.config;
                     let interfaces = self.interfaces.take().unwrap();
-                    let join = compio::runtime::spawn_blocking(move || {
+                    let join = compio_runtime::spawn_blocking(move || {
                         handle.set_active_configuration(config)?;
                         let mut claimed_interfaces = interfaces.lock().unwrap();
                         for interface in 0..16 {
@@ -212,7 +212,7 @@ impl Future for ClearStall {
                 State::Init { ref mut handle } => {
                     let handle = handle.take().unwrap();
                     let endpoint = self.endpoint;
-                    let join = compio::runtime::spawn_blocking(move || handle.clear_halt(endpoint));
+                    let join = compio_runtime::spawn_blocking(move || handle.clear_halt(endpoint));
                     State::Waiting { join }
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {

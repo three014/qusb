@@ -3,7 +3,7 @@ use std::{io, pin::pin, time::Duration};
 use super::{Seq, compress_frame_len};
 use crate::utils::{CloseStream, Interval, blocker, mpsc};
 use bytes::{Bytes, BytesMut};
-use compio::io::{AsyncRead, AsyncWrite};
+use compio_io::{AsyncRead, AsyncWrite};
 use futures_concurrency::{future::Race, stream::Merge};
 use futures_lite::{Stream, StreamExt, stream};
 use futures_util::SinkExt;
@@ -23,7 +23,7 @@ use zerocopy::transmute;
 
 pub(super) mod blocking;
 
-const TICK: Duration = Duration::from_micros(487);
+const TICK: Duration = Duration::from_micros(47);
 
 pub enum CtrlReq {
     SetInterface(SetInterface),
@@ -208,7 +208,7 @@ impl<W> SendLoop<W> {
         W: AsyncWrite + CloseStream + Unpin + 'static,
         H: SendHandler,
     {
-        use compio::io::AsyncWriteExt;
+        use compio_io::AsyncWriteExt;
         enum State {
             Solicit,
             Timer,
@@ -305,7 +305,7 @@ impl<W> SendLoop<W> {
         let result = match Self::do_loop(&mut tx, event_rx, handler).await {
             Ok(_) | Err(None) => Ok(()),
             Err(Some(Error::Usb(err))) => {
-                use compio::io::AsyncWriteExt;
+                use compio_io::AsyncWriteExt;
                 let header = err.as_header();
                 _ = tx.write_u64_le(transmute!(header)).await;
                 cancel.cancel();

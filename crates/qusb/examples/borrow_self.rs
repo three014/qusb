@@ -12,8 +12,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-#[compio::main]
-async fn main() {
+fn main() {
+    let proactor = compio::driver::ProactorBuilder::new()
+        .sqpoll_idle(Duration::from_millis(2))
+        .clone();
+    compio::runtime::RuntimeBuilder::new()
+        .event_interval(29)
+        .with_proactor(proactor)
+        .build()
+        .unwrap()
+        .block_on(async_main());
+}
+
+async fn async_main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
@@ -31,7 +42,7 @@ async fn main() {
                 .parse("none,borrow_self=info,qusb=trace")
                 .unwrap(),
         )
-        .with_writer(Mutex::new(BufWriter::with_capacity(64, log_file)))
+        .with_writer(Mutex::new(BufWriter::with_capacity(128, log_file)))
         .try_init();
 
     let _guard = tracing::info_span!("main");
@@ -47,7 +58,7 @@ async fn main() {
 
         let dev = msg::UsbDeviceId {
             bus_number: 1,
-            device_addr: 9,
+            device_addr: 5,
         };
         let usb = session.req_borrow(dev).await.unwrap();
         let cancel_token = CancellationToken::new();

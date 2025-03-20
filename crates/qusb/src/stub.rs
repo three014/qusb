@@ -101,7 +101,7 @@ impl Demuxer {
         let controller = controller_rx.into_stream().map(Event::Controller);
 
         let mut events = (reg, giveback, disconnect, work, controller).merge();
-        let handle = compio::runtime::spawn_blocking(move || recv_work(vhci_work_rx, work_tx));
+        let handle = compio_runtime::spawn_blocking(move || recv_work(vhci_work_rx, work_tx));
         while let Some(event) = events.next().await {
             match event {
                 Event::Register(Ctrl {
@@ -114,7 +114,7 @@ impl Demuxer {
                 }) => {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
-                    compio::runtime::spawn_blocking(move || {
+                    compio_runtime::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_connect_any(data_rate);
                         let msg = ControllerResult::Register((result, tx));
                         _ = controller_tx.send(msg);
@@ -131,7 +131,7 @@ impl Demuxer {
                 }) => {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
-                    compio::runtime::spawn_blocking(move || {
+                    compio_runtime::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_connect(port, data_rate);
                         let result = result.map(|_| port);
                         let msg = ControllerResult::Register((result, tx));
@@ -145,7 +145,7 @@ impl Demuxer {
                 Event::Disconnect(Ctrl { data: port, tx }) => {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
-                    compio::runtime::spawn_blocking(move || {
+                    compio_runtime::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_disconnect(port);
                         let msg = ControllerResult::Disconnect((result, tx));
                         _ = controller_tx.send(msg);
@@ -269,7 +269,7 @@ impl Demuxer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    handle: Option<Arc<compio::runtime::JoinHandle<()>>>,
+    handle: Option<Arc<compio_runtime::JoinHandle<()>>>,
     register_tx: mpsc::AsyncSender<Ctrl<Register, (Port, WorkReceiver)>>,
     giveback_tx: mpsc::AsyncSender<UrbHandle>,
     disconnect_tx: mpsc::AsyncSender<Ctrl<Port>>,
@@ -283,7 +283,7 @@ impl Controller {
         let (disconnect_tx, disconnect_rx) = mpsc::channel(0);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
-        let handle = Some(Arc::new(compio::runtime::spawn(
+        let handle = Some(Arc::new(compio_runtime::spawn(
             Demuxer::new(
                 register_rx.into_stream(),
                 giveback_rx.into_stream(),
@@ -384,7 +384,7 @@ impl VhciRemote {
     {
         _ = self.giveback_tx.send(urb.handle()).await;
         let remote = self.remote.clone();
-        let op = compio::runtime::spawn_blocking(move || remote.giveback(urb));
+        let op = compio_runtime::spawn_blocking(move || remote.giveback(urb));
         op.await.unwrap()
     }
 

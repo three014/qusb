@@ -228,15 +228,15 @@ source = "git+https://github.com/three014/compio.git#e06d8337bee7a8d8e04013a166a
 dependencies = [
  "compio-buf",
  "compio-dispatcher",
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
  "compio-fs",
  "compio-io",
- "compio-log 0.1.0 (git+https://github.com/three014/compio.git)",
+ "compio-log",
  "compio-macros",
  "compio-net",
  "compio-process",
  "compio-quic",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-runtime",
  "compio-signal",
  "compio-tls",
 ]
@@ -256,33 +256,10 @@ name = "compio-dispatcher"
 version = "0.6.0"
 source = "git+https://github.com/three014/compio.git#e06d8337bee7a8d8e04013a166a582f0221c2088"
 dependencies = [
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
+ "compio-runtime",
  "flume",
  "futures-channel",
-]
-
-[[package]]
-name = "compio-driver"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9493b0c88b90d386bb3fd9b5618260d96ba2b09cab5c4a5ba50ec9b77f0711b"
-dependencies = [
- "aligned-array",
- "cfg-if",
- "cfg_aliases",
- "compio-buf",
- "compio-log 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "crossbeam-channel",
- "crossbeam-queue",
- "futures-util",
- "io-uring",
- "libc",
- "once_cell",
- "paste",
- "polling",
- "socket2",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -294,7 +271,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "compio-buf",
- "compio-log 0.1.0 (git+https://github.com/three014/compio.git)",
+ "compio-log",
  "crossbeam-channel",
  "crossbeam-queue",
  "futures-util",
@@ -317,9 +294,9 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "compio-buf",
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
  "compio-io",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-runtime",
  "libc",
  "os_pipe",
  "widestring",
@@ -335,15 +312,6 @@ dependencies = [
  "futures-util",
  "paste",
  "pin-project-lite",
-]
-
-[[package]]
-name = "compio-log"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc4e560213c1996b618da369b7c9109564b41af9033802ae534465c4ee4e132f"
-dependencies = [
- "tracing",
 ]
 
 [[package]]
@@ -372,9 +340,9 @@ source = "git+https://github.com/three014/compio.git#e06d8337bee7a8d8e04013a166a
 dependencies = [
  "cfg-if",
  "compio-buf",
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
  "compio-io",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-runtime",
  "either",
  "libc",
  "once_cell",
@@ -390,9 +358,9 @@ source = "git+https://github.com/three014/compio.git#e06d8337bee7a8d8e04013a166a
 dependencies = [
  "cfg-if",
  "compio-buf",
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
  "compio-io",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-runtime",
  "futures-util",
  "windows-sys 0.52.0",
 ]
@@ -405,9 +373,9 @@ dependencies = [
  "cfg_aliases",
  "compio-buf",
  "compio-io",
- "compio-log 0.1.0 (git+https://github.com/three014/compio.git)",
+ "compio-log",
  "compio-net",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-runtime",
  "flume",
  "futures-util",
  "libc",
@@ -421,32 +389,13 @@ dependencies = [
 [[package]]
 name = "compio-runtime"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a95ef126945a166879ef37d494015be13a1e4e452419bc4e5c4c5799f441756a"
-dependencies = [
- "async-task",
- "compio-buf",
- "compio-driver 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "compio-log 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "crossbeam-queue",
- "futures-util",
- "libc",
- "once_cell",
- "scoped-tls",
- "socket2",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "compio-runtime"
-version = "0.7.0"
 source = "git+https://github.com/three014/compio.git#e06d8337bee7a8d8e04013a166a582f0221c2088"
 dependencies = [
  "async-task",
  "cfg-if",
  "compio-buf",
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
- "compio-log 0.1.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
+ "compio-log",
  "crossbeam-queue",
  "futures-util",
  "libc",
@@ -463,8 +412,8 @@ version = "0.5.0"
 source = "git+https://github.com/three014/compio.git#e06d8337bee7a8d8e04013a166a582f0221c2088"
 dependencies = [
  "compio-buf",
- "compio-driver 0.7.0 (git+https://github.com/three014/compio.git)",
- "compio-runtime 0.7.0 (git+https://github.com/three014/compio.git)",
+ "compio-driver",
+ "compio-runtime",
  "libc",
  "once_cell",
  "os_pipe",
@@ -1199,6 +1148,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "compio",
+ "compio-driver",
+ "compio-io",
+ "compio-quic",
+ "compio-runtime",
  "flume",
  "futures-concurrency",
  "futures-lite",
@@ -1371,7 +1324,7 @@ source = "git+https://github.com/three014/rusb-async.git#bcf54278659e3a6a7e58de8
 dependencies = [
  "bitflags",
  "bytes",
- "compio-runtime 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "compio-runtime",
  "pin-project-lite",
  "rusb",
  "tokio",
