@@ -2,9 +2,9 @@ use std::{future::Future, io, pin::pin, time::Duration};
 
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWrite};
-use futures::stream::FuturesUnordered;
 use futures_concurrency::future::Race;
 use futures_lite::{Stream, StreamExt, stream};
+use futures_util::stream::FuturesUnordered;
 use proto::{
     data::{Data, Ring},
     msg::{Header, UrbFrame},
@@ -81,6 +81,7 @@ impl<W> SendLoop<W> {
         Self { tx, work_rx }
     }
 
+    #[inline]
     pub async fn do_loop<H>(
         tx: &mut W,
         work_rx: impl Stream<Item = Work> + Unpin,
@@ -124,6 +125,12 @@ impl<W> SendLoop<W> {
         // Timer -> [Timer(SetAddress, Work), Flush(FlushBuf)]
         // Flush -> [Solicit(FlushComplete), Timer(FlushComplete), Flush(SetAddress, Work)]
 
+        #[inline]
+        async fn arm_timer<W>(interval: &Interval) -> Option<Event<W>> {
+            interval.tick().await;
+            Some(Event::FlushBuf)
+        }
+
         let interval = Interval::new(TICK);
         let mut tx_holder = Some(tx);
         let mut sleeper = pin!(blocker(None));
@@ -134,27 +141,26 @@ impl<W> SendLoop<W> {
         let mut state = State::Solicit;
         loop {
             let event = {
-                let flush = async {
-                    let result: Option<io::Result<&mut W>> = flush_op.as_mut().await;
-                    result.map(Event::FlushComplete)
-                };
-                let timer = async {
-                    sleeper.as_mut().await;
-                    Some(Event::FlushBuf)
-                };
-                let set_addr = async { Some(Event::SetAddress(set_addr.as_mut().await)) };
-                let race = (work_rx.next(), timer, flush, set_addr).race();
+                let race = (
+                    work_rx.next(),
+                    sleeper.as_mut(),
+                    flush_op.as_mut(),
+                    set_addr.as_mut(),
+                )
+                    .race();
                 race.await.ok_or(None)?
             };
             state = match event {
                 Event::Work(work) => {
                     if let Some(fut) = handler.handle_work(work)? {
-                        set_addr.set(blocker(Some(fut)));
+                        set_addr.set(blocker(Some(
+                            async move { Some(Event::SetAddress(fut.await)) },
+                        )));
                         state
                     } else {
                         match state {
                             State::Solicit if !handler.is_buf_empty() => {
-                                sleeper.set(blocker(Some(interval.tick())));
+                                sleeper.set(blocker(Some(arm_timer(&interval))));
                                 State::Timer
                             }
                             current => current,
@@ -167,8 +173,8 @@ impl<W> SendLoop<W> {
                     let bytes = handler.flush_buf();
                     flush_op.set(blocker(Some(async move {
                         match tx.write_all(bytes).await.0 {
-                            Ok(_) => Some(Ok(tx)),
-                            Err(err) => Some(Err(err)),
+                            Ok(_) => Some(Event::FlushComplete(Ok(tx))),
+                            Err(err) => Some(Event::FlushComplete(Err(err))),
                         }
                     })));
                     State::Flush
@@ -179,7 +185,7 @@ impl<W> SendLoop<W> {
                     if handler.is_buf_empty() {
                         State::Solicit
                     } else {
-                        sleeper.set(blocker(Some(interval.tick())));
+                        sleeper.set(blocker(Some(arm_timer(&interval))));
                         State::Timer
                     }
                 }
@@ -307,6 +313,7 @@ impl<R> RecvLoop<R> {
         Self { rx, buf }
     }
 
+    #[inline]
     async fn do_loop<H>(
         frame_rx: impl Stream<Item = io::Result<super::Recv>> + Unpin,
         mut handler: H,
@@ -399,7 +406,11 @@ impl<R> RecvLoop<R> {
 
         // Done! Drain the streams
         let mut buf = Ring::with_capacity(32);
-        while 0 != buf.fill_with_reader(&mut rx).await? {}
+        while buf
+            .fill_with_reader(&mut rx)
+            .await
+            .is_ok_and(|bytes_read| 0 != bytes_read)
+        {}
         result
     }
 

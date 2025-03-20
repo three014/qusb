@@ -1,7 +1,7 @@
 use compio::quic::{Connection, ConnectionError, RecvStream, SendStream};
-use futures::SinkExt;
 use futures_concurrency::{future::Race, stream::Merge};
 use futures_lite::{stream, StreamExt};
+use futures_util::SinkExt;
 use operator::{BorrowDevice, LendDevice, SendDevices, ServerResp};
 use proto::{
     data::{IterDst, IterMutDst, ReadError, Ring},

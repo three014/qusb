@@ -1,22 +1,19 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::RefCell,
     collections::BTreeMap,
     io,
     ops::DerefMut,
-    pin::pin,
     rc::Rc,
-    sync::{Arc, Mutex, atomic::AtomicU32},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
-// use std::collections::VecDeque;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use compio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    runtime::time::sleep,
-};
-use futures_concurrency::{future::Race, stream::Merge};
-use futures_lite::{StreamExt, stream};
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use futures_concurrency::future::Join;
 use lend::{
     Bulk, ClearStall, Ctrl, Int, Iso, ResultData, SetConfig, SetInterface, blocking::BlockingOps,
 };
@@ -28,7 +25,7 @@ use proto::{
 use rusb::UsbContext;
 use rusb_async::{InnerTransfer, IsoPacket, TransferFlags, TransferStatus};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, trace, trace_span, warn, warn_span};
+use tracing::{Instrument, debug, error, info, trace, warn, warn_span};
 use vhci::{
     DataRate, PortChange, PortFlag, PortStatus,
     ioctl::{self, UrbType},
@@ -37,12 +34,11 @@ use vhci::{
 use zerocopy::{FromBytes, IntoBytes, transmute};
 
 use crate::{
-    Error, Result, UrbWithIsoData,
+    Result, UrbWithIsoData,
     stub::{self, RegisterPort},
     utils::{
         CloseStream, Counter, SimpleMap, align_to_usize, cold,
         metrics::{self, RollingAvg},
-        mpsc,
     },
 };
 
@@ -358,7 +354,6 @@ impl borrow::SendHandler for BorrowSendHandler {
 
                 // TEST: We're gonna see if VHCI needs
                 // an actual buffer for this part.
-                // let transfr = &mut self.scratch[..actual_transfer_len];
                 let transfer = &mut [][..];
 
                 // CONTRACT: All of `data` is the isochronous packet buffer.
@@ -414,11 +409,13 @@ impl borrow::SendHandler for BorrowSendHandler {
     }
 }
 
+#[derive(Debug)]
 enum GivebackData {
     In(BytesMut),
     Out(u16),
 }
 
+#[derive(Debug)]
 struct OwnedUrbGiveback {
     handle: ioctl::UrbHandle,
     kind: UrbType,
@@ -755,18 +752,18 @@ fn port_reset<C: rusb::UsbContext>(
     }
 }
 
-#[inline(always)]
-fn get_or_alloc_transfer_no_iso(mut cache: RefMut<'_, Vec<InnerTransfer>>) -> InnerTransfer {
-    cache.pop().unwrap_or_else(|| InnerTransfer::new(0))
-}
+// #[inline(always)]
+// fn get_or_alloc_transfer_no_iso(mut cache: RefMut<'_, Vec<InnerTransfer>>) -> InnerTransfer {
+//     cache.pop().unwrap_or_else(|| InnerTransfer::new(0))
+// }
 
-#[inline(always)]
-fn insert_spare_transfer_no_iso(
-    mut cache: RefMut<'_, Vec<InnerTransfer>>,
-    transfer: InnerTransfer,
-) {
-    cache.push(transfer);
-}
+// #[inline(always)]
+// fn insert_spare_transfer_no_iso(
+//     mut cache: RefMut<'_, Vec<InnerTransfer>>,
+//     transfer: InnerTransfer,
+// ) {
+//     cache.push(transfer);
+// }
 
 #[derive(Debug)]
 enum OneOrMany<T> {
@@ -774,73 +771,73 @@ enum OneOrMany<T> {
     Many(Vec<T>),
 }
 
-fn get_or_alloc_transfer(
-    mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
-    num_iso_packets: u16,
-) -> InnerTransfer {
-    let maybe_entry = cache.range_mut(num_iso_packets..).next();
-    if let Some((&num_pkts, entry)) = maybe_entry {
-        const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
-        let (transfer, remove_entry) = {
-            match std::mem::replace(entry, EMPTY) {
-                OneOrMany::One(transfer) => (transfer, true),
-                OneOrMany::Many(mut vec) => {
-                    let transfer = vec.pop().expect("shouldn't be an empty vec");
-                    if vec.is_empty() {
-                        (transfer, true)
-                    } else {
-                        *entry = OneOrMany::Many(vec);
-                        (transfer, false)
-                    }
-                }
-            }
-        };
-        if remove_entry {
-            cache.remove(&num_pkts);
-        }
-        transfer
-    } else {
-        drop(cache);
-        InnerTransfer::new(num_iso_packets as usize)
-    }
-}
+// fn get_or_alloc_transfer(
+//     mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
+//     num_iso_packets: u16,
+// ) -> InnerTransfer {
+//     let maybe_entry = cache.range_mut(num_iso_packets..).next();
+//     if let Some((&num_pkts, entry)) = maybe_entry {
+//         const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
+//         let (transfer, remove_entry) = {
+//             match std::mem::replace(entry, EMPTY) {
+//                 OneOrMany::One(transfer) => (transfer, true),
+//                 OneOrMany::Many(mut vec) => {
+//                     let transfer = vec.pop().expect("shouldn't be an empty vec");
+//                     if vec.is_empty() {
+//                         (transfer, true)
+//                     } else {
+//                         *entry = OneOrMany::Many(vec);
+//                         (transfer, false)
+//                     }
+//                 }
+//             }
+//         };
+//         if remove_entry {
+//             cache.remove(&num_pkts);
+//         }
+//         transfer
+//     } else {
+//         drop(cache);
+//         InnerTransfer::new(num_iso_packets as usize)
+//     }
+// }
 
-fn insert_spare_transfer(
-    mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
-    transfer: InnerTransfer,
-) {
-    const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
-    let entry = cache.get_mut(&(transfer.num_iso_packets() as u16));
-    match entry {
-        Some(entry) => match std::mem::replace(entry, EMPTY) {
-            OneOrMany::One(other) => {
-                *entry = OneOrMany::Many(vec![transfer, other]);
-            }
-            OneOrMany::Many(mut vec) => {
-                vec.push(transfer);
-                *entry = OneOrMany::Many(vec);
-            }
-        },
-        None => {
-            cache.insert(transfer.num_iso_packets() as u16, OneOrMany::One(transfer));
-        }
-    }
-}
+// fn insert_spare_transfer(
+//     mut cache: RefMut<'_, BTreeMap<u16, OneOrMany<InnerTransfer>>>,
+//     transfer: InnerTransfer,
+// ) {
+//     const EMPTY: OneOrMany<InnerTransfer> = OneOrMany::Many(Vec::new());
+//     let entry = cache.get_mut(&(transfer.num_iso_packets() as u16));
+//     match entry {
+//         Some(entry) => match std::mem::replace(entry, EMPTY) {
+//             OneOrMany::One(other) => {
+//                 *entry = OneOrMany::Many(vec![transfer, other]);
+//             }
+//             OneOrMany::Many(mut vec) => {
+//                 vec.push(transfer);
+//                 *entry = OneOrMany::Many(vec);
+//             }
+//         },
+//         None => {
+//             cache.insert(transfer.num_iso_packets() as u16, OneOrMany::One(transfer));
+//         }
+//     }
+// }
 
-/// An allocation strategy for direct memory access regions.
-///
-/// The motivation behind this struct is that setting up and tearing down DMA
-/// regions on modern systems is slower than compared to normal memory
-/// allocation. This is why [`UsbMemMut`] does not allocate more memory
-/// when it doesn't have the space to fit more data.
-///
-/// To get around this, we reserve a cluster of small DMA regions upfront,
-/// then handle reservations by trying to reclaim enough space for the requested
-/// memory block in each region until one succeeds.
-///
-/// Is it fast? For the purpose of this project, yeah!
-///
-/// [`UsbMemMut`]: rusb_async::UsbMemMut
+// /// An allocation strategy for direct memory access regions.
+// ///
+// /// The motivation behind this struct is that setting up and tearing down DMA
+// /// regions on modern systems is slower than compared to normal memory
+// /// allocation. This is why [`UsbMemMut`] does not allocate more memory
+// /// when it doesn't have the space to fit more data.
+// ///
+// /// To get around this, we reserve a cluster of small DMA regions upfront,
+// /// then handle reservations by trying to reclaim enough space for the requested
+// /// memory block in each region until one succeeds.
+// ///
+// /// Is it fast? For the purpose of this project, yeah!
+// ///
+// /// [`UsbMemMut`]: rusb_async::UsbMemMut
 // struct DmaAllocator<C: rusb::UsbContext> {
 //     queue: VecDeque<UsbMemMut>,
 //     handle: Arc<rusb::DeviceHandle<C>>,
@@ -942,37 +939,37 @@ fn convert_libusb_to_vhci(
     }
 }
 
-#[inline(always)]
-fn write_transfer(src: &[u8], dst: &mut [u8]) {
-    // let src = <[u64]>::ref_from_bytes(src).unwrap();
-    // let dst = <[u64]>::mut_from_bytes(dst).unwrap();
-    dst.copy_from_slice(src);
-}
+// #[inline(always)]
+// fn write_transfer(src: &[u8], dst: &mut [u8]) {
+//     // let src = <[u64]>::ref_from_bytes(src).unwrap();
+//     // let dst = <[u64]>::mut_from_bytes(dst).unwrap();
+//     dst.copy_from_slice(src);
+// }
 
-#[cold]
-#[inline(never)]
-fn make_error_header(
-    seqnum: u32,
-    proto: msg::Status,
-    vhci: vhci::Status,
-    kind: UrbType,
-    endpoint: ioctl::Endpoint,
-) -> (Header, io::Error) {
-    let _guard = tracing::Span::current().entered();
-    error!(
-        "({seqnum}) {kind:?} transfer failed on endpoint {}: {vhci:?}",
-        endpoint.0
-    );
-    let header = Header {
-        total_frame_len: compress_frame_len(size_of::<Header>()),
-        command: msg::Command::RetSubmit,
-        status: proto,
-        seqnum,
-    };
-    let errno = vhci.to_errno_raw(UrbType::Iso == kind);
-    let err = io::Error::from_raw_os_error(-errno);
-    (header, err)
-}
+// #[cold]
+// #[inline(never)]
+// fn make_error_header(
+//     seqnum: u32,
+//     proto: msg::Status,
+//     vhci: vhci::Status,
+//     kind: UrbType,
+//     endpoint: ioctl::Endpoint,
+// ) -> (Header, io::Error) {
+//     let _guard = tracing::Span::current().entered();
+//     error!(
+//         "({seqnum}) {kind:?} transfer failed on endpoint {}: {vhci:?}",
+//         endpoint.0
+//     );
+//     let header = Header {
+//         total_frame_len: compress_frame_len(size_of::<Header>()),
+//         command: msg::Command::RetSubmit,
+//         status: proto,
+//         seqnum,
+//     };
+//     let errno = vhci.to_errno_raw(UrbType::Iso == kind);
+//     let err = io::Error::from_raw_os_error(-errno);
+//     (header, err)
+// }
 
 #[derive(Debug)]
 pub struct Seq<T> {
@@ -991,10 +988,6 @@ fn padding(actual_transfer_len: u16) -> &'static [u8] {
 #[inline]
 const fn compress_frame_len(len: usize) -> u16 {
     (len / size_of::<u64>()) as u16
-}
-
-struct LendSendHandler {
-    id: msg::UsbDeviceId,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -1073,7 +1066,6 @@ impl SmallTransfers {
 struct LendRecvHandler {
     dev_id: msg::UsbDeviceId,
     device: Arc<rusb::DeviceHandle<rusb::Context>>,
-    libusb: compio::runtime::JoinHandle<()>,
     interfaces: Arc<Mutex<IntSet<u8>>>,
     cancel_tokens: Rc<RefCell<IntMap<u32, CancellationToken>>>,
     scratch: BytesMut,
@@ -1130,6 +1122,7 @@ impl lend::RecvHandler for LendRecvHandler {
                     res: ResultData::Out {
                         bytes_transferred: 0,
                     },
+                    endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
                     status,
                 },
             }
@@ -1157,6 +1150,7 @@ impl lend::RecvHandler for LendRecvHandler {
                     res: ResultData::Out {
                         bytes_transferred: 0,
                     },
+                    endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
                     status,
                 },
             }
@@ -1182,6 +1176,7 @@ impl lend::RecvHandler for LendRecvHandler {
                     res: ResultData::Out {
                         bytes_transferred: 0,
                     },
+                    endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
                     status,
                 },
             }
@@ -1224,6 +1219,10 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let mut cache = self.smalls.clone();
         let dev_id = self.dev_id;
+        let endpoint = match ctrl_pkt.req().dir() {
+            Dir::Out => ioctl::Endpoint(0),
+            Dir::In => ioctl::Endpoint(128),
+        };
         async move {
             let result = transfer.submit(&cancel).await;
             let status = convert_libusb_to_vhci(result, UrbType::Ctrl, seqnum, dev_id);
@@ -1243,7 +1242,11 @@ impl lend::RecvHandler for LendRecvHandler {
             let res = ResultData::new(buf, ctrl_pkt.req().dir());
             Seq {
                 seqnum,
-                data: Ctrl { res, status },
+                data: Ctrl {
+                    res,
+                    status,
+                    endpoint,
+                },
             }
         }
     }
@@ -1338,6 +1341,12 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let cancel = self.register_cancel_token(seqnum);
 
+        // BUG: By specifying the type as a `[u8]`,
+        // the inner NonNull pointer inside becomes a fat
+        // pointer, and I just wonder if that's what I'm
+        // looking for? Because most pointers to a slice
+        // have the type `NonNull<u8>`, not `NonNull<[u8]>`.
+        // Hmmmmmmmmmm...
         let (header, data) = urb_frame.split::<[u8]>();
         let mut data = data.unwrap().into_bytes_mut();
         let padded_transfer_len = header.padded_transfer_len();
@@ -1380,7 +1389,6 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let mut cache = self.isos.clone();
         let dev_id = self.dev_id;
-
         async move {
             let result = transfer.submit(&cancel).await;
             let status = convert_libusb_to_vhci(result, UrbType::Iso, seqnum, dev_id);
@@ -1479,9 +1487,18 @@ impl lend::RecvHandler for LendRecvHandler {
     }
 }
 
+impl Drop for LendRecvHandler {
+    fn drop(&mut self) {
+        self.cancel_tokens
+            .take()
+            .into_values()
+            .for_each(|transfer| transfer.cancel());
+    }
+}
+
 const THRESHOLD: usize = 64;
 
-struct LendStats {
+struct LendRecvStats {
     last_few_setup_times: RollingAvg<THRESHOLD, metrics::Duration>,
     min_setup_time: Duration,
     max_setup_time: Duration,
@@ -1489,21 +1506,21 @@ struct LendStats {
     max_active_transfers: u32,
 }
 
-impl LendStats {
-    fn new() -> Self {
-        Self {
+impl LendRecvStats {
+    fn new() -> (Self, Arc<AtomicU32>) {
+        let num_active_transfers = Arc::new(AtomicU32::new(0));
+        let this = Self {
             last_few_setup_times: RollingAvg::preallocated(),
             min_setup_time: Duration::MAX,
             max_setup_time: Duration::ZERO,
-            num_active_transfers: Arc::new(AtomicU32::new(0)),
+            num_active_transfers: Arc::clone(&num_active_transfers),
             max_active_transfers: 0,
-        }
+        };
+        (this, num_active_transfers)
     }
 
     fn mark_start(&mut self) -> Instant {
-        let num_active = self
-            .num_active_transfers
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let num_active = self.num_active_transfers.fetch_add(1, Ordering::AcqRel);
         self.max_active_transfers = std::cmp::max(self.max_active_transfers, num_active + 1);
         Instant::now()
     }
@@ -1516,12 +1533,25 @@ impl LendStats {
     }
 }
 
-struct StatLendRecvHandler {
-    inner: LendRecvHandler,
-    stats: LendStats,
+impl Drop for LendRecvStats {
+    fn drop(&mut self) {
+        debug!("==== RECV STATS ====");
+        debug!("Max active transfers: {}", self.max_active_transfers);
+        debug!("Min time to setup transfer: {:?}", self.min_setup_time);
+        debug!("Max time to setup transfer: {:?}", self.max_setup_time);
+        debug!(
+            "Avg setup time for last {THRESHOLD} transfers: {:?}",
+            Duration::from(self.last_few_setup_times.mean().unwrap_or_default())
+        );
+    }
 }
 
-impl lend::RecvHandler for StatLendRecvHandler {
+struct StatLendRecvHandler<H> {
+    inner: H,
+    stats: LendRecvStats,
+}
+
+impl<H: lend::RecvHandler> lend::RecvHandler for StatLendRecvHandler<H> {
     fn cancel_urb(&mut self, seqnum: u32) {
         self.inner.cancel_urb(seqnum);
     }
@@ -1592,6 +1622,403 @@ impl lend::RecvHandler for StatLendRecvHandler {
     }
 }
 
+struct LendSendHandler {
+    dev_id: msg::UsbDeviceId,
+    buf: BytesMut,
+    cancel_tokens: Rc<RefCell<IntMap<u32, CancellationToken>>>,
+}
+
+impl lend::SendHandler for LendSendHandler {
+    fn is_buf_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    fn flush_buf(&mut self) -> Bytes {
+        self.buf.split().freeze()
+    }
+
+    fn iso_completed(
+        &mut self,
+        Seq {
+            seqnum,
+            data:
+                Iso {
+                    res,
+                    endpoint,
+                    interval,
+                    raw_iso_buf,
+                    num_errors,
+                    num_iso_packets,
+                    status: vhci_status,
+                },
+        }: Seq<Iso>,
+    ) -> std::result::Result<(), lend::Error> {
+        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        let status = msg::Status::from(vhci_status);
+        if msg::Status::Success != status {
+            let err = lend::Error::Usb(lend::UsbError {
+                id: self.dev_id,
+                seqnum,
+                status,
+                kind: lend::FrameKind::Transfer {
+                    kind: UrbType::Iso,
+                    endpoint,
+                    status: vhci_status,
+                },
+            });
+            return Err(err);
+        }
+
+        let lend::HeaderData {
+            actual_transfer_len,
+            transfer,
+            padding,
+        } = res.as_header_data();
+
+        // If we're not sending any transfer data then this will
+        // just be the guaranteed length.
+        let total_frame_len = {
+            let guaranteed = size_of::<Header>() + size_of::<UrbHeader>() + raw_iso_buf.len();
+            let len = guaranteed + transfer.len() + padding.len();
+            compress_frame_len(len)
+        };
+
+        let header = Header {
+            total_frame_len,
+            command: msg::Command::RetSubmit,
+            status,
+            seqnum,
+        };
+        let urb_header = UrbHeader {
+            actual_transfer_len,
+            iso_packet_count: num_iso_packets,
+            endpoint,
+            kind: UrbType::Iso,
+            interval,
+            status: vhci_status,
+            flags: 0,
+            num_errors,
+            ctrl_packet: Default::default(),
+        };
+
+        self.buf.put_slice(header.as_bytes());
+        self.buf.put_slice(urb_header.as_bytes());
+        self.buf.put_slice(transfer);
+        self.buf.put_slice(padding);
+        self.buf.put_slice(&raw_iso_buf);
+        Ok(())
+    }
+
+    fn int_completed(
+        &mut self,
+        Seq {
+            seqnum,
+            data:
+                Int {
+                    res,
+                    endpoint,
+                    interval,
+                    status: vhci_status,
+                },
+        }: Seq<Int>,
+    ) -> std::result::Result<(), lend::Error> {
+        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        let status = msg::Status::from(vhci_status);
+        if msg::Status::Success != status {
+            let err = lend::Error::Usb(lend::UsbError {
+                id: self.dev_id,
+                seqnum,
+                status,
+                kind: lend::FrameKind::Transfer {
+                    kind: UrbType::Int,
+                    endpoint,
+                    status: vhci_status,
+                },
+            });
+            return Err(err);
+        }
+
+        let lend::HeaderData {
+            actual_transfer_len,
+            transfer,
+            padding,
+        } = res.as_header_data();
+
+        // If we're not sending any transfer data then this will
+        // just be the guaranteed length.
+        let total_frame_len = {
+            let guaranteed = size_of::<Header>() + size_of::<UrbHeader>();
+            let len = guaranteed + transfer.len() + padding.len();
+            compress_frame_len(len)
+        };
+
+        let header = Header {
+            total_frame_len,
+            command: msg::Command::RetSubmit,
+            status,
+            seqnum,
+        };
+        let urb_header = UrbHeader {
+            actual_transfer_len,
+            iso_packet_count: 0,
+            endpoint,
+            kind: UrbType::Int,
+            interval,
+            status: vhci_status,
+            flags: 0,
+            num_errors: 0,
+            ctrl_packet: Default::default(),
+        };
+
+        self.buf.put_slice(header.as_bytes());
+        self.buf.put_slice(urb_header.as_bytes());
+        self.buf.put_slice(transfer);
+        self.buf.put_slice(padding);
+        Ok(())
+    }
+
+    fn ctrl_completed(
+        &mut self,
+        Seq {
+            seqnum,
+            data:
+                Ctrl {
+                    res,
+                    endpoint,
+                    status: vhci_status,
+                },
+        }: Seq<Ctrl>,
+    ) -> std::result::Result<(), lend::Error> {
+        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        let status = msg::Status::from(vhci_status);
+        if msg::Status::Success != status {
+            let err = lend::Error::Usb(lend::UsbError {
+                id: self.dev_id,
+                seqnum,
+                status,
+                kind: lend::FrameKind::Transfer {
+                    kind: UrbType::Ctrl,
+                    endpoint,
+                    status: vhci_status,
+                },
+            });
+            return Err(err);
+        }
+
+        let lend::HeaderData {
+            actual_transfer_len,
+            transfer,
+            padding,
+        } = res.as_header_data();
+
+        // If we're not sending any transfer data then this will
+        // just be the guaranteed length.
+        let total_frame_len = {
+            let guaranteed = size_of::<Header>() + size_of::<UrbHeader>();
+            let len = guaranteed + transfer.len() + padding.len();
+            compress_frame_len(len)
+        };
+
+        let header = Header {
+            total_frame_len,
+            command: msg::Command::RetSubmit,
+            status,
+            seqnum,
+        };
+        let urb_header = UrbHeader {
+            actual_transfer_len,
+            iso_packet_count: 0,
+            endpoint,
+            kind: UrbType::Ctrl,
+            interval: 0,
+            status: vhci_status,
+            flags: 0,
+            num_errors: 0,
+            ctrl_packet: Default::default(),
+        };
+
+        self.buf.put_slice(header.as_bytes());
+        self.buf.put_slice(urb_header.as_bytes());
+        self.buf.put_slice(transfer);
+        self.buf.put_slice(padding);
+        Ok(())
+    }
+
+    fn bulk_completed(
+        &mut self,
+        Seq {
+            seqnum,
+            data:
+                Bulk {
+                    res,
+                    endpoint,
+                    status: vhci_status,
+                },
+        }: Seq<Bulk>,
+    ) -> std::result::Result<(), lend::Error> {
+        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        let status = msg::Status::from(vhci_status);
+        if msg::Status::Success != status {
+            let err = lend::Error::Usb(lend::UsbError {
+                id: self.dev_id,
+                seqnum,
+                status,
+                kind: lend::FrameKind::Transfer {
+                    kind: UrbType::Bulk,
+                    endpoint,
+                    status: vhci_status,
+                },
+            });
+            return Err(err);
+        }
+
+        let lend::HeaderData {
+            actual_transfer_len,
+            transfer,
+            padding,
+        } = res.as_header_data();
+
+        // If we're not sending any transfer data then this will
+        // just be the guaranteed length.
+        let total_frame_len = {
+            let guaranteed = size_of::<Header>() + size_of::<UrbHeader>();
+            let len = guaranteed + transfer.len() + padding.len();
+            compress_frame_len(len)
+        };
+
+        let header = Header {
+            total_frame_len,
+            command: msg::Command::RetSubmit,
+            status,
+            seqnum,
+        };
+        let urb_header = UrbHeader {
+            actual_transfer_len,
+            iso_packet_count: 0,
+            endpoint,
+            kind: UrbType::Bulk,
+            interval: 0,
+            status: vhci_status,
+            flags: 0,
+            num_errors: 0,
+            ctrl_packet: Default::default(),
+        };
+
+        self.buf.put_slice(header.as_bytes());
+        self.buf.put_slice(urb_header.as_bytes());
+        self.buf.put_slice(transfer);
+        self.buf.put_slice(padding);
+        Ok(())
+    }
+
+    fn device_resetted(
+        &mut self,
+        Seq {
+            seqnum,
+            data: status,
+        }: Seq<proto::msg::Status>,
+    ) -> std::result::Result<(), lend::Error> {
+        if msg::Status::Success == status {
+            self.buf.put_u64_le(transmute!(Header {
+                command: msg::Command::RetPort,
+                status,
+                total_frame_len: compress_frame_len(size_of::<Header>()),
+                seqnum
+            }));
+            Ok(())
+        } else {
+            Err(lend::Error::Usb(lend::UsbError {
+                id: self.dev_id,
+                seqnum,
+                status,
+                kind: lend::FrameKind::Reset,
+            }))
+        }
+    }
+}
+
+struct LendSendStats {
+    num_transfers_completed: u32,
+    num_active_transfers: Arc<AtomicU32>,
+    max_completed_transfers_before_flush: u32,
+}
+
+impl LendSendStats {
+    fn new(num_active_transfers: Arc<AtomicU32>) -> Self {
+        Self {
+            num_transfers_completed: 0,
+            num_active_transfers,
+            max_completed_transfers_before_flush: 0,
+        }
+    }
+
+    fn mark_flush(&mut self) {
+        self.max_completed_transfers_before_flush = std::cmp::max(
+            self.max_completed_transfers_before_flush,
+            self.num_transfers_completed,
+        );
+        self.num_transfers_completed = 0;
+    }
+
+    fn mark_complete(&mut self) {
+        self.num_active_transfers.fetch_sub(1, Ordering::AcqRel);
+        self.num_transfers_completed += 1;
+    }
+}
+
+impl Drop for LendSendStats {
+    fn drop(&mut self) {
+        debug!("==== SEND STATS ====");
+        debug!(
+            "Max completed transfers before flush: {}",
+            self.max_completed_transfers_before_flush
+        );
+    }
+}
+
+struct StatLendSendHandler<H> {
+    inner: H,
+    stats: LendSendStats,
+}
+
+impl<H: lend::SendHandler> lend::SendHandler for StatLendSendHandler<H> {
+    fn is_buf_empty(&self) -> bool {
+        self.inner.is_buf_empty()
+    }
+
+    fn flush_buf(&mut self) -> Bytes {
+        self.stats.mark_flush();
+        self.inner.flush_buf()
+    }
+
+    fn iso_completed(&mut self, iso: Seq<Iso>) -> std::result::Result<(), lend::Error> {
+        self.stats.mark_complete();
+        self.inner.iso_completed(iso)
+    }
+
+    fn int_completed(&mut self, int: Seq<Int>) -> std::result::Result<(), lend::Error> {
+        self.stats.mark_complete();
+        self.inner.int_completed(int)
+    }
+
+    fn ctrl_completed(&mut self, ctrl: Seq<Ctrl>) -> std::result::Result<(), lend::Error> {
+        self.stats.mark_complete();
+        self.inner.ctrl_completed(ctrl)
+    }
+
+    fn bulk_completed(&mut self, bulk: Seq<Bulk>) -> std::result::Result<(), lend::Error> {
+        self.stats.mark_complete();
+        self.inner.bulk_completed(bulk)
+    }
+
+    fn device_resetted(
+        &mut self,
+        reset: Seq<proto::msg::Status>,
+    ) -> std::result::Result<(), lend::Error> {
+        self.inner.device_resetted(reset)
+    }
+}
+
 pub struct LendDevice<W, R> {
     tx: W,
     rx: R,
@@ -1620,19 +2047,19 @@ impl<W, R> LendDevice<W, R> {
 
 impl<W, R> LendDevice<W, R>
 where
-    W: AsyncWrite + CloseStream + Unpin,
-    R: AsyncRead + Unpin,
+    W: AsyncWrite + CloseStream + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
-    pub async fn lend2(
-        Self {
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub async fn lend(self, cancel_token: CancellationToken) -> Result<()> {
+        let Self {
             tx,
             rx,
             buf_rx,
             device,
             id: dev_id,
-        }: Self,
-        cancel_token: CancellationToken,
-    ) -> Result<()> {
+        } = self;
+
         let device = Arc::new(device);
         let ctx = device.context().clone();
         let span = warn_span!("libusb_event_handler");
@@ -1646,1084 +2073,1130 @@ where
             }
         });
 
-        
-        todo!()
-    }
+        let interfaces = Arc::new(Mutex::new(IntSet::with_capacity_and_hasher(
+            16,
+            Default::default(),
+        )));
+        let cancel_tokens = Rc::new(RefCell::new(IntMap::with_capacity_and_hasher(
+            512,
+            Default::default(),
+        )));
 
-    #[tracing::instrument(level = "trace", skip_all)]
-    pub async fn lend(self, cancel_token: CancellationToken) -> Result<()> {
-        let Self {
-            mut tx,
-            mut rx,
-            mut buf_rx,
-            device,
-            id: dev_id,
-        } = self;
-
-        enum Event {
-            RecvFrame2(io::Result<Recv>),
-            FlushBuf,
-            CompletedIso(Seq<Iso>),
-            CompletedInt(Seq<Int>),
-            CompletedCtrl(Seq<Ctrl>),
-            CompletedBulk(Seq<Bulk>),
-            Cancelled,
-        }
-
-        let device = Arc::new(device);
-        let event_handler = CancellationToken::new();
-        let runtime = event_handler.clone();
-        let ctx = device.context().clone();
-        let libusb_handle = compio::runtime::spawn_blocking(move || {
-            let _guard = warn_span!("libusb_event_handler").entered();
-            while !runtime.is_cancelled() {
-                if let Err(err) = ctx.handle_events(Some(Duration::from_secs(5))) {
-                    warn! { %err };
-                }
-            }
-        });
-
-        // ---- Bookkeeping ----
-        let mut cancel_tokens: IntMap<u32, CancellationToken> =
-            IntMap::with_capacity_and_hasher(1024, Default::default());
-        let claimed_interfaces: Arc<Mutex<IntSet<u8>>> = Arc::new(Mutex::new(
-            IntSet::with_capacity_and_hasher(16, Default::default()),
-        ));
-
-        // ---- Cache ----
-        const BUF_LEN: usize = 16 << 14;
-        buf_rx.reserve(BUF_LEN);
-        let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
-        // let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
-        let mut scratch = BytesMut::with_capacity(usize::from(u16::MAX));
-        let iso_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> = Rc::default();
-        let small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
-
-        // ---- Event Receivers ----
-        const TICK: Duration = Duration::from_micros(897);
-        let (blocking_tx, blocking_rx) = mpsc::channel::<Seq<vhci::Status>>(0);
-        let mut blocking_rx = blocking_rx.into_stream();
-        let (iso_tx, iso_rx) = mpsc::channel::<Seq<Iso>>(512);
-        let mut iso_rx = iso_rx.into_stream();
-        let (int_tx, int_rx) = mpsc::channel::<Seq<Int>>(0);
-        let mut int_rx = int_rx.into_stream();
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<Seq<Ctrl>>(0);
-        let mut ctrl_rx = ctrl_rx.into_stream();
-        let (bulk_tx, bulk_rx) = mpsc::channel::<Seq<Bulk>>(16);
-        let mut bulk_rx = bulk_rx.into_stream();
-
-        let blocking = (&mut blocking_rx).map(|Seq { seqnum, data }| {
-            Event::CompletedCtrl(Seq {
-                seqnum,
-                data: Ctrl {
-                    res: ResultData::Out {
-                        bytes_transferred: 0,
-                    },
-                    status: data,
-                },
-            })
-        });
-        let iso = (&mut iso_rx).map(Event::CompletedIso);
-        let int = (&mut int_rx).map(Event::CompletedInt);
-        let ctrl = (&mut ctrl_rx).map(Event::CompletedCtrl);
-        let bulk = (&mut bulk_rx).map(Event::CompletedBulk);
-        let mut timer = pin!(sleep(TICK));
-        let cancel = stream::once_future(async move {
-            cancel_token.cancelled_owned().await;
-            Event::Cancelled
-        });
-        let frame = stream::unfold((&mut rx, buf_rx), |(mut rx, mut buf)| async {
-            let result = recv_frame(&mut rx, &mut buf).await.transpose()?;
-            Some((Event::RecvFrame2(result), (rx, buf)))
-        });
-
-        // ---- Stats ----
-        let mut max_active_transfers = 0;
-        let mut num_active_transfers = 0;
-        let mut max_completed_transfers_before_flush = 0;
-        let mut num_transfers_completed = 0;
-        let mut min_setup_time = Duration::MAX;
-        let mut max_setup_time = Duration::ZERO;
-        const THRESHOLD: usize = 64;
-        let mut last_few_setup_times = RollingAvg::<THRESHOLD, metrics::Duration>::preallocated();
-
-        let result: std::result::Result<(), (Option<Header>, io::Error)> = {
-            let mut main_events = pin!((cancel, frame, iso, int, ctrl, blocking, bulk).merge());
-            let mut main = main_events.next();
-            loop {
-                let event = if buf_tx.is_empty() {
-                    pin!(&mut main).await
-                } else {
-                    let timer = async {
-                        timer.as_mut().await;
-                        Some(Event::FlushBuf)
-                    };
-                    (pin!(&mut main), timer).race().await
-                };
-
-                match event {
-                    Some(Event::FlushBuf) => {
-                        max_completed_transfers_before_flush = std::cmp::max(
-                            max_completed_transfers_before_flush,
-                            num_transfers_completed,
-                        );
-                        num_transfers_completed = 0;
-                        let bytes = buf_tx.split().freeze();
-                        tx.write_all(bytes).await.0.unwrap();
-                        timer.set(sleep(TICK));
-                    }
-                    Some(Event::RecvFrame2(Ok(Recv::Urb((Header { seqnum, .. }, urb_frame))))) => {
-                        num_active_transfers += 1;
-                        max_active_transfers =
-                            std::cmp::max(max_active_transfers, num_active_transfers);
-                        let start = std::time::Instant::now();
-                        let cancel = CancellationToken::new();
-                        cancel_tokens.insert(seqnum, cancel.clone());
-
-                        let (urb, data) = urb_frame.unwrap().split::<[u8]>();
-                        let mut data = data.unwrap().into_bytes_mut();
-                        match urb.kind {
-                            UrbType::Iso => {
-                                let padded_transfer_len = urb.padded_transfer_len();
-                                let is_out = urb.is_out();
-
-                                let (transfer_buf, mut raw_iso_buf) = if is_out {
-                                    let transfer_buf = data
-                                        .split_to(padded_transfer_len)
-                                        .split_to(urb.actual_transfer_len as usize);
-                                    // let mut dma = scratch_dma.reserve(padded_transfer_len);
-                                    // write_transfer(&transfer_data, &mut dma);
-                                    // let transfer_buf = dma.split_to(urb.actual_transfer_len as usize);
-
-                                    (transfer_buf, data)
-                                } else {
-                                    scratch.reserve(padded_transfer_len);
-                                    unsafe { scratch.set_len(padded_transfer_len) };
-                                    let transfer_buf =
-                                        scratch.split_to(urb.actual_transfer_len as usize);
-                                    (transfer_buf, data)
-                                };
-
-                                #[repr(transparent)]
-                                struct Pkt(ioctl::IocIsoPacketData);
-                                impl IsoPacket for Pkt {
-                                    fn len(&self) -> u32 {
-                                        self.0.packet_length
-                                    }
-                                }
-
-                                struct Iter<'a> {
-                                    pkts: std::slice::Iter<'a, ioctl::IocIsoPacketData>,
-                                }
-                                impl Iterator for Iter<'_> {
-                                    type Item = Pkt;
-                                    fn next(&mut self) -> Option<Self::Item> {
-                                        self.pkts.next().map(|pkt| Pkt(*pkt))
-                                    }
-
-                                    fn size_hint(&self) -> (usize, Option<usize>) {
-                                        self.pkts.size_hint()
-                                    }
-                                }
-                                impl ExactSizeIterator for Iter<'_> {
-                                    fn len(&self) -> usize {
-                                        self.pkts.len()
-                                    }
-                                }
-
-                                let num_iso_pkts = urb.iso_packet_count as usize;
-                                let iso_pkts =
-                                    <[ioctl::IocIsoPacketData]>::ref_from_bytes_with_elems(
-                                        &raw_iso_buf[..],
-                                        num_iso_pkts,
-                                    )
-                                    .unwrap();
-
-                                let transfer = get_or_alloc_transfer(
-                                    iso_transfers.borrow_mut(),
-                                    urb.iso_packet_count,
-                                );
-                                let endpoint = urb.endpoint;
-                                let interval = urb.interval;
-                                let transfer = unsafe {
-                                    transfer.into_iso(
-                                        &device,
-                                        endpoint.0,
-                                        transfer_buf,
-                                        Iter {
-                                            pkts: iso_pkts.iter(),
-                                        },
-                                    )
-                                };
-
-                                let cache = iso_transfers.clone();
-                                let iso_tx = iso_tx.clone();
-                                compio::runtime::spawn(async move {
-                                    let result = transfer.submit(&cancel).await;
-                                    let status = convert_libusb_to_vhci(
-                                        result,
-                                        UrbType::Iso,
-                                        seqnum,
-                                        dev_id,
-                                    );
-
-                                    let our_pkts =
-                                        <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
-                                            &mut raw_iso_buf[..],
-                                            num_iso_pkts,
-                                        )
-                                        .unwrap();
-                                    let their_pkts = transfer
-                                        .iso_packets()
-                                        .expect("why wouldn't a transfer be done by this point?");
-
-                                    let mut num_errors = 0;
-                                    for (our_pkt, libusb_pkt) in our_pkts.iter_mut().zip(their_pkts)
-                                    {
-                                        our_pkt.packet_actual = libusb_pkt.actual_len();
-                                        our_pkt.status =
-                                            vhci_from_transfer_status(libusb_pkt.status())
-                                                .to_errno_raw(true);
-                                        if our_pkt.status != 0 {
-                                            num_errors += 1;
-                                        }
-                                    }
-                                    let (transfer, mut buf) = transfer.into_parts().unwrap();
-                                    insert_spare_transfer(cache.borrow_mut(), transfer);
-
-                                    // SAFETY: Isochronous transfer requires that the full
-                                    // buffer be sent back to the caller.
-                                    unsafe { buf.set_len(buf.capacity()) };
-
-                                    let msg = Seq {
-                                        seqnum,
-                                        data: Iso {
-                                            res: match is_out {
-                                                true => ResultData::Out {
-                                                    bytes_transferred: buf.len(),
-                                                },
-                                                false => ResultData::In(buf),
-                                            },
-                                            endpoint,
-                                            interval,
-                                            raw_iso_buf,
-                                            num_errors,
-                                            num_iso_packets: num_iso_pkts as u16,
-                                            status,
-                                        },
-                                    };
-                                    _ = iso_tx.into_send_async(msg).await;
-                                })
-                                .detach();
-                                let elapsed = start.elapsed();
-                                last_few_setup_times.push(elapsed);
-                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                            }
-                            UrbType::Int => {
-                                // let mut buf = {
-                                //     let needed = urb.padded_transfer_len();
-                                //     scratch_dma.reserve(needed)
-                                // };
-
-                                let is_out = urb.is_out();
-                                // if is_out {
-                                //     write_transfer(&data, &mut buf);
-                                // }
-
-                                // let buf = buf.split_to(urb.actual_transfer_len as usize);
-                                let buf = if is_out {
-                                    data.split_to(urb.actual_transfer_len as usize)
-                                } else {
-                                    scratch.reserve(urb.padded_transfer_len());
-                                    unsafe { scratch.set_len(urb.padded_transfer_len()) };
-                                    scratch
-                                        .split_to(urb.padded_transfer_len())
-                                        .split_to(urb.actual_transfer_len as usize)
-                                };
-                                let transfer =
-                                    get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
-                                let endpoint = urb.endpoint;
-                                let interval = urb.interval;
-
-                                // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
-                                let transfer =
-                                    unsafe { transfer.into_int(&device, endpoint.0, buf) };
-
-                                let cache = small_transfers.clone();
-                                let int_tx = int_tx.clone();
-                                compio::runtime::spawn(async move {
-                                    let result = transfer.submit(&cancel).await;
-                                    let status = convert_libusb_to_vhci(
-                                        result,
-                                        UrbType::Int,
-                                        seqnum,
-                                        dev_id,
-                                    );
-
-                                    let (transfer, buf) = transfer.into_parts().unwrap();
-                                    insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
-
-                                    let msg = Seq {
-                                        seqnum,
-                                        data: Int {
-                                            res: match is_out {
-                                                true => ResultData::Out {
-                                                    bytes_transferred: buf.len(),
-                                                },
-                                                false => ResultData::In(buf),
-                                            },
-                                            endpoint,
-                                            interval,
-                                            status,
-                                        },
-                                    };
-                                    _ = int_tx.into_send_async(msg).await;
-                                })
-                                .detach();
-                                let elapsed = start.elapsed();
-                                last_few_setup_times.push(elapsed);
-                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                            }
-                            UrbType::Ctrl => match lend::CtrlKind::parse(urb.ctrl_packet) {
-                                lend::CtrlKind::Blocking(lend::CtrlReq::SetInterface(
-                                    SetInterface { setting, interface },
-                                )) => {
-                                    let blocking_tx = blocking_tx.clone();
-                                    let device = Arc::clone(&device);
-                                    compio::runtime::spawn(async move {
-                                        let msg = device
-                                            .set_alt_setting_async(seqnum, interface, setting)
-                                            .instrument(trace_span!("transfer"))
-                                            .await;
-                                        _ = blocking_tx.into_send_async(msg).await;
-                                    })
-                                    .detach();
-                                    let elapsed = start.elapsed();
-                                    last_few_setup_times.push(elapsed);
-                                    min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                    max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                                }
-                                lend::CtrlKind::Blocking(lend::CtrlReq::SetConfig(SetConfig {
-                                    desired,
-                                })) => {
-                                    let interfaces = Arc::clone(&claimed_interfaces);
-                                    let blocking_tx = blocking_tx.clone();
-                                    let device = Arc::clone(&device);
-                                    compio::runtime::spawn(async move {
-                                        let msg = device
-                                            .set_config_async(seqnum, desired, interfaces)
-                                            .instrument(trace_span!("transfer"))
-                                            .await;
-                                        _ = blocking_tx.into_send_async(msg).await;
-                                    })
-                                    .detach();
-                                    let elapsed = start.elapsed();
-                                    last_few_setup_times.push(elapsed);
-                                    min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                    max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                                }
-                                lend::CtrlKind::Blocking(lend::CtrlReq::ClearStall(
-                                    ClearStall { endpoint },
-                                )) => {
-                                    let blocking_tx = blocking_tx.clone();
-                                    let device = Arc::clone(&device);
-                                    compio::runtime::spawn(async move {
-                                        let msg = device
-                                            .clear_stall_async(seqnum, endpoint)
-                                            .instrument(trace_span!("transfer"))
-                                            .await;
-                                        _ = blocking_tx.into_send_async(msg).await;
-                                    })
-                                    .detach();
-                                    let elapsed = start.elapsed();
-                                    last_few_setup_times.push(elapsed);
-                                    min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                    max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                                }
-                                lend::CtrlKind::Async(ctrl_pkt) => {
-                                    let is_get_status =
-                                        Request::STANDARD_DEVICE_GET_STATUS == ctrl_pkt.req();
-                                    let size_of_pkt = size_of::<ioctl::IocSetupPacket>();
-                                    let actual_transfer_len = urb.actual_transfer_len as usize;
-                                    let mut buf = {
-                                        let w_length = ctrl_pkt.length() as usize;
-                                        debug_assert_eq!(w_length, actual_transfer_len);
-                                        let needed = size_of_pkt + urb.padded_transfer_len();
-                                        scratch.reserve(needed);
-                                        unsafe { scratch.set_len(needed) };
-                                        scratch.split_to(needed)
-                                    };
-
-                                    let (setup_space, rest) =
-                                        ioctl::IocSetupPacket::mut_from_prefix(&mut buf).unwrap();
-
-                                    *setup_space = ctrl_pkt;
-                                    let is_out = Dir::Out == ctrl_pkt.req().dir();
-                                    if is_out {
-                                        write_transfer(&data, rest);
-                                    }
-
-                                    let buf = buf.split_to(size_of_pkt + actual_transfer_len);
-                                    let transfer =
-                                        get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
-
-                                    // SAFETY: Transfer buffer is exactly the length needed for
-                                    // a control transfer, and matches w_length + 8.
-                                    let transfer = unsafe {
-                                        transfer.into_ctrl(&device, buf, Duration::from_millis(900))
-                                    };
-
-                                    let cache = small_transfers.clone();
-                                    let ctrl_tx = ctrl_tx.clone();
-                                    compio::runtime::spawn(async move {
-                                        let result = transfer.submit(&cancel).await;
-                                        let status = convert_libusb_to_vhci(
-                                            result, urb.kind, seqnum, dev_id,
-                                        );
-
-                                        let mut buf = {
-                                            let (transfer, mut buf) =
-                                                transfer.into_parts().unwrap();
-                                            insert_spare_transfer_no_iso(
-                                                cache.borrow_mut(),
-                                                transfer,
-                                            );
-                                            buf.split_off(size_of_pkt)
-                                        };
-
-                                        if is_get_status {
-                                            // Indicate that our fake USB device is self powered.
-                                            buf[0] = 0x01;
-                                        }
-
-                                        let msg = Seq {
-                                            seqnum,
-                                            data: Ctrl {
-                                                res: match is_out {
-                                                    true => ResultData::Out {
-                                                        bytes_transferred: buf.len(),
-                                                    },
-                                                    false => ResultData::In(buf),
-                                                },
-                                                status,
-                                            },
-                                        };
-                                        _ = ctrl_tx.into_send_async(msg).await;
-                                    })
-                                    .detach();
-                                    let elapsed = start.elapsed();
-                                    last_few_setup_times.push(elapsed);
-                                    min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                    max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                                }
-                            },
-                            UrbType::Bulk => {
-                                // let padded_transfer_len = urb.padded_transfer_len();
-                                // let mut buf = scratch_dma.reserve(padded_transfer_len);
-
-                                let is_out = urb.is_out();
-                                // if is_out {
-                                //     write_transfer(&data, &mut buf);
-                                // }
-
-                                // let buf = buf.split_to(urb.actual_transfer_len as usize);
-
-                                let buf = if is_out {
-                                    data.split_to(urb.actual_transfer_len as usize)
-                                } else {
-                                    scratch.reserve(urb.padded_transfer_len());
-                                    unsafe { scratch.set_len(urb.padded_transfer_len()) };
-                                    scratch
-                                        .split_to(urb.padded_transfer_len())
-                                        .split_to(urb.actual_transfer_len as usize)
-                                };
-                                let transfer =
-                                    get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
-                                let endpoint = urb.endpoint;
-
-                                // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
-                                let transfer = unsafe {
-                                    transfer.into_bulk(
-                                        &device,
-                                        endpoint.0,
-                                        TransferFlags::NONE,
-                                        buf,
-                                    )
-                                };
-
-                                let cache = small_transfers.clone();
-                                let bulk_tx = bulk_tx.clone();
-                                compio::runtime::spawn(async move {
-                                    let result = transfer.submit(&cancel).await;
-                                    let status = convert_libusb_to_vhci(
-                                        result,
-                                        UrbType::Bulk,
-                                        seqnum,
-                                        dev_id,
-                                    );
-
-                                    let (transfer, buf) = transfer.into_parts().unwrap();
-                                    insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
-
-                                    let msg = Seq {
-                                        seqnum,
-                                        data: Bulk {
-                                            res: match is_out {
-                                                true => ResultData::Out {
-                                                    bytes_transferred: buf.len(),
-                                                },
-                                                false => ResultData::In(buf),
-                                            },
-                                            endpoint,
-                                            status,
-                                        },
-                                    };
-                                    _ = bulk_tx.into_send_async(msg).await;
-                                })
-                                .detach();
-                                let elapsed = start.elapsed();
-                                last_few_setup_times.push(elapsed);
-                                min_setup_time = std::cmp::min(min_setup_time, elapsed);
-                                max_setup_time = std::cmp::max(max_setup_time, elapsed);
-                            }
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedCtrl(Seq {
-                        seqnum,
-                        data:
-                            Ctrl {
-                                res: ResultData::In(buf),
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let actual_transfer_len = buf.len() as u16;
-                            let padding = padding(actual_transfer_len);
-                            let urb_header = UrbHeader {
-                                actual_transfer_len,
-                                iso_packet_count: 0,
-                                endpoint: ioctl::Endpoint(0x80),
-                                kind: UrbType::Ctrl,
-                                interval: 0,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors: 0,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>()
-                                    + size_of::<UrbHeader>()
-                                    + align_to_usize(buf.len());
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                            buf_tx.put_slice(&buf);
-                            buf_tx.put_slice(padding);
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Ctrl,
-                                ioctl::Endpoint(0x80),
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedCtrl(Seq {
-                        seqnum,
-                        data:
-                            Ctrl {
-                                res: ResultData::Out { bytes_transferred },
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let urb_header = UrbHeader {
-                                actual_transfer_len: bytes_transferred as u16,
-                                iso_packet_count: 0,
-                                endpoint: ioctl::Endpoint(0),
-                                kind: UrbType::Ctrl,
-                                interval: 0,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors: 0,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>() + size_of::<UrbHeader>();
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Ctrl,
-                                ioctl::Endpoint(0),
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedInt(Seq {
-                        seqnum,
-                        data:
-                            Int {
-                                res: ResultData::In(buf),
-                                endpoint,
-                                interval,
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let actual_transfer_len = buf.len() as u16;
-                            let padding = padding(actual_transfer_len);
-                            let urb_header = UrbHeader {
-                                actual_transfer_len,
-                                iso_packet_count: 0,
-                                endpoint,
-                                kind: UrbType::Int,
-                                interval,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors: 0,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>()
-                                    + size_of::<UrbHeader>()
-                                    + align_to_usize(buf.len());
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                            buf_tx.put_slice(&buf);
-                            buf_tx.put_slice(padding);
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Int,
-                                endpoint,
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedInt(Seq {
-                        seqnum,
-                        data:
-                            Int {
-                                res: ResultData::Out { bytes_transferred },
-                                endpoint,
-                                interval,
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let urb_header = UrbHeader {
-                                actual_transfer_len: bytes_transferred as u16,
-                                iso_packet_count: 0,
-                                endpoint,
-                                kind: UrbType::Int,
-                                interval,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors: 0,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>() + size_of::<UrbHeader>();
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Int,
-                                endpoint,
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedBulk(Seq {
-                        seqnum,
-                        data:
-                            Bulk {
-                                res: ResultData::In(buf),
-                                endpoint,
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let actual_transfer_len = buf.len() as u16;
-                            let padding = padding(actual_transfer_len);
-                            let urb_header = UrbHeader {
-                                actual_transfer_len,
-                                iso_packet_count: 0,
-                                endpoint,
-                                kind: UrbType::Bulk,
-                                interval: 0,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors: 0,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>()
-                                    + size_of::<UrbHeader>()
-                                    + align_to_usize(buf.len());
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                            buf_tx.put_slice(&buf);
-                            buf_tx.put_slice(padding);
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Bulk,
-                                endpoint,
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedBulk(Seq {
-                        seqnum,
-                        data:
-                            Bulk {
-                                res: ResultData::Out { bytes_transferred },
-                                endpoint,
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let urb_header = UrbHeader {
-                                actual_transfer_len: bytes_transferred as u16,
-                                iso_packet_count: 0,
-                                endpoint,
-                                kind: UrbType::Bulk,
-                                interval: 0,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors: 0,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>() + size_of::<UrbHeader>();
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Bulk,
-                                endpoint,
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedIso(Seq {
-                        seqnum,
-                        data:
-                            Iso {
-                                res: ResultData::In(buf),
-                                endpoint,
-                                interval,
-                                raw_iso_buf,
-                                num_errors,
-                                num_iso_packets,
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let actual_transfer_len = buf.len() as u16;
-                            let padding = padding(actual_transfer_len);
-                            let urb_header = UrbHeader {
-                                actual_transfer_len,
-                                iso_packet_count: num_iso_packets,
-                                endpoint,
-                                kind: UrbType::Iso,
-                                interval,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>()
-                                    + size_of::<UrbHeader>()
-                                    + align_to_usize(buf.len())
-                                    + raw_iso_buf.len();
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                            buf_tx.put_slice(&buf);
-                            buf_tx.put_slice(padding);
-                            buf_tx.put_slice(&raw_iso_buf);
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Iso,
-                                endpoint,
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::CompletedIso(Seq {
-                        seqnum,
-                        data:
-                            Iso {
-                                res: ResultData::Out { bytes_transferred },
-                                endpoint,
-                                interval,
-                                raw_iso_buf,
-                                num_errors,
-                                num_iso_packets,
-                                status: vhci_status,
-                            },
-                    })) => {
-                        num_transfers_completed += 1;
-                        num_active_transfers -= 1;
-                        cancel_tokens.remove(&seqnum);
-                        let status = msg::Status::from(vhci_status);
-
-                        if msg::Status::Success == status {
-                            let urb_header = UrbHeader {
-                                actual_transfer_len: bytes_transferred as u16,
-                                iso_packet_count: num_iso_packets,
-                                endpoint,
-                                kind: UrbType::Iso,
-                                interval,
-                                status: vhci_status,
-                                flags: 0,
-                                num_errors,
-                                ctrl_packet: Default::default(),
-                            };
-                            let total_frame_len = {
-                                let len = size_of::<Header>()
-                                    + size_of::<UrbHeader>()
-                                    + raw_iso_buf.len();
-                                compress_frame_len(len)
-                            };
-                            let header = Header {
-                                total_frame_len,
-                                command: msg::Command::RetSubmit,
-                                status,
-                                seqnum,
-                            };
-                            buf_tx.put_slice(header.as_bytes());
-                            buf_tx.put_slice(urb_header.as_bytes());
-                            buf_tx.put_slice(&raw_iso_buf);
-                        } else {
-                            let (header, err) = make_error_header(
-                                seqnum,
-                                status,
-                                vhci_status,
-                                UrbType::Iso,
-                                endpoint,
-                            );
-                            break Err((Some(header), err));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::RecvFrame2(Ok(Recv::PortReset(header)))) => {
-                        trace!("({}) got port reset", header.seqnum);
-
-                        let handle = Arc::clone(&device);
-                        let span = tracing::Span::current();
-                        let port_reset = compio::runtime::spawn_blocking(move || {
-                            let _guard = span.entered();
-                            port_reset(header.seqnum, dev_id, &handle)
-                        });
-
-                        let status = port_reset.await.unwrap();
-
-                        let header = Header {
-                            command: msg::Command::RetPort,
-                            status,
-                            ..header
-                        };
-
-                        if msg::Status::Success == header.status {
-                            buf_tx.put_u64_le(transmute!(header));
-                        } else {
-                            break Err((Some(header), io::ErrorKind::ResourceBusy.into()));
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::RecvFrame2(Ok(Recv::Unlink(header)))) => {
-                        if let Some(transfer) = cancel_tokens.remove(&header.seqnum) {
-                            transfer.cancel();
-                        }
-                        main = main_events.next();
-                    }
-                    Some(Event::Cancelled) | None => break Ok(()),
-                    Some(Event::RecvFrame2(Err(_err))) => break Err((None, _err)),
-                }
-            }
+        const BUF_LEN: usize = u16::MAX as usize;
+        let (recv_stats, num_active_transfers) = LendRecvStats::new();
+        let recv_handler = StatLendRecvHandler {
+            inner: LendRecvHandler {
+                dev_id,
+                device,
+                interfaces,
+                cancel_tokens: cancel_tokens.clone(),
+                scratch: BytesMut::with_capacity(BUF_LEN),
+                isos: BigTransfers::default(),
+                smalls: SmallTransfers::default(),
+            },
+            stats: recv_stats,
         };
 
-        let result = match result {
-            Ok(_) => Ok(()),
-            Err((Some(header), err)) => {
-                tx.write_u64_le(transmute!(header)).await?;
-                Err(Error::Io(err))
-            }
-            Err((None, err)) => Err(Error::Io(err)),
+        let send_stats = LendSendStats::new(num_active_transfers);
+        let send_handler = StatLendSendHandler {
+            inner: LendSendHandler {
+                dev_id,
+                buf: BytesMut::with_capacity(BUF_LEN),
+                cancel_tokens,
+            },
+            stats: send_stats,
         };
 
-        // Done! Drain the streams
-        _ = tx.close();
-        let mut buf = Ring::with_capacity(32);
-        while 0 != buf.fill_with_reader(&mut rx).await? {}
+        let (send, recv) = lend::loops(tx, rx, buf_rx);
 
-        // ---- Cleanup ----
-        info!(
-            "shutting down ({:03}/{:03})",
-            dev_id.bus_number, dev_id.device_addr
-        );
-        cancel_tokens
-            .into_values()
-            .for_each(|transfer| transfer.cancel());
-        drop(blocking_tx);
-        drop(iso_tx);
-        drop(int_tx);
-        drop(ctrl_tx);
-        drop(bulk_tx);
+        let recv = compio::runtime::spawn(recv.run(recv_handler, cancel_token.clone()));
+        let send = compio::runtime::spawn(send.run(send_handler, cancel_token.clone()));
+        let (recv_result, send_result) = (recv, send).join().await;
 
-        trace!(
-            "waiting for all transfers to complete ({:03}/{:03})",
-            dev_id.bus_number, dev_id.device_addr
-        );
-        while blocking_rx.next().await.is_some() {}
-        while iso_rx.next().await.is_some() {}
-        while int_rx.next().await.is_some() {}
-        while ctrl_rx.next().await.is_some() {}
-        while bulk_rx.next().await.is_some() {}
-        event_handler.cancel();
-        drop(device);
-        trace!("joining event handler loop");
-        libusb_handle.await.unwrap();
+        info!("({dev_id}) shutting down");
 
-        info!("==== STATS ====");
-        info!("Max active transfers: {max_active_transfers}");
-        info!("Max completed transfers before flush: {max_completed_transfers_before_flush}");
-        // info!("Number of DMA regions in use: {}", scratch_dma.queue.len());
-        info!("Min time to setup transfer: {min_setup_time:?}");
-        info!("Max time to setup transfer: {max_setup_time:?}");
-        info!(
-            "Avg setup time for last {THRESHOLD} transfers: {:?}",
-            Duration::from(last_few_setup_times.mean().unwrap_or_default())
-        );
-
-        result
+        cancel_token.cancel();
+        libusb.await.unwrap();
+        recv_result.unwrap()?;
+        send_result.unwrap()?;
+        Ok(())
     }
+
+    // #[tracing::instrument(level = "trace", skip_all)]
+    // pub async fn lend2(self, cancel_token: CancellationToken) -> Result<()> {
+    //     let Self {
+    //         mut tx,
+    //         mut rx,
+    //         mut buf_rx,
+    //         device,
+    //         id: dev_id,
+    //     } = self;
+
+    //     enum Event {
+    //         RecvFrame2(io::Result<Recv>),
+    //         FlushBuf,
+    //         CompletedIso(Seq<Iso>),
+    //         CompletedInt(Seq<Int>),
+    //         CompletedCtrl(Seq<Ctrl>),
+    //         CompletedBulk(Seq<Bulk>),
+    //         Cancelled,
+    //     }
+
+    //     let device = Arc::new(device);
+    //     let event_handler = CancellationToken::new();
+    //     let runtime = event_handler.clone();
+    //     let ctx = device.context().clone();
+    //     let libusb_handle = compio::runtime::spawn_blocking(move || {
+    //         let _guard = warn_span!("libusb_event_handler").entered();
+    //         while !runtime.is_cancelled() {
+    //             if let Err(err) = ctx.handle_events(Some(Duration::from_secs(5))) {
+    //                 warn! { %err };
+    //             }
+    //         }
+    //     });
+
+    //     // ---- Bookkeeping ----
+    //     let mut cancel_tokens: IntMap<u32, CancellationToken> =
+    //         IntMap::with_capacity_and_hasher(1024, Default::default());
+    //     let claimed_interfaces: Arc<Mutex<IntSet<u8>>> = Arc::new(Mutex::new(
+    //         IntSet::with_capacity_and_hasher(16, Default::default()),
+    //     ));
+
+    //     // ---- Cache ----
+    //     const BUF_LEN: usize = 16 << 14;
+    //     buf_rx.reserve(BUF_LEN);
+    //     let mut buf_tx = BytesMut::with_capacity(BUF_LEN);
+    //     // let mut scratch_dma = DmaAllocator::with_capacity(5, Arc::clone(&device));
+    //     let mut scratch = BytesMut::with_capacity(usize::from(u16::MAX));
+    //     let iso_transfers: Rc<RefCell<BTreeMap<u16, OneOrMany<InnerTransfer>>>> = Rc::default();
+    //     let small_transfers: Rc<RefCell<Vec<InnerTransfer>>> = Rc::default();
+
+    //     // ---- Event Receivers ----
+    //     const TICK: Duration = Duration::from_micros(897);
+    //     let (blocking_tx, blocking_rx) = mpsc::channel::<Seq<vhci::Status>>(0);
+    //     let mut blocking_rx = blocking_rx.into_stream();
+    //     let (iso_tx, iso_rx) = mpsc::channel::<Seq<Iso>>(512);
+    //     let mut iso_rx = iso_rx.into_stream();
+    //     let (int_tx, int_rx) = mpsc::channel::<Seq<Int>>(0);
+    //     let mut int_rx = int_rx.into_stream();
+    //     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Seq<Ctrl>>(0);
+    //     let mut ctrl_rx = ctrl_rx.into_stream();
+    //     let (bulk_tx, bulk_rx) = mpsc::channel::<Seq<Bulk>>(16);
+    //     let mut bulk_rx = bulk_rx.into_stream();
+
+    //     let blocking = (&mut blocking_rx).map(|Seq { seqnum, data }| {
+    //         Event::CompletedCtrl(Seq {
+    //             seqnum,
+    //             data: Ctrl {
+    //                 res: ResultData::Out {
+    //                     bytes_transferred: 0,
+    //                 },
+    //                 status: data,
+    //                 endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
+    //             },
+    //         })
+    //     });
+    //     let iso = (&mut iso_rx).map(Event::CompletedIso);
+    //     let int = (&mut int_rx).map(Event::CompletedInt);
+    //     let ctrl = (&mut ctrl_rx).map(Event::CompletedCtrl);
+    //     let bulk = (&mut bulk_rx).map(Event::CompletedBulk);
+    //     let mut timer = pin!(sleep(TICK));
+    //     let cancel = stream::once_future(async move {
+    //         cancel_token.cancelled_owned().await;
+    //         Event::Cancelled
+    //     });
+    //     let frame = stream::unfold((&mut rx, buf_rx), |(mut rx, mut buf)| async {
+    //         let result = recv_frame(&mut rx, &mut buf).await.transpose()?;
+    //         Some((Event::RecvFrame2(result), (rx, buf)))
+    //     });
+
+    //     // ---- Stats ----
+    //     let mut max_active_transfers = 0;
+    //     let mut num_active_transfers = 0;
+    //     let mut max_completed_transfers_before_flush = 0;
+    //     let mut num_transfers_completed = 0;
+    //     let mut min_setup_time = Duration::MAX;
+    //     let mut max_setup_time = Duration::ZERO;
+    //     const THRESHOLD: usize = 64;
+    //     let mut last_few_setup_times = RollingAvg::<THRESHOLD, metrics::Duration>::preallocated();
+
+    //     let result: std::result::Result<(), (Option<Header>, io::Error)> = {
+    //         let mut main_events = pin!((cancel, frame, iso, int, ctrl, blocking, bulk).merge());
+    //         let mut main = main_events.next();
+    //         loop {
+    //             let event = if buf_tx.is_empty() {
+    //                 pin!(&mut main).await
+    //             } else {
+    //                 let timer = async {
+    //                     timer.as_mut().await;
+    //                     Some(Event::FlushBuf)
+    //                 };
+    //                 (pin!(&mut main), timer).race().await
+    //             };
+
+    //             match event {
+    //                 Some(Event::FlushBuf) => {
+    //                     max_completed_transfers_before_flush = std::cmp::max(
+    //                         max_completed_transfers_before_flush,
+    //                         num_transfers_completed,
+    //                     );
+    //                     num_transfers_completed = 0;
+    //                     let bytes = buf_tx.split().freeze();
+    //                     tx.write_all(bytes).await.0.unwrap();
+    //                     timer.set(sleep(TICK));
+    //                 }
+    //                 Some(Event::RecvFrame2(Ok(Recv::Urb((Header { seqnum, .. }, urb_frame))))) => {
+    //                     num_active_transfers += 1;
+    //                     max_active_transfers =
+    //                         std::cmp::max(max_active_transfers, num_active_transfers);
+    //                     let start = std::time::Instant::now();
+    //                     let cancel = CancellationToken::new();
+    //                     cancel_tokens.insert(seqnum, cancel.clone());
+
+    //                     let (urb, data) = urb_frame.unwrap().split::<[u8]>();
+    //                     let mut data = data.unwrap().into_bytes_mut();
+    //                     match urb.kind {
+    //                         UrbType::Iso => {
+    //                             let padded_transfer_len = urb.padded_transfer_len();
+    //                             let is_out = urb.is_out();
+
+    //                             let (transfer_buf, mut raw_iso_buf) = if is_out {
+    //                                 let transfer_buf = data
+    //                                     .split_to(padded_transfer_len)
+    //                                     .split_to(urb.actual_transfer_len as usize);
+    //                                 // let mut dma = scratch_dma.reserve(padded_transfer_len);
+    //                                 // write_transfer(&transfer_data, &mut dma);
+    //                                 // let transfer_buf = dma.split_to(urb.actual_transfer_len as usize);
+
+    //                                 (transfer_buf, data)
+    //                             } else {
+    //                                 scratch.reserve(padded_transfer_len);
+    //                                 unsafe { scratch.set_len(padded_transfer_len) };
+    //                                 let transfer_buf =
+    //                                     scratch.split_to(urb.actual_transfer_len as usize);
+    //                                 (transfer_buf, data)
+    //                             };
+
+    //                             #[repr(transparent)]
+    //                             struct Pkt(ioctl::IocIsoPacketData);
+    //                             impl IsoPacket for Pkt {
+    //                                 fn len(&self) -> u32 {
+    //                                     self.0.packet_length
+    //                                 }
+    //                             }
+
+    //                             struct Iter<'a> {
+    //                                 pkts: std::slice::Iter<'a, ioctl::IocIsoPacketData>,
+    //                             }
+    //                             impl Iterator for Iter<'_> {
+    //                                 type Item = Pkt;
+    //                                 fn next(&mut self) -> Option<Self::Item> {
+    //                                     self.pkts.next().map(|pkt| Pkt(*pkt))
+    //                                 }
+
+    //                                 fn size_hint(&self) -> (usize, Option<usize>) {
+    //                                     self.pkts.size_hint()
+    //                                 }
+    //                             }
+    //                             impl ExactSizeIterator for Iter<'_> {
+    //                                 fn len(&self) -> usize {
+    //                                     self.pkts.len()
+    //                                 }
+    //                             }
+
+    //                             let num_iso_pkts = urb.iso_packet_count as usize;
+    //                             let iso_pkts =
+    //                                 <[ioctl::IocIsoPacketData]>::ref_from_bytes_with_elems(
+    //                                     &raw_iso_buf[..],
+    //                                     num_iso_pkts,
+    //                                 )
+    //                                 .unwrap();
+
+    //                             let transfer = get_or_alloc_transfer(
+    //                                 iso_transfers.borrow_mut(),
+    //                                 urb.iso_packet_count,
+    //                             );
+    //                             let endpoint = urb.endpoint;
+    //                             let interval = urb.interval;
+    //                             let transfer = unsafe {
+    //                                 transfer.into_iso(
+    //                                     &device,
+    //                                     endpoint.0,
+    //                                     transfer_buf,
+    //                                     Iter {
+    //                                         pkts: iso_pkts.iter(),
+    //                                     },
+    //                                 )
+    //                             };
+
+    //                             let cache = iso_transfers.clone();
+    //                             let iso_tx = iso_tx.clone();
+    //                             compio::runtime::spawn(async move {
+    //                                 let result = transfer.submit(&cancel).await;
+    //                                 let status = convert_libusb_to_vhci(
+    //                                     result,
+    //                                     UrbType::Iso,
+    //                                     seqnum,
+    //                                     dev_id,
+    //                                 );
+
+    //                                 let our_pkts =
+    //                                     <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
+    //                                         &mut raw_iso_buf[..],
+    //                                         num_iso_pkts,
+    //                                     )
+    //                                     .unwrap();
+    //                                 let their_pkts = transfer
+    //                                     .iso_packets()
+    //                                     .expect("why wouldn't a transfer be done by this point?");
+
+    //                                 let mut num_errors = 0;
+    //                                 for (our_pkt, libusb_pkt) in our_pkts.iter_mut().zip(their_pkts)
+    //                                 {
+    //                                     our_pkt.packet_actual = libusb_pkt.actual_len();
+    //                                     our_pkt.status =
+    //                                         vhci_from_transfer_status(libusb_pkt.status())
+    //                                             .to_errno_raw(true);
+    //                                     if our_pkt.status != 0 {
+    //                                         num_errors += 1;
+    //                                     }
+    //                                 }
+    //                                 let (transfer, mut buf) = transfer.into_parts().unwrap();
+    //                                 insert_spare_transfer(cache.borrow_mut(), transfer);
+
+    //                                 // SAFETY: Isochronous transfer requires that the full
+    //                                 // buffer be sent back to the caller.
+    //                                 unsafe { buf.set_len(buf.capacity()) };
+
+    //                                 let msg = Seq {
+    //                                     seqnum,
+    //                                     data: Iso {
+    //                                         res: match is_out {
+    //                                             true => ResultData::Out {
+    //                                                 bytes_transferred: buf.len(),
+    //                                             },
+    //                                             false => ResultData::In(buf),
+    //                                         },
+    //                                         endpoint,
+    //                                         interval,
+    //                                         raw_iso_buf,
+    //                                         num_errors,
+    //                                         num_iso_packets: num_iso_pkts as u16,
+    //                                         status,
+    //                                     },
+    //                                 };
+    //                                 _ = iso_tx.into_send_async(msg).await;
+    //                             })
+    //                             .detach();
+    //                             let elapsed = start.elapsed();
+    //                             last_few_setup_times.push(elapsed);
+    //                             min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                             max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                         }
+    //                         UrbType::Int => {
+    //                             // let mut buf = {
+    //                             //     let needed = urb.padded_transfer_len();
+    //                             //     scratch_dma.reserve(needed)
+    //                             // };
+
+    //                             let is_out = urb.is_out();
+    //                             // if is_out {
+    //                             //     write_transfer(&data, &mut buf);
+    //                             // }
+
+    //                             // let buf = buf.split_to(urb.actual_transfer_len as usize);
+    //                             let buf = if is_out {
+    //                                 data.split_to(urb.actual_transfer_len as usize)
+    //                             } else {
+    //                                 scratch.reserve(urb.padded_transfer_len());
+    //                                 unsafe { scratch.set_len(urb.padded_transfer_len()) };
+    //                                 scratch
+    //                                     .split_to(urb.padded_transfer_len())
+    //                                     .split_to(urb.actual_transfer_len as usize)
+    //                             };
+    //                             let transfer =
+    //                                 get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
+    //                             let endpoint = urb.endpoint;
+    //                             let interval = urb.interval;
+
+    //                             // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
+    //                             let transfer =
+    //                                 unsafe { transfer.into_int(&device, endpoint.0, buf) };
+
+    //                             let cache = small_transfers.clone();
+    //                             let int_tx = int_tx.clone();
+    //                             compio::runtime::spawn(async move {
+    //                                 let result = transfer.submit(&cancel).await;
+    //                                 let status = convert_libusb_to_vhci(
+    //                                     result,
+    //                                     UrbType::Int,
+    //                                     seqnum,
+    //                                     dev_id,
+    //                                 );
+
+    //                                 let (transfer, buf) = transfer.into_parts().unwrap();
+    //                                 insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
+
+    //                                 let msg = Seq {
+    //                                     seqnum,
+    //                                     data: Int {
+    //                                         res: match is_out {
+    //                                             true => ResultData::Out {
+    //                                                 bytes_transferred: buf.len(),
+    //                                             },
+    //                                             false => ResultData::In(buf),
+    //                                         },
+    //                                         endpoint,
+    //                                         interval,
+    //                                         status,
+    //                                     },
+    //                                 };
+    //                                 _ = int_tx.into_send_async(msg).await;
+    //                             })
+    //                             .detach();
+    //                             let elapsed = start.elapsed();
+    //                             last_few_setup_times.push(elapsed);
+    //                             min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                             max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                         }
+    //                         UrbType::Ctrl => match lend::CtrlKind::parse(urb.ctrl_packet) {
+    //                             lend::CtrlKind::Blocking(lend::CtrlReq::SetInterface(
+    //                                 SetInterface { setting, interface },
+    //                             )) => {
+    //                                 let blocking_tx = blocking_tx.clone();
+    //                                 let device = Arc::clone(&device);
+    //                                 compio::runtime::spawn(async move {
+    //                                     let msg = device
+    //                                         .set_alt_setting_async(seqnum, interface, setting)
+    //                                         .instrument(trace_span!("transfer"))
+    //                                         .await;
+    //                                     _ = blocking_tx.into_send_async(msg).await;
+    //                                 })
+    //                                 .detach();
+    //                                 let elapsed = start.elapsed();
+    //                                 last_few_setup_times.push(elapsed);
+    //                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                             }
+    //                             lend::CtrlKind::Blocking(lend::CtrlReq::SetConfig(SetConfig {
+    //                                 desired,
+    //                             })) => {
+    //                                 let interfaces = Arc::clone(&claimed_interfaces);
+    //                                 let blocking_tx = blocking_tx.clone();
+    //                                 let device = Arc::clone(&device);
+    //                                 compio::runtime::spawn(async move {
+    //                                     let msg = device
+    //                                         .set_config_async(seqnum, desired, interfaces)
+    //                                         .instrument(trace_span!("transfer"))
+    //                                         .await;
+    //                                     _ = blocking_tx.into_send_async(msg).await;
+    //                                 })
+    //                                 .detach();
+    //                                 let elapsed = start.elapsed();
+    //                                 last_few_setup_times.push(elapsed);
+    //                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                             }
+    //                             lend::CtrlKind::Blocking(lend::CtrlReq::ClearStall(
+    //                                 ClearStall { endpoint },
+    //                             )) => {
+    //                                 let blocking_tx = blocking_tx.clone();
+    //                                 let device = Arc::clone(&device);
+    //                                 compio::runtime::spawn(async move {
+    //                                     let msg = device
+    //                                         .clear_stall_async(seqnum, endpoint)
+    //                                         .instrument(trace_span!("transfer"))
+    //                                         .await;
+    //                                     _ = blocking_tx.into_send_async(msg).await;
+    //                                 })
+    //                                 .detach();
+    //                                 let elapsed = start.elapsed();
+    //                                 last_few_setup_times.push(elapsed);
+    //                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                             }
+    //                             lend::CtrlKind::Async(ctrl_pkt) => {
+    //                                 let is_get_status =
+    //                                     Request::STANDARD_DEVICE_GET_STATUS == ctrl_pkt.req();
+    //                                 let size_of_pkt = size_of::<ioctl::IocSetupPacket>();
+    //                                 let actual_transfer_len = urb.actual_transfer_len as usize;
+    //                                 let mut buf = {
+    //                                     let w_length = ctrl_pkt.length() as usize;
+    //                                     debug_assert_eq!(w_length, actual_transfer_len);
+    //                                     let needed = size_of_pkt + urb.padded_transfer_len();
+    //                                     scratch.reserve(needed);
+    //                                     unsafe { scratch.set_len(needed) };
+    //                                     scratch.split_to(needed)
+    //                                 };
+
+    //                                 let (setup_space, rest) =
+    //                                     ioctl::IocSetupPacket::mut_from_prefix(&mut buf).unwrap();
+
+    //                                 *setup_space = ctrl_pkt;
+    //                                 let is_out = Dir::Out == ctrl_pkt.req().dir();
+    //                                 if is_out {
+    //                                     write_transfer(&data, rest);
+    //                                 }
+
+    //                                 let buf = buf.split_to(size_of_pkt + actual_transfer_len);
+    //                                 let transfer =
+    //                                     get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
+
+    //                                 // SAFETY: Transfer buffer is exactly the length needed for
+    //                                 // a control transfer, and matches w_length + 8.
+    //                                 let transfer = unsafe {
+    //                                     transfer.into_ctrl(&device, buf, Duration::from_millis(900))
+    //                                 };
+
+    //                                 let cache = small_transfers.clone();
+    //                                 let ctrl_tx = ctrl_tx.clone();
+    //                                 compio::runtime::spawn(async move {
+    //                                     let result = transfer.submit(&cancel).await;
+    //                                     let status = convert_libusb_to_vhci(
+    //                                         result, urb.kind, seqnum, dev_id,
+    //                                     );
+
+    //                                     let mut buf = {
+    //                                         let (transfer, mut buf) =
+    //                                             transfer.into_parts().unwrap();
+    //                                         insert_spare_transfer_no_iso(
+    //                                             cache.borrow_mut(),
+    //                                             transfer,
+    //                                         );
+    //                                         buf.split_off(size_of_pkt)
+    //                                     };
+
+    //                                     if is_get_status {
+    //                                         // Indicate that our fake USB device is self powered.
+    //                                         buf[0] = 0x01;
+    //                                     }
+
+    //                                     let msg = Seq {
+    //                                         seqnum,
+    //                                         data: Ctrl {
+    //                                             res: match is_out {
+    //                                                 true => ResultData::Out {
+    //                                                     bytes_transferred: buf.len(),
+    //                                                 },
+    //                                                 false => ResultData::In(buf),
+    //                                             },
+    //                                             status,
+    //                                         },
+    //                                     };
+    //                                     _ = ctrl_tx.into_send_async(msg).await;
+    //                                 })
+    //                                 .detach();
+    //                                 let elapsed = start.elapsed();
+    //                                 last_few_setup_times.push(elapsed);
+    //                                 min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                                 max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                             }
+    //                         },
+    //                         UrbType::Bulk => {
+    //                             // let padded_transfer_len = urb.padded_transfer_len();
+    //                             // let mut buf = scratch_dma.reserve(padded_transfer_len);
+
+    //                             let is_out = urb.is_out();
+    //                             // if is_out {
+    //                             //     write_transfer(&data, &mut buf);
+    //                             // }
+
+    //                             // let buf = buf.split_to(urb.actual_transfer_len as usize);
+
+    //                             let buf = if is_out {
+    //                                 data.split_to(urb.actual_transfer_len as usize)
+    //                             } else {
+    //                                 scratch.reserve(urb.padded_transfer_len());
+    //                                 unsafe { scratch.set_len(urb.padded_transfer_len()) };
+    //                                 scratch
+    //                                     .split_to(urb.padded_transfer_len())
+    //                                     .split_to(urb.actual_transfer_len as usize)
+    //                             };
+    //                             let transfer =
+    //                                 get_or_alloc_transfer_no_iso(small_transfers.borrow_mut());
+    //                             let endpoint = urb.endpoint;
+
+    //                             // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
+    //                             let transfer = unsafe {
+    //                                 transfer.into_bulk(
+    //                                     &device,
+    //                                     endpoint.0,
+    //                                     TransferFlags::NONE,
+    //                                     buf,
+    //                                 )
+    //                             };
+
+    //                             let cache = small_transfers.clone();
+    //                             let bulk_tx = bulk_tx.clone();
+    //                             compio::runtime::spawn(async move {
+    //                                 let result = transfer.submit(&cancel).await;
+    //                                 let status = convert_libusb_to_vhci(
+    //                                     result,
+    //                                     UrbType::Bulk,
+    //                                     seqnum,
+    //                                     dev_id,
+    //                                 );
+
+    //                                 let (transfer, buf) = transfer.into_parts().unwrap();
+    //                                 insert_spare_transfer_no_iso(cache.borrow_mut(), transfer);
+
+    //                                 let msg = Seq {
+    //                                     seqnum,
+    //                                     data: Bulk {
+    //                                         res: match is_out {
+    //                                             true => ResultData::Out {
+    //                                                 bytes_transferred: buf.len(),
+    //                                             },
+    //                                             false => ResultData::In(buf),
+    //                                         },
+    //                                         endpoint,
+    //                                         status,
+    //                                     },
+    //                                 };
+    //                                 _ = bulk_tx.into_send_async(msg).await;
+    //                             })
+    //                             .detach();
+    //                             let elapsed = start.elapsed();
+    //                             last_few_setup_times.push(elapsed);
+    //                             min_setup_time = std::cmp::min(min_setup_time, elapsed);
+    //                             max_setup_time = std::cmp::max(max_setup_time, elapsed);
+    //                         }
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedCtrl(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Ctrl {
+    //                             res: ResultData::In(buf),
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let actual_transfer_len = buf.len() as u16;
+    //                         let padding = padding(actual_transfer_len);
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len,
+    //                             iso_packet_count: 0,
+    //                             endpoint: ioctl::Endpoint(0x80),
+    //                             kind: UrbType::Ctrl,
+    //                             interval: 0,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors: 0,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>()
+    //                                 + size_of::<UrbHeader>()
+    //                                 + align_to_usize(buf.len());
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                         buf_tx.put_slice(&buf);
+    //                         buf_tx.put_slice(padding);
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Ctrl,
+    //                             ioctl::Endpoint(0x80),
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedCtrl(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Ctrl {
+    //                             res: ResultData::Out { bytes_transferred },
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len: bytes_transferred as u16,
+    //                             iso_packet_count: 0,
+    //                             endpoint: ioctl::Endpoint(0),
+    //                             kind: UrbType::Ctrl,
+    //                             interval: 0,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors: 0,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>() + size_of::<UrbHeader>();
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Ctrl,
+    //                             ioctl::Endpoint(0),
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedInt(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Int {
+    //                             res: ResultData::In(buf),
+    //                             endpoint,
+    //                             interval,
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let actual_transfer_len = buf.len() as u16;
+    //                         let padding = padding(actual_transfer_len);
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len,
+    //                             iso_packet_count: 0,
+    //                             endpoint,
+    //                             kind: UrbType::Int,
+    //                             interval,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors: 0,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>()
+    //                                 + size_of::<UrbHeader>()
+    //                                 + align_to_usize(buf.len());
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                         buf_tx.put_slice(&buf);
+    //                         buf_tx.put_slice(padding);
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Int,
+    //                             endpoint,
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedInt(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Int {
+    //                             res: ResultData::Out { bytes_transferred },
+    //                             endpoint,
+    //                             interval,
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len: bytes_transferred as u16,
+    //                             iso_packet_count: 0,
+    //                             endpoint,
+    //                             kind: UrbType::Int,
+    //                             interval,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors: 0,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>() + size_of::<UrbHeader>();
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Int,
+    //                             endpoint,
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedBulk(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Bulk {
+    //                             res: ResultData::In(buf),
+    //                             endpoint,
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let actual_transfer_len = buf.len() as u16;
+    //                         let padding = padding(actual_transfer_len);
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len,
+    //                             iso_packet_count: 0,
+    //                             endpoint,
+    //                             kind: UrbType::Bulk,
+    //                             interval: 0,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors: 0,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>()
+    //                                 + size_of::<UrbHeader>()
+    //                                 + align_to_usize(buf.len());
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                         buf_tx.put_slice(&buf);
+    //                         buf_tx.put_slice(padding);
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Bulk,
+    //                             endpoint,
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedBulk(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Bulk {
+    //                             res: ResultData::Out { bytes_transferred },
+    //                             endpoint,
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len: bytes_transferred as u16,
+    //                             iso_packet_count: 0,
+    //                             endpoint,
+    //                             kind: UrbType::Bulk,
+    //                             interval: 0,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors: 0,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>() + size_of::<UrbHeader>();
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Bulk,
+    //                             endpoint,
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedIso(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Iso {
+    //                             res: ResultData::In(buf),
+    //                             endpoint,
+    //                             interval,
+    //                             raw_iso_buf,
+    //                             num_errors,
+    //                             num_iso_packets,
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let actual_transfer_len = buf.len() as u16;
+    //                         let padding = padding(actual_transfer_len);
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len,
+    //                             iso_packet_count: num_iso_packets,
+    //                             endpoint,
+    //                             kind: UrbType::Iso,
+    //                             interval,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>()
+    //                                 + size_of::<UrbHeader>()
+    //                                 + align_to_usize(buf.len())
+    //                                 + raw_iso_buf.len();
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                         buf_tx.put_slice(&buf);
+    //                         buf_tx.put_slice(padding);
+    //                         buf_tx.put_slice(&raw_iso_buf);
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Iso,
+    //                             endpoint,
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::CompletedIso(Seq {
+    //                     seqnum,
+    //                     data:
+    //                         Iso {
+    //                             res: ResultData::Out { bytes_transferred },
+    //                             endpoint,
+    //                             interval,
+    //                             raw_iso_buf,
+    //                             num_errors,
+    //                             num_iso_packets,
+    //                             status: vhci_status,
+    //                         },
+    //                 })) => {
+    //                     num_transfers_completed += 1;
+    //                     num_active_transfers -= 1;
+    //                     cancel_tokens.remove(&seqnum);
+    //                     let status = msg::Status::from(vhci_status);
+
+    //                     if msg::Status::Success == status {
+    //                         let urb_header = UrbHeader {
+    //                             actual_transfer_len: bytes_transferred as u16,
+    //                             iso_packet_count: num_iso_packets,
+    //                             endpoint,
+    //                             kind: UrbType::Iso,
+    //                             interval,
+    //                             status: vhci_status,
+    //                             flags: 0,
+    //                             num_errors,
+    //                             ctrl_packet: Default::default(),
+    //                         };
+    //                         let total_frame_len = {
+    //                             let len = size_of::<Header>()
+    //                                 + size_of::<UrbHeader>()
+    //                                 + raw_iso_buf.len();
+    //                             compress_frame_len(len)
+    //                         };
+    //                         let header = Header {
+    //                             total_frame_len,
+    //                             command: msg::Command::RetSubmit,
+    //                             status,
+    //                             seqnum,
+    //                         };
+    //                         buf_tx.put_slice(header.as_bytes());
+    //                         buf_tx.put_slice(urb_header.as_bytes());
+    //                         buf_tx.put_slice(&raw_iso_buf);
+    //                     } else {
+    //                         let (header, err) = make_error_header(
+    //                             seqnum,
+    //                             status,
+    //                             vhci_status,
+    //                             UrbType::Iso,
+    //                             endpoint,
+    //                         );
+    //                         break Err((Some(header), err));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::RecvFrame2(Ok(Recv::PortReset(header)))) => {
+    //                     trace!("({}) got port reset", header.seqnum);
+
+    //                     let handle = Arc::clone(&device);
+    //                     let span = tracing::Span::current();
+    //                     let port_reset = compio::runtime::spawn_blocking(move || {
+    //                         let _guard = span.entered();
+    //                         port_reset(header.seqnum, dev_id, &handle)
+    //                     });
+
+    //                     let status = port_reset.await.unwrap();
+
+    //                     let header = Header {
+    //                         command: msg::Command::RetPort,
+    //                         status,
+    //                         ..header
+    //                     };
+
+    //                     if msg::Status::Success == header.status {
+    //                         buf_tx.put_u64_le(transmute!(header));
+    //                     } else {
+    //                         break Err((Some(header), io::ErrorKind::ResourceBusy.into()));
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::RecvFrame2(Ok(Recv::Unlink(header)))) => {
+    //                     if let Some(transfer) = cancel_tokens.remove(&header.seqnum) {
+    //                         transfer.cancel();
+    //                     }
+    //                     main = main_events.next();
+    //                 }
+    //                 Some(Event::Cancelled) | None => break Ok(()),
+    //                 Some(Event::RecvFrame2(Err(_err))) => break Err((None, _err)),
+    //             }
+    //         }
+    //     };
+
+    //     let result = match result {
+    //         Ok(_) => Ok(()),
+    //         Err((Some(header), err)) => {
+    //             tx.write_u64_le(transmute!(header)).await?;
+    //             Err(Error::Io(err))
+    //         }
+    //         Err((None, err)) => Err(Error::Io(err)),
+    //     };
+
+    //     // Done! Drain the streams
+    //     _ = tx.close();
+    //     let mut buf = Ring::with_capacity(32);
+    //     while 0 != buf.fill_with_reader(&mut rx).await? {}
+
+    //     // ---- Cleanup ----
+    //     info!(
+    //         "shutting down ({:03}/{:03})",
+    //         dev_id.bus_number, dev_id.device_addr
+    //     );
+    //     cancel_tokens
+    //         .into_values()
+    //         .for_each(|transfer| transfer.cancel());
+    //     drop(blocking_tx);
+    //     drop(iso_tx);
+    //     drop(int_tx);
+    //     drop(ctrl_tx);
+    //     drop(bulk_tx);
+
+    //     trace!(
+    //         "waiting for all transfers to complete ({:03}/{:03})",
+    //         dev_id.bus_number, dev_id.device_addr
+    //     );
+    //     while blocking_rx.next().await.is_some() {}
+    //     while iso_rx.next().await.is_some() {}
+    //     while int_rx.next().await.is_some() {}
+    //     while ctrl_rx.next().await.is_some() {}
+    //     while bulk_rx.next().await.is_some() {}
+    //     event_handler.cancel();
+    //     drop(device);
+    //     trace!("joining event handler loop");
+    //     libusb_handle.await.unwrap();
+
+    //     info!("==== STATS ====");
+    //     info!("Max active transfers: {max_active_transfers}");
+    //     info!("Max completed transfers before flush: {max_completed_transfers_before_flush}");
+    //     // info!("Number of DMA regions in use: {}", scratch_dma.queue.len());
+    //     info!("Min time to setup transfer: {min_setup_time:?}");
+    //     info!("Max time to setup transfer: {max_setup_time:?}");
+    //     info!(
+    //         "Avg setup time for last {THRESHOLD} transfers: {:?}",
+    //         Duration::from(last_few_setup_times.mean().unwrap_or_default())
+    //     );
+
+    //     result
+    // }
 }
 
 pub struct SendDevices<W> {

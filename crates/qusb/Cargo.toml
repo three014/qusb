@@ -4,30 +4,31 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-thiserror = "2.0.3"
+thiserror = { version = "2.0.3", default-features = false }
 proto = { package = "qusb-proto", path = "../qusb-proto" }
-nohash-hasher = "0.2.0"
-rand = "0.8.5"
-tracing = "0.1.40"
+nohash-hasher = { version = "0.2.0", default-features = false }
+rand = { version = "0.9.0", default-features = false }
+tracing = { version = "0.1.40", default-features = false, features = ["attributes"] }
 tokio-util = { version = "0.7.12", default-features = false }
 nusb = "0.1.12"
 vhci = { package = "usb_vhci", git = "https://github.com/three014/usb_vhci", features = ["zerocopy"], version = "0.2.1" }
 bytes = "1.9.0"
-zerocopy = "0.8.13"
-rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4" }
+zerocopy = { version = "0.8.13", default-features = false }
+rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4", default-features = false }
 fxhash = "0.2.1"
 rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.3.10", features = ["runtime-compio"] }
-futures = { version = "0.3.31", default-features = false }
 flume = { version = "0.11.1", default-features = false, features = ["async"] }
-compio = { version = "0.13.2", default-features = false, features = ["runtime", "io-uring", "quic", "rustls", "ring", "io"] }
+compio = { version = "0.14.0", default-features = false, features = ["runtime", "io-uring", "quic", "rustls", "ring", "io"] }
 futures-lite = { version = "2.6.0", default-features = false }
 futures-concurrency = { version = "7.6.3", default-features = false }
 rustls = { version = "0.23.23", default-features = false, features = ["ring"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["sink"] }
+futures-sink = { version = "0.3.31", default-features = false }
 
 [dev-dependencies]
 tracing-test = { version = "0.2.5" }
 tracing-subscriber = "0.3.19"
 rcgen = "0.13.2"
-rustls = "0.23.23"
-compio = { version = "0.13.2", default-features = false, features = ["runtime", "io-uring", "quic", "rustls", "ring", "signal", "macros"] }
+rustls = { version = "0.23.23", default-features = false, features = ["ring"] }
+compio = { version = "0.14.0", default-features = false, features = ["runtime", "io-uring", "quic", "rustls", "signal", "macros"] }
 

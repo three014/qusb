@@ -1,4 +1,4 @@
-use futures::SinkExt;
+use futures_util::sink::SinkExt;
 use futures_concurrency::stream::Merge;
 use futures_lite::StreamExt;
 use std::{

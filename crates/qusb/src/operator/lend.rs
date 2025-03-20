@@ -4,9 +4,10 @@ use super::{Seq, compress_frame_len};
 use crate::utils::{CloseStream, Interval, blocker, mpsc};
 use bytes::{Bytes, BytesMut};
 use compio::io::{AsyncRead, AsyncWrite};
-use futures::{SinkExt, stream::FuturesUnordered};
 use futures_concurrency::{future::Race, stream::Merge};
 use futures_lite::{Stream, StreamExt, stream};
+use futures_util::SinkExt;
+use futures_util::stream::FuturesUnordered;
 use proto::{
     data::{Data, Ring},
     msg::{Command, Header, UrbFrame, UsbDeviceId},
@@ -197,6 +198,7 @@ enum LendEvent {
 }
 
 impl<W> SendLoop<W> {
+    #[inline]
     async fn do_loop<H>(
         tx: &mut W,
         event_rx: impl Stream<Item = LendEvent> + Unpin,
@@ -214,7 +216,7 @@ impl<W> SendLoop<W> {
         }
 
         enum Event<W> {
-            LendEvent(LendEvent),
+            Lend(LendEvent),
             FlushBuf,
             FlushComplete(io::Result<W>),
         }
@@ -224,32 +226,30 @@ impl<W> SendLoop<W> {
         // Timer -> [Timer(LendEvent), Flush(FlushBuf)]
         // Flush -> [Solicit(FlushComplete), Timer(FlushComplete), Flush(LendEvent)]
 
+        #[inline]
+        async fn arm_timer<W>(interval: &Interval) -> Option<Event<W>> {
+            interval.tick().await;
+            Some(Event::FlushBuf)
+        }
+
         let interval = Interval::new(TICK);
         let mut tx_holder = Some(tx);
         let mut sleeper = pin!(blocker(None));
         let mut flush_op = pin!(blocker(None));
-        let mut event_rx = event_rx.map(Event::LendEvent);
+        let mut event_rx = event_rx.map(Event::Lend);
 
         let mut state = State::Solicit;
         loop {
             let event = {
-                let flush = async {
-                    let result: Option<io::Result<&mut W>> = flush_op.as_mut().await;
-                    result.map(Event::FlushComplete)
-                };
-                let timer = async {
-                    sleeper.as_mut().await;
-                    Some(Event::FlushBuf)
-                };
-                let race = (event_rx.next(), timer, flush).race();
+                let race = (event_rx.next(), sleeper.as_mut(), flush_op.as_mut()).race();
                 race.await.ok_or(None)?
             };
             state = match event {
-                Event::LendEvent(event) => {
+                Event::Lend(event) => {
                     handler.handle_event(event)?;
                     match state {
                         State::Solicit => {
-                            sleeper.set(blocker(Some(interval.tick())));
+                            sleeper.set(blocker(Some(arm_timer(&interval))));
                             State::Timer
                         }
                         current => current,
@@ -261,8 +261,8 @@ impl<W> SendLoop<W> {
                     let bytes = handler.flush_buf();
                     flush_op.set(blocker(Some(async move {
                         match tx.write_all(bytes).await.0 {
-                            Ok(_) => Some(Ok(tx)),
-                            Err(err) => Some(Err(err)),
+                            Ok(_) => Some(Event::FlushComplete(Ok(tx))),
+                            Err(err) => Some(Event::FlushComplete(Err(err))),
                         }
                     })));
                     State::Flush
@@ -273,7 +273,7 @@ impl<W> SendLoop<W> {
                     if handler.is_buf_empty() {
                         State::Solicit
                     } else {
-                        sleeper.set(blocker(Some(interval.tick())));
+                        sleeper.set(blocker(Some(arm_timer(&interval))));
                         State::Timer
                     }
                 }
@@ -331,6 +331,7 @@ pub struct RecvLoop<R> {
 }
 
 impl<R> RecvLoop<R> {
+    #[inline]
     async fn do_loop<H>(
         frame_rx: impl Stream<Item = io::Result<super::Recv>> + Unpin,
         mut resets: mpsc::AsyncSender<Seq<proto::msg::Status>>,
@@ -371,23 +372,23 @@ impl<R> RecvLoop<R> {
         loop {
             let frame_next = async { frame_rx.next().await };
             let blocking_next = async {
-                let next: Seq<proto::msg::Status> = reset_inprogress.next().await.unwrap();
+                let next: Seq<proto::msg::Status> = reset_inprogress.next().await?;
                 Some(Ok::<_, io::Error>(Event::CompletedBlocking(next)))
             };
             let ctrl_next = async {
-                let next: Seq<Ctrl> = ctrl_inprogress.next().await.unwrap();
+                let next: Seq<Ctrl> = ctrl_inprogress.next().await?;
                 Some(Ok::<_, io::Error>(Event::CompletedCtrl(next)))
             };
             let int_next = async {
-                let next: Seq<Int> = int_inprogress.next().await.unwrap();
+                let next: Seq<Int> = int_inprogress.next().await?;
                 Some(Ok::<_, io::Error>(Event::CompletedInt(next)))
             };
             let iso_next = async {
-                let next: Seq<Iso> = iso_inprogress.next().await.unwrap();
+                let next: Seq<Iso> = iso_inprogress.next().await?;
                 Some(Ok::<_, io::Error>(Event::CompletedIso(next)))
             };
             let bulk_next = async {
-                let next: Seq<Bulk> = bulk_inprogress.next().await.unwrap();
+                let next: Seq<Bulk> = bulk_inprogress.next().await?;
                 Some(Ok::<_, io::Error>(Event::CompletedBulk(next)))
             };
 
@@ -464,7 +465,7 @@ impl<R> RecvLoop<R> {
                                         .race();
                                     ctrl_inprogress.push(blocker(Some(hehe)));
                                 }
-                                CtrlKind::Async(_) => {
+                                CtrlKind::Async => {
                                     let fut = handler.new_ctrl(Seq {
                                         seqnum,
                                         data: urb_frame,
@@ -516,11 +517,7 @@ impl<R> RecvLoop<R> {
         }
     }
 
-    pub async fn run<H>(
-        self,
-        handler: impl RecvHandler,
-        cancel: CancellationToken,
-    ) -> io::Result<()>
+    pub async fn run(self, handler: impl RecvHandler, cancel: CancellationToken) -> io::Result<()>
     where
         R: AsyncRead + Unpin + 'static,
     {
@@ -587,7 +584,7 @@ pub fn loops<W, R>(tx: W, rx: R, buf: Ring) -> (SendLoop<W>, RecvLoop<R>) {
 
 pub enum CtrlKind {
     Blocking(CtrlReq),
-    Async(IocSetupPacket),
+    Async,
 }
 
 impl CtrlKind {
@@ -610,7 +607,7 @@ impl CtrlKind {
                     endpoint: setup_pkt.index() as u8,
                 }))
             }
-            _ => CtrlKind::Async(setup_pkt),
+            _ => CtrlKind::Async,
         }
     }
 }
@@ -630,6 +627,45 @@ impl ResultData {
             vhci::usbfs::Dir::In => Self::In(buf),
         }
     }
+
+    pub fn actual_transfer_len(&self) -> usize {
+        match self {
+            ResultData::In(buf) => buf.len(),
+            ResultData::Out { bytes_transferred } => *bytes_transferred,
+        }
+    }
+
+    pub fn get(&self) -> &[u8] {
+        match self {
+            ResultData::In(buf) => buf,
+            ResultData::Out {
+                bytes_transferred: _,
+            } => &[],
+        }
+    }
+
+    pub fn as_header_data(&self) -> HeaderData<'_> {
+        let actual_transfer_len = self.actual_transfer_len() as u16;
+        let transfer = self.get();
+        let padding = super::padding(transfer.len() as u16);
+        HeaderData {
+            actual_transfer_len,
+            transfer,
+            padding,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeaderData<'a> {
+    /// The length that goes into the UrbHeader
+    pub actual_transfer_len: u16,
+    /// The buffer we write into our buffer, which might
+    /// be empty if the transfer was an outgoing one
+    pub transfer: &'a [u8],
+    /// The extra padding for the buffer above, so that
+    /// we're aligned to 8 bytes (Can be zero length as well)
+    pub padding: &'static [u8],
 }
 
 #[derive(Debug)]
@@ -654,6 +690,7 @@ pub struct Int {
 #[derive(Debug)]
 pub struct Ctrl {
     pub res: ResultData,
+    pub endpoint: ioctl::Endpoint,
     pub status: vhci::Status,
 }
 

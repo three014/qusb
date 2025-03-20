@@ -149,6 +149,7 @@ impl Interval {
         }
     }
 
+    #[inline]
     pub async fn tick(&self) {
         let time_til_next_tick = {
             let elapsed = self.start.elapsed().as_secs_f64();
@@ -167,7 +168,14 @@ where
     if let Some(f) = f {
         f.await
     } else {
-        cold(std::future::pending()).await
+
+        #[inline(never)]
+        #[cold]
+        async fn pending<T>() -> T {
+            std::future::pending().await
+        }
+
+        pending().await
     }
 }
 
