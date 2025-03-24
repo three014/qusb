@@ -1,13 +1,16 @@
 [package]
 name = "qusb-cli"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0.95"
-clap = { version = "4.5.28", features = ["wrap_help"] }
+clap = { version = "4.5.28", features = ["wrap_help", "derive"] }
+compio-macros = "0.1.2"
+compio-runtime = { version = "0.7.0", default-features = false, features = ["io-uring"] }
+compio-signal = "0.5.0"
 qusb = { path = "../qusb" }
 rcgen = "0.13.2"
-tokio = { version = "1.43.0", features = ["rt", "signal"] }
+rustls = { version = "0.23.25", default-features = false }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

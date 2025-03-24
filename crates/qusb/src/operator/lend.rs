@@ -14,7 +14,7 @@ use proto::{
 };
 use rusb_async::UsbMemMut;
 use tokio_util::sync::CancellationToken;
-use tracing::Span;
+use tracing::{Instrument, Span};
 use vhci::{
     ioctl::{self, Endpoint, IocSetupPacket, UrbType},
     usbfs::Request,
@@ -22,6 +22,7 @@ use vhci::{
 use zerocopy::transmute;
 
 pub(super) mod blocking;
+pub mod device;
 
 const TICK: Duration = Duration::from_micros(47);
 
@@ -232,6 +233,7 @@ impl<W> SendLoop<W> {
             Some(Event::FlushBuf)
         }
 
+        let _enter = Span::current();
         let interval = Interval::new(TICK);
         let mut tx_holder = Some(tx);
         let mut sleeper = pin!(blocker(None));
@@ -288,13 +290,13 @@ impl<W> SendLoop<W> {
     {
         let Self {
             mut tx,
-            resets: reset,
+            resets,
             ctrls,
             ints,
             isos,
             bulks,
         } = self;
-        let reset = reset.map(LendEvent::Reset);
+        let reset = resets.map(LendEvent::Reset);
         let ctrls = ctrls.map(LendEvent::Ctrl);
         let ints = ints.map(LendEvent::Int);
         let isos = isos.map(LendEvent::Iso);
@@ -302,7 +304,10 @@ impl<W> SendLoop<W> {
         let event_rx = (isos, ints, ctrls, bulks, reset).merge();
         let event_rx = pin!(stream::stop_after_future(event_rx, cancel.cancelled()));
 
-        let result = match Self::do_loop(&mut tx, event_rx, handler).await {
+        let result = match Self::do_loop(&mut tx, event_rx, handler)
+            .in_current_span()
+            .await
+        {
             Ok(_) | Err(None) => Ok(()),
             Err(Some(Error::Usb(err))) => {
                 use compio_io::AsyncWriteExt;
@@ -331,7 +336,6 @@ pub struct RecvLoop<R> {
 }
 
 impl<R> RecvLoop<R> {
-    #[inline]
     async fn do_loop<H>(
         frame_rx: impl Stream<Item = io::Result<super::Recv>> + Unpin,
         mut resets: mpsc::AsyncSender<Seq<proto::msg::Status>>,
@@ -353,8 +357,7 @@ impl<R> RecvLoop<R> {
             CompletedBulk(Seq<Bulk>),
         }
 
-        let _guard = Span::current().entered();
-
+        let _enter = Span::current();
         let mut reset_inprogress = FuturesUnordered::new();
         let mut ctrl_inprogress = FuturesUnordered::new();
         let mut int_inprogress = FuturesUnordered::new();
@@ -394,10 +397,10 @@ impl<R> RecvLoop<R> {
 
             let events = (
                 frame_next,
-                blocking_next,
-                ctrl_next,
-                int_next,
                 iso_next,
+                int_next,
+                ctrl_next,
+                blocking_next,
                 bulk_next,
             );
             let event = events.race().await.ok_or(None)??;
@@ -433,7 +436,9 @@ impl<R> RecvLoop<R> {
                         UrbType::Ctrl => {
                             match CtrlKind::parse(urb_frame.get().header.ctrl_packet) {
                                 CtrlKind::Blocking(CtrlReq::SetInterface(req)) => {
-                                    let fut = handler.set_interface(Seq { seqnum, data: req });
+                                    let fut = handler
+                                        .set_interface(Seq { seqnum, data: req })
+                                        .in_current_span();
                                     let hehe = (
                                         blocker(None),
                                         blocker(Some(fut)),
@@ -444,7 +449,9 @@ impl<R> RecvLoop<R> {
                                     ctrl_inprogress.push(blocker(Some(hehe)));
                                 }
                                 CtrlKind::Blocking(CtrlReq::SetConfig(req)) => {
-                                    let fut = handler.set_config(Seq { seqnum, data: req });
+                                    let fut = handler
+                                        .set_config(Seq { seqnum, data: req })
+                                        .in_current_span();
                                     let hehe = (
                                         blocker(None),
                                         blocker(None),
@@ -455,7 +462,9 @@ impl<R> RecvLoop<R> {
                                     ctrl_inprogress.push(blocker(Some(hehe)));
                                 }
                                 CtrlKind::Blocking(CtrlReq::ClearStall(req)) => {
-                                    let fut = handler.clear_stall(Seq { seqnum, data: req });
+                                    let fut = handler
+                                        .clear_stall(Seq { seqnum, data: req })
+                                        .in_current_span();
                                     let hehe = (
                                         blocker(None),
                                         blocker(None),
@@ -539,7 +548,10 @@ impl<R> RecvLoop<R> {
                 frame_rx,
                 cancel.cancelled_owned()
             ));
-            match Self::do_loop(frame_rx, reset, ctrls, ints, isos, bulks, handler).await {
+            match Self::do_loop(frame_rx, reset, ctrls, ints, isos, bulks, handler)
+                .in_current_span()
+                .await
+            {
                 Ok(_) | Err(None) => Ok(()),
                 Err(Some(err)) => Err(err),
             }

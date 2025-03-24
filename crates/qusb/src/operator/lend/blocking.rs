@@ -1,29 +1,23 @@
 use std::{
     future::Future,
     pin::pin,
-    sync::{Arc, Mutex},
-    task::{ready, Poll},
+    sync::Arc,
+    task::{Poll, ready},
 };
 
-use nohash_hasher::IntSet;
-use tracing::{debug, trace, warn};
+use tracing::{Span, debug, error, warn};
 
-use crate::operator::{is_config_active, Seq};
+use crate::operator::Seq;
 
 pub trait BlockingOps {
     fn set_alt_setting_async(&self, seqnum: u32, interface: u8, setting: u8) -> SetInterface;
-    fn set_config_async(
-        &self,
-        seqnum: u32,
-        config: u8,
-        interfaces: Arc<Mutex<IntSet<u8>>>,
-    ) -> SetConfig;
+    fn set_config_async(&self, seqnum: u32, config: u8) -> SetConfig;
     fn clear_stall_async(&self, seqnum: u32, endpoint: u8) -> ClearStall;
 }
 
 enum State {
     Init {
-        handle: Option<Arc<rusb::DeviceHandle<rusb::Context>>>,
+        handle: Option<Arc<super::device::Handle>>,
     },
     Waiting {
         join: compio_runtime::JoinHandle<rusb::Result<()>>,
@@ -31,7 +25,7 @@ enum State {
     Complete(vhci::Status),
 }
 
-impl BlockingOps for Arc<rusb::DeviceHandle<rusb::Context>> {
+impl BlockingOps for Arc<super::device::Handle> {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     fn set_alt_setting_async(&self, seqnum: u32, interface: u8, setting: u8) -> SetInterface {
         SetInterface {
@@ -45,29 +39,13 @@ impl BlockingOps for Arc<rusb::DeviceHandle<rusb::Context>> {
     }
 
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    fn set_config_async(
-        &self,
-        seqnum: u32,
-        config: u8,
-        interfaces: Arc<Mutex<IntSet<u8>>>,
-    ) -> SetConfig {
-        if is_config_active(self, config) {
-            trace!("({seqnum}) config {config} is already set");
-            SetConfig {
-                seqnum,
-                config,
-                interfaces: Some(interfaces),
-                state: State::Complete(vhci::Status::Success),
-            }
-        } else {
-            SetConfig {
-                seqnum,
-                config,
-                interfaces: Some(interfaces),
-                state: State::Init {
-                    handle: Some(Arc::clone(self)),
-                },
-            }
+    fn set_config_async(&self, seqnum: u32, config: u8) -> SetConfig {
+        SetConfig {
+            seqnum,
+            config,
+            state: State::Init {
+                handle: Some(Arc::clone(self)),
+            },
         }
     }
 
@@ -103,13 +81,23 @@ impl Future for SetInterface {
                     let device = handle.take().unwrap();
                     let interface = self.interface;
                     let setting = self.setting;
+                    let span = Span::current();
                     let join = compio_runtime::spawn_blocking(move || {
-                        device.set_alternate_setting(interface, setting)
+                        let _enter = span.entered();
+                        device
+                            .set_alt_setting(interface, setting)
+                            .inspect_err(|_| error!("{}", std::io::Error::last_os_error()))
                     });
                     State::Waiting { join }
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
-                    Ok(_) => State::Complete(vhci::Status::Success),
+                    Ok(_) => {
+                        debug!(
+                            "({}) set alternate setting {} for interface {}",
+                            self.seqnum, self.setting, self.interface
+                        );
+                        State::Complete(vhci::Status::Success)
+                    }
                     Err(rusb::Error::NotFound) => todo!(),
                     Err(rusb::Error::NoDevice) => todo!(),
                     Err(err) => {
@@ -119,7 +107,7 @@ impl Future for SetInterface {
                             self.seqnum,
                             self.setting,
                             self.interface,
-                        }
+                        };
                         State::Complete(vhci::Status::Stall)
                     }
                 },
@@ -127,7 +115,7 @@ impl Future for SetInterface {
                     break Poll::Ready(Seq {
                         seqnum: self.seqnum,
                         data: status,
-                    })
+                    });
                 }
             };
         }
@@ -138,7 +126,6 @@ impl Future for SetInterface {
 pub struct SetConfig {
     seqnum: u32,
     config: u8,
-    interfaces: Option<Arc<Mutex<IntSet<u8>>>>,
     state: State,
 }
 
@@ -154,22 +141,7 @@ impl Future for SetConfig {
                 State::Init { ref mut handle } => {
                     let handle = handle.take().unwrap();
                     let config = self.config;
-                    let interfaces = self.interfaces.take().unwrap();
-                    let join = compio_runtime::spawn_blocking(move || {
-                        handle.set_active_configuration(config)?;
-                        let mut claimed_interfaces = interfaces.lock().unwrap();
-                        for interface in 0..16 {
-                            if claimed_interfaces.insert(interface)
-                                && handle.claim_interface(interface).is_ok()
-                            {
-                                // Debug if needed
-                            }
-                        }
-                        if !is_config_active(&handle, config) {
-                            handle.set_active_configuration(config)?;
-                        }
-                        Ok(())
-                    });
+                    let join = compio_runtime::spawn_blocking(move || handle.set_config(config));
                     State::Waiting { join }
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
@@ -186,7 +158,7 @@ impl Future for SetConfig {
                     break Poll::Ready(Seq {
                         seqnum: self.seqnum,
                         data: status,
-                    })
+                    });
                 }
             }
         }
@@ -212,7 +184,9 @@ impl Future for ClearStall {
                 State::Init { ref mut handle } => {
                     let handle = handle.take().unwrap();
                     let endpoint = self.endpoint;
-                    let join = compio_runtime::spawn_blocking(move || handle.clear_halt(endpoint));
+                    let join = compio_runtime::spawn_blocking(move || {
+                        handle.as_device().clear_halt(endpoint)
+                    });
                     State::Waiting { join }
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
@@ -226,7 +200,7 @@ impl Future for ClearStall {
                     break Poll::Ready(Seq {
                         seqnum: self.seqnum,
                         data: status,
-                    })
+                    });
                 }
             }
         }

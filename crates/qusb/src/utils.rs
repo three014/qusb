@@ -66,7 +66,82 @@ pub mod oneshot {
     }
 }
 pub mod metrics {
-    use std::{collections::VecDeque, iter::Sum, ops::Div};
+    use std::{
+        cmp::Reverse,
+        collections::{BTreeMap, BTreeSet, VecDeque},
+        iter::Sum,
+        ops::Div,
+    };
+
+    pub struct Max<const N: usize, T, V> {
+        inner: BTreeMap<Reverse<T>, V>,
+    }
+
+    impl<const N: usize, T: Ord, V> Max<N, T, V> {
+        pub const fn new() -> Self {
+            Self {
+                inner: BTreeMap::new(),
+            }
+        }
+
+        pub fn push(&mut self, item: impl Into<T>, data: V) {
+            self.inner.insert(Reverse(item.into()), data);
+            if self.inner.len() > N {
+                self.inner.pop_last();
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+    }
+
+    impl<const N: usize, T: Ord + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
+        for Max<N, T, V>
+    {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_list()
+                .entries(self.inner.iter().map(|(Reverse(item), data)| (item, data)))
+                .finish()
+        }
+    }
+
+    pub struct Min<const N: usize, T> {
+        inner: BTreeSet<T>,
+    }
+
+    impl<const N: usize, T: Ord> Min<N, T> {
+        pub const fn new() -> Self {
+            Self {
+                inner: BTreeSet::new(),
+            }
+        }
+
+        pub fn push(&mut self, item: impl Into<T>) {
+            self.inner.insert(item.into());
+            if self.inner.len() > N {
+                self.inner.pop_last();
+            }
+        }
+
+        pub fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.inner.is_empty()
+        }
+    }
+
+    impl<const N: usize, T: Ord + std::fmt::Debug> std::fmt::Debug for Min<N, T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_list().entries(self.inner.iter()).finish()
+        }
+    }
 
     pub struct RollingAvg<const N: usize, T> {
         inner: VecDeque<T>,
@@ -102,6 +177,14 @@ pub mod metrics {
             let len = self.inner.len();
             let sum: T = self.inner.iter().sum();
             Some(sum / len)
+        }
+
+        pub fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.inner.is_empty()
         }
     }
 
@@ -168,7 +251,6 @@ where
     if let Some(f) = f {
         f.await
     } else {
-
         #[inline(never)]
         #[cold]
         async fn pending<T>() -> T {

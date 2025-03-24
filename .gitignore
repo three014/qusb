@@ -9,3 +9,4 @@ sandbox/
 *.pem
 RUN_TEST
 *dhat*
+cachegrind*

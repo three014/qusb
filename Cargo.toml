@@ -10,7 +10,7 @@ incremental = true
 
 [profile.release2]
 inherits = "release"
-opt-level = "z"
+opt-level = 3
 debug = false
 strip = true
 lto = true

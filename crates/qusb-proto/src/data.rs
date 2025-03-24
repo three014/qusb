@@ -118,14 +118,24 @@ where
     /// so that the first `Data` contains the header, and the second `Data`
     /// contains the remainder of the data interpreted as type `U`.
     #[inline]
-    pub fn split<U>(mut self) -> (T::Header, Option<Data<U>>)
+    pub fn split<U>(self) -> (T::Header, Option<Data<U>>)
     where
         T: GetSliceLen,
         U: TryFromBytes + Immutable + KnownLayout + ?Sized + IntoBytes,
     {
         let header = self.get().header();
+        let data = self.split_data();
+        (header, data)
+    }
+
+    #[inline]
+    pub fn split_data<U>(mut self) -> Option<Data<U>>
+    where
+        T: GetSliceLen,
+        U: ?Sized + TryFromBytes + IntoBytes + KnownLayout + Immutable,
+    {
         self.buf.advance(size_of::<T::Header>());
-        (header, Data::new(self.buf).ok())
+        Data::new(self.buf).ok()
     }
 
     /// Consumes the `Data` and returns the underlying
@@ -234,7 +244,6 @@ unsafe impl BufMut for BufWrapper {
     where
         Self: Sized,
     {
-
         while src.has_remaining() {
             let s = src.chunk();
             let l = s.len();

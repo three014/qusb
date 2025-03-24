@@ -280,7 +280,7 @@ impl Session {
                 // TODO: Use global context instead
                 let device = match operator::open_device(dev_id) {
                     Ok(handle) => {
-                        let data_rate = match handle.device().speed() {
+                        let data_rate = match handle.as_device().device().speed() {
                             rusb::Speed::Unknown | rusb::Speed::Low => msg::DataRate::Low,
                             rusb::Speed::Full => msg::DataRate::Full,
                             rusb::Speed::High | rusb::Speed::Super | rusb::Speed::SuperPlus => {
@@ -460,7 +460,7 @@ impl Session {
         // TODO: Use global context instead
         let device = match operator::open_device(id) {
             Ok(handle) => {
-                let data_rate = match handle.device().speed() {
+                let data_rate = match handle.as_device().device().speed() {
                     rusb::Speed::Unknown | rusb::Speed::Low => msg::DataRate::Low,
                     rusb::Speed::Full => msg::DataRate::Full,
                     rusb::Speed::High | rusb::Speed::Super | rusb::Speed::SuperPlus => {
@@ -846,4 +846,17 @@ pub async fn peer(
         },
         Server { endpoint, dev },
     )
+}
+
+pub async fn server(
+    tls: rustls::ServerConfig,
+    bind: SocketAddr,
+    num_ports: BoundedU8<1, 32>,
+) -> io::Result<Server> {
+    let endpoint = compio_quic::ServerBuilder::new_with_rustls_server_config(tls)
+        .bind(bind)
+        .await?;
+    let dev = stub::Controller::start(num_ports)?;
+
+    Ok(Server { endpoint, dev })
 }

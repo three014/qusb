@@ -9,12 +9,12 @@ use futures_concurrency::future::Race;
 use proto::msg;
 use qusb::BoundedU8;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
     let proactor = compio::driver::ProactorBuilder::new()
-        .sqpoll_idle(Duration::from_millis(2))
+        // .sqpoll_idle(Duration::from_millis(1))
         .clone();
     compio::runtime::RuntimeBuilder::new()
         .event_interval(29)
@@ -42,7 +42,10 @@ async fn async_main() {
                 .parse("none,borrow_self=info,qusb=trace")
                 .unwrap(),
         )
-        .with_writer(Mutex::new(BufWriter::with_capacity(128, log_file)))
+        .with_line_number(false)
+        .with_file(false)
+        .compact()
+        .with_writer(Mutex::new(BufWriter::with_capacity(64, log_file)))
         .try_init();
 
     let _guard = tracing::info_span!("main");
@@ -58,7 +61,7 @@ async fn async_main() {
 
         let dev = msg::UsbDeviceId {
             bus_number: 1,
-            device_addr: 5,
+            device_addr: 10,
         };
         let usb = session.req_borrow(dev).await.unwrap();
         let cancel_token = CancellationToken::new();
@@ -81,7 +84,7 @@ async fn async_main() {
         let completion = {
             let handle = &mut handle;
             async {
-                handle.await.unwrap().unwrap();
+                _ = handle.await.unwrap().inspect_err(|err| error! { %err });
                 Event::Completed
             }
         };
@@ -90,7 +93,7 @@ async fn async_main() {
             Event::Cancelled => {
                 tracing::info!("borrow cancelled, waiting for session to complete");
                 cancel_token.cancel();
-                handle.await.unwrap().unwrap();
+                _ = handle.await.unwrap().inspect_err(|err| error! { %err });
             }
             Event::Completed => {}
         }
