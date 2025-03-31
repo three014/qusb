@@ -686,6 +686,8 @@ impl ReqHandler {
             conn.rtt()
         );
         let session = Session::new(conn.clone(), self.vhci);
+        // BUG: This code only lets a session service one request at a
+        // time, instead of being able to service multiple requests.
         while conn.close_reason().is_none() && !self.cancel_token.is_cancelled() {
             match session.accept_stream().await? {
                 ServerResp::ListDevices(operator) => {
@@ -718,14 +720,13 @@ impl Server {
         let cancel_for_handle = CancellationToken::new();
         let cancel_for_serve = cancel_for_handle.clone();
         let fut = async move {
-            let (task_tx, task_rx) = mpsc::channel(0);
+            let (task_tx, task_rx) = mpsc::channel(1);
             let mut task_rx = task_rx.into_stream();
             let task_tx = task_tx.into_sink();
             info!("Server ready to accept new connections");
 
             enum Event {
                 Incoming(compio_quic::Incoming),
-                Cancelled,
                 Task(ServerTaskResult),
             }
 
@@ -733,13 +734,10 @@ impl Server {
                 let incoming = endpoint.wait_incoming().await?;
                 Some((Event::Incoming(incoming), endpoint))
             });
-            let cancel = stream::once_future(async {
-                cancel_for_serve.cancelled().await;
-                Event::Cancelled
-            });
+            let incoming = stream::stop_after_future(incoming, cancel_for_serve.cancelled());
             let task = (&mut task_rx).map(Event::Task);
 
-            let mut events = pin!((incoming, cancel, task).merge());
+            let mut events = pin!((incoming, task).merge());
             while let Some(event) = events.next().await {
                 match event {
                     Event::Incoming(incoming) => {
@@ -762,7 +760,6 @@ impl Server {
                     Event::Task((id, Err(err))) => {
                         warn! { %err, "session {id} failed" };
                     }
-                    Event::Cancelled => break,
                 }
             }
 

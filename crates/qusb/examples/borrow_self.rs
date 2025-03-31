@@ -12,6 +12,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+const DEV: msg::UsbDeviceId = msg::UsbDeviceId {
+    bus_number: 1,
+    device_addr: 11,
+};
+
 fn main() {
     let proactor = compio::driver::ProactorBuilder::new()
         // .sqpoll_idle(Duration::from_millis(1))
@@ -28,7 +33,7 @@ async fn async_main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
-    let log_path = "borrow_self_dev.log";
+    let log_path = "borrow_self.log";
     let log_file = std::fs::File::options()
         .create(true)
         .read(true)
@@ -45,7 +50,7 @@ async fn async_main() {
         .with_line_number(false)
         .with_file(false)
         .compact()
-        .with_writer(Mutex::new(BufWriter::with_capacity(64, log_file)))
+        .with_writer(Mutex::new(BufWriter::with_capacity(196, log_file)))
         .try_init();
 
     let _guard = tracing::info_span!("main");
@@ -59,11 +64,7 @@ async fn async_main() {
         let session = client.connect(addr, "localhost").await.unwrap();
         info!("connected to {}", session.remote_address());
 
-        let dev = msg::UsbDeviceId {
-            bus_number: 1,
-            device_addr: 10,
-        };
-        let usb = session.req_borrow(dev).await.unwrap();
+        let usb = session.req_borrow(DEV).await.unwrap();
         let cancel_token = CancellationToken::new();
         let timer = compio::runtime::time::sleep(Duration::from_secs(60));
         let mut handle = compio::runtime::spawn(usb.borrow(cancel_token.clone()));

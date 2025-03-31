@@ -92,10 +92,10 @@ impl Future for SetInterface {
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
                     Ok(_) => {
-                        debug!(
-                            "({}) set alternate setting {} for interface {}",
-                            self.seqnum, self.setting, self.interface
-                        );
+                        // debug!(
+                        //     "({}) set alternate setting {} for interface {}",
+                        //     self.seqnum, self.setting, self.interface
+                        // );
                         State::Complete(vhci::Status::Success)
                     }
                     Err(rusb::Error::NotFound) => todo!(),
@@ -146,7 +146,7 @@ impl Future for SetConfig {
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
                     Ok(_) => {
-                        debug!("({}) set config {}", self.seqnum, self.config);
+                        // debug!("({}) set config {}", self.seqnum, self.config);
                         State::Complete(vhci::Status::Success)
                     }
                     Err(err) => {

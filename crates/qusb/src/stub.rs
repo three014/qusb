@@ -1,10 +1,10 @@
-use futures_util::sink::SinkExt;
 use futures_concurrency::stream::Merge;
 use futures_lite::StreamExt;
+use futures_util::sink::SinkExt;
 use std::{
     collections::VecDeque,
     io,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use tracing::{error, info, trace, warn};
@@ -15,7 +15,9 @@ use vhci::{
     utils::{BoundedI16, BoundedU8, TimeoutMillis},
 };
 
-use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, mpsc, oneshot};
+use crate::utils::{
+    mpsc, new_blocking_task, oneshot, spawn_blocking, task, Ctrl, LinkResult, NoHash, OnceFlag, ThreeKeyMap
+};
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -88,7 +90,7 @@ impl Demuxer {
 
         let mut register_queue: VecDeque<Port> = VecDeque::new();
         let mut mailer = Mailer::with_capacities(8, 8, 10, 1024);
-        let (work_tx, work_rx) = mpsc::channel(32);
+        let (work_tx, work_rx) = mpsc::channel(0);
         let work_rx: mpsc::AsyncReceiver<vhci::ioctl::IocWork> = work_rx.into_stream();
         let vhci_work_rx = vhci.work_receiver().unwrap();
         let vhci = Arc::new(Mutex::new(vhci));
@@ -114,12 +116,11 @@ impl Demuxer {
                 }) => {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
-                    compio_runtime::spawn_blocking(move || {
+                    task::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_connect_any(data_rate);
                         let msg = ControllerResult::Register((result, tx));
                         _ = controller_tx.send(msg);
-                    })
-                    .detach();
+                    });
                 }
                 Event::Register(Ctrl {
                     data:
@@ -131,13 +132,12 @@ impl Demuxer {
                 }) => {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
-                    compio_runtime::spawn_blocking(move || {
+                    task::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_connect(port, data_rate);
                         let result = result.map(|_| port);
                         let msg = ControllerResult::Register((result, tx));
                         _ = controller_tx.send(msg);
-                    })
-                    .detach();
+                    });
                 }
                 Event::GivebackUrb(handle) => {
                     _ = mailer.remove_by_key3(&handle);
@@ -145,12 +145,11 @@ impl Demuxer {
                 Event::Disconnect(Ctrl { data: port, tx }) => {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
-                    compio_runtime::spawn_blocking(move || {
+                    task::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_disconnect(port);
                         let msg = ControllerResult::Disconnect((result, tx));
                         _ = controller_tx.send(msg);
-                    })
-                    .detach();
+                    });
                 }
                 Event::Work(ioc_work) => {
                     // SAFETY: Per the function's safety contract,
@@ -231,7 +230,7 @@ impl Demuxer {
                     }
                 }
                 Event::Controller(ControllerResult::Register((Ok(port), tx))) => {
-                    let (work_tx, work_rx) = mpsc::channel(32);
+                    let (work_tx, work_rx) = mpsc::channel(0);
                     assert!(
                         mailer.insert_by_key1(port, work_tx.into_sink()).is_none(),
                         "{port:?}"
@@ -269,7 +268,7 @@ impl Demuxer {
 
 #[derive(Debug, Clone)]
 pub struct Controller {
-    handle: Option<Arc<compio_runtime::JoinHandle<()>>>,
+    work_rx_handle: Option<Arc<compio_runtime::JoinHandle<()>>>,
     register_tx: mpsc::AsyncSender<Ctrl<Register, (Port, WorkReceiver)>>,
     giveback_tx: mpsc::AsyncSender<UrbHandle>,
     disconnect_tx: mpsc::AsyncSender<Ctrl<Port>>,
@@ -279,7 +278,7 @@ pub struct Controller {
 impl Controller {
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
         let (register_tx, register_rx) = mpsc::channel(0);
-        let (giveback_tx, giveback_rx) = mpsc::channel(512);
+        let (giveback_tx, giveback_rx) = mpsc::channel(0);
         let (disconnect_tx, disconnect_rx) = mpsc::channel(0);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
@@ -294,7 +293,7 @@ impl Controller {
         )));
 
         Ok(Self {
-            handle,
+            work_rx_handle: handle,
             register_tx: register_tx.into_sink(),
             giveback_tx: giveback_tx.into_sink(),
             disconnect_tx: disconnect_tx.into_sink(),
@@ -322,14 +321,14 @@ impl Controller {
         self.remote.fetch_data(urb)
     }
 
-    #[inline]
-    pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
-        &mut self,
-        urb: T,
-    ) -> io::Result<()> {
-        _ = self.giveback_tx.send(urb.handle()).await;
-        self.remote.giveback(urb)
-    }
+    // #[inline]
+    // pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
+    //     &mut self,
+    //     urb: T,
+    // ) -> io::Result<()> {
+    //     _ = self.giveback_tx.send(urb.handle()).await;
+    //     self.remote.giveback(urb)
+    // }
 
     #[inline]
     pub async fn disconnect(&mut self, port: Port) -> io::Result<()> {
@@ -355,7 +354,7 @@ impl Controller {
 
 impl Drop for Controller {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take().and_then(Arc::into_inner) {
+        if let Some(handle) = self.work_rx_handle.take().and_then(Arc::into_inner) {
             info!("about to wait for vhci controller handle");
             handle.detach();
         }
@@ -382,10 +381,14 @@ impl VhciRemote {
     where
         T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + Sync + 'static,
     {
-        _ = self.giveback_tx.send(urb.handle()).await;
+        let handle = urb.handle();
         let remote = self.remote.clone();
-        let op = compio_runtime::spawn_blocking(move || remote.giveback(urb));
-        op.await.unwrap()
+        let completed = spawn_blocking(move || {
+            _ = remote.giveback(urb);
+        });
+        _ = self.giveback_tx.send(handle).await;
+        completed.await;
+        Ok(())
     }
 
     #[inline(always)]

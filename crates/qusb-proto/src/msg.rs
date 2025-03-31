@@ -461,7 +461,6 @@ pub struct Header {
 #[repr(C)]
 pub struct UrbHeader {
     pub actual_transfer_len: u16,
-    // pub transfer_padded_len: u16,
     pub iso_packet_count: u16,
     pub endpoint: vhci::ioctl::Endpoint,
     pub kind: vhci::ioctl::UrbType,
@@ -470,7 +469,6 @@ pub struct UrbHeader {
     pub flags: u16,
     pub num_errors: u16,
     pub ctrl_packet: vhci::ioctl::IocSetupPacket,
-    // pub _padding: [u8; 5],
 }
 
 /*
@@ -504,13 +502,13 @@ pub enum UrbKind {
     Bulk,
 }
 
-const PKT_MASK: u8 = 0b01111111;
-const MAX_PKTS: u8 = 0b01111111;
-const KIND_MASK: u8 = 0b10000011;
+const PKT_MASK: u8 = 0b00111111;
+const MAX_PKTS: u8 = 0b00111111;
+const KIND_MASK: u8 = 0b11000000;
 const KIND_ISO: u8 = 0b00000000;
-const KIND_INT: u8 = 0b10000000;
-const KIND_CTRL: u8 = 0b10000001;
-const KIND_BULK: u8 = 0b10000010;
+const KIND_INT: u8 = 0b11000000;
+const KIND_CTRL: u8 = 0b01000000;
+const KIND_BULK: u8 = 0b10000000;
 
 /// The URB type and (optionally) the number of
 /// isochronous packet descriptors, now packed into one byte.
@@ -551,42 +549,40 @@ impl PackedKind {
 
     #[inline]
     pub const fn get(&self) -> UrbKind {
-        if self.inner & (1 << 7) == 0 {
-            UrbKind::Iso(self.inner & PKT_MASK)
-        } else {
-            match self.inner & KIND_MASK {
-                KIND_INT => UrbKind::Int,
-                KIND_CTRL => UrbKind::Ctrl,
-                KIND_BULK => UrbKind::Bulk,
-                _ => unreachable!()
-            }
+        let kind = self.inner & KIND_MASK;
+        let pkts = self.num_pkts();
+        match kind {
+            KIND_ISO => UrbKind::Iso(pkts),
+            KIND_INT => UrbKind::Int,
+            KIND_CTRL => UrbKind::Ctrl,
+            KIND_BULK => UrbKind::Bulk,
+            _ => unreachable!(),
         }
     }
 
     #[inline]
     pub const fn num_pkts(&self) -> u8 {
-        if self.inner & (1 << 7) != 0 {
-            0
-        } else {
-            self.inner & PKT_MASK
-        }
+        self.inner & PKT_MASK
     }
 }
 
 impl UrbHeader {
+    #[inline]
     pub const fn padded_transfer_len(&self) -> usize {
-        let actual_transfer_len = self.actual_transfer_len as usize;
-        actual_transfer_len.next_multiple_of(size_of::<u64>())
+        crate::utils::align(self.actual_transfer_len as usize, size_of::<u64>())
     }
 
+    #[inline]
     pub const fn is_out(&self) -> bool {
         matches!(self.endpoint.direction(), vhci::usbfs::Dir::Out)
     }
 
+    #[inline]
     pub const fn is_pending(&self) -> bool {
         matches!(self.status, vhci::Status::Pending)
     }
 
+    #[inline]
     pub const fn iso_byte_len(&self) -> usize {
         let num_iso_pkts = self.iso_packet_count as usize;
         num_iso_pkts * size_of::<vhci::ioctl::IocIsoPacketData>()
@@ -594,6 +590,7 @@ impl UrbHeader {
 
     /// Returns `true` if this header is part of a reply frame,
     /// `false` otherwise.
+    #[inline]
     pub const fn is_reply(&self) -> bool {
         !self.is_pending()
     }
@@ -662,8 +659,10 @@ impl GetSliceLen for QusbFrame {
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const BASE_LEN: usize = size_of::<Header>();
 
-        let (frame_len, _) =
-            u16::read_from_prefix(buf).map_err(|_| GetSliceLenErr::BufferShort {
+        let frame_len = buf
+            .split_first_chunk::<{ size_of::<u16>() }>()
+            .map(|(arr, _)| u16::from_le_bytes(*arr))
+            .ok_or(GetSliceLenErr::BufferShort {
                 num_bytes_needed: BASE_LEN - buf.len(),
             })?;
 

@@ -28,9 +28,7 @@ impl GetSliceLenErr {
     ) -> Self {
         use zerocopy::ConvertError::*;
         match err {
-            Alignment(_) | Validity(_) => {
-                GetSliceLenErr::NoConfidence
-            }
+            Alignment(_) | Validity(_) => GetSliceLenErr::NoConfidence,
             Size(src) => GetSliceLenErr::BufferShort {
                 num_bytes_needed: needed_size - src.into_src().len(),
             },
@@ -78,6 +76,12 @@ where
     ///   the DST and its trailing slice.
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr>;
     fn header(&self) -> Self::Header;
+}
+
+mod utils {
+    pub const fn align(val: usize, alignment: usize) -> usize {
+        (val + (alignment - 1)) & !(alignment - 1)
+    }
 }
 
 #[cfg(test)]

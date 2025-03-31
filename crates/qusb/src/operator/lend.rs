@@ -14,7 +14,7 @@ use proto::{
 };
 use rusb_async::UsbMemMut;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span};
+use tracing::{trace, Instrument, Span};
 use vhci::{
     ioctl::{self, Endpoint, IocSetupPacket, UrbType},
     usbfs::Request,
@@ -24,7 +24,7 @@ use zerocopy::transmute;
 pub(super) mod blocking;
 pub mod device;
 
-const TICK: Duration = Duration::from_micros(47);
+const TICK: Duration = Duration::from_micros(469);
 
 pub enum CtrlReq {
     SetInterface(SetInterface),
@@ -434,7 +434,9 @@ impl<R> RecvLoop<R> {
                         // I'm willing to accept having slightly slower control requests
                         // in exchange for other places having more understandable code.
                         UrbType::Ctrl => {
-                            match CtrlKind::parse(urb_frame.get().header.ctrl_packet) {
+                            let ctrl_pkt = urb_frame.get().header.ctrl_packet;
+                            trace! { %ctrl_pkt };
+                            match CtrlKind::parse(ctrl_pkt) {
                                 CtrlKind::Blocking(CtrlReq::SetInterface(req)) => {
                                     let fut = handler
                                         .set_interface(Seq { seqnum, data: req })
@@ -570,8 +572,8 @@ impl<R> RecvLoop<R> {
 
 pub fn loops<W, R>(tx: W, rx: R, buf: Ring) -> (SendLoop<W>, RecvLoop<R>) {
     let (reset_tx, reset_rx) = mpsc::channel(0);
-    let (ctrl_tx, ctrl_rx) = mpsc::channel(1);
-    let (int_tx, int_rx) = mpsc::channel(1);
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(0);
+    let (int_tx, int_rx) = mpsc::channel(0);
     let (bulk_tx, bulk_rx) = mpsc::channel(8);
     let (iso_tx, iso_rx) = mpsc::channel(8);
     let send_loop = SendLoop {

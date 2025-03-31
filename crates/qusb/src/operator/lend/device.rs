@@ -99,7 +99,6 @@ impl Handle {
         Ok(())
     }
 
-    #[inline]
     pub fn claim_interface(&self, interface: u8) -> rusb::Result<()> {
         if self
             .interfaces

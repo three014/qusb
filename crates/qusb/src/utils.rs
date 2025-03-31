@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use atomic_waker::AtomicWaker;
 use core::fmt;
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
@@ -10,213 +11,156 @@ use std::{
     future::Future,
     hash::Hash,
     io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
     time::{Duration, Instant},
 };
 
-pub mod mpsc {
-    pub type AsyncSender<T> = flume::r#async::SendSink<'static, T>;
-    pub type AsyncReceiver<T> = flume::r#async::RecvStream<'static, T>;
-    pub type Sender<T> = flume::Sender<T>;
-    pub type Receiver<T> = flume::Receiver<T>;
+pub mod metrics;
+pub mod mpsc;
+pub mod oneshot;
+pub mod alloc {
+    use std::collections::VecDeque;
 
-    pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-        flume::bounded(capacity)
+    use bytes::BytesMut;
+
+    pub struct BytesAllocator {
+        queue: VecDeque<BytesMut>,
+    }
+
+    const BUF_LEN: usize = 16 << 12;
+
+    impl BytesAllocator {
+        pub fn with_capacity(capacity: usize) -> Self {
+            let mut queue = VecDeque::with_capacity(capacity);
+            queue.resize_with(capacity, || BytesMut::with_capacity(BUF_LEN));
+
+            Self { queue }
+        }
+
+        pub fn reserve(&mut self, num_bytes: usize) -> BytesMut {
+            assert!(
+                num_bytes <= BUF_LEN,
+                "requested more bytes than can be held in a single block: {num_bytes} bytes (max: {BUF_LEN} bytes)"
+            );
+            let queue = &mut self.queue;
+            for _ in 0..queue.len() {
+                let buffer = queue.front_mut().unwrap();
+                let additional = num_bytes.saturating_sub(buffer.len());
+                if buffer.try_reclaim(additional) {
+                    // SAFETY: We won't go over the capacity due to the
+                    //         assertion at the beginning of the function
+                    unsafe { buffer.set_len(num_bytes) };
+                    let mem = buffer.split_to(num_bytes);
+
+                    return mem;
+                } else {
+                    // By rotating the current handle to the end,
+                    // we reduce the chances of a transfer not being
+                    // complete by the time we come back around. This
+                    // will allow us to reclaim the entire buffer later.
+                    queue.rotate_left(1);
+                }
+            }
+
+            // Not enough room in our previous buffers,
+            // so let's allocate a new one!
+            let mut buffer = BytesMut::with_capacity(BUF_LEN);
+
+            // SAFETY: We won't go over the capacity due to the
+            //         assertion at the beginning of the function
+            unsafe { buffer.set_len(num_bytes) };
+            let mem = buffer.split_to(num_bytes);
+            queue.push_front(buffer);
+            mem
+        }
     }
 }
-pub mod oneshot {
-    use std::{
-        future::Future,
-        pin::Pin,
-        task::{Context, Poll},
-    };
+pub mod task {
+    use std::sync::{LazyLock, RwLock};
+    use super::mpsc;
 
-    use futures_lite::FutureExt;
+    struct Task(Box<dyn FnOnce() + Send + 'static>);
 
-    pub struct Sender<T> {
-        inner: flume::Sender<T>,
+    unsafe impl Sync for Task {}
+
+    struct BlockingThread {
+        handle: std::thread::JoinHandle<()>,
+        task_tx: RwLock<mpsc::AsyncSender<Task>>,
     }
 
-    impl<T> Sender<T> {
-        #[inline]
-        pub fn send(self, item: T) -> Result<(), flume::SendError<T>> {
-            self.inner.send(item)
+    static THREAD: LazyLock<BlockingThread> = LazyLock::new(|| {
+        let (tx, rx) = mpsc::channel::<Task>(64);
+        BlockingThread {
+            handle: std::thread::spawn(move || {
+                while let Ok(Task(thunk)) = rx.recv() {
+                    thunk();
+                }
+            }),
+            task_tx: RwLock::new(tx.into_sink()),
         }
-    }
+    });
 
-    pub struct AsyncReceiver<T: 'static> {
-        inner: flume::r#async::RecvFut<'static, T>,
-    }
-
-    impl<T> Future for AsyncReceiver<T> {
-        type Output = Result<T, flume::RecvError>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            self.inner.poll(cx)
-        }
-    }
-
-    pub fn channel_async<T>() -> (Sender<T>, AsyncReceiver<T>) {
-        let (tx, rx) = flume::bounded(1);
-        (
-            Sender { inner: tx },
-            AsyncReceiver {
-                inner: rx.into_recv_async(),
-            },
-        )
+    pub fn spawn_blocking(f: impl FnOnce() + Send + 'static) {
+        THREAD.task_tx.read().unwrap().sender().send(Task(Box::new(f))).unwrap();
     }
 }
-pub mod metrics {
-    use std::{
-        cmp::Reverse,
-        collections::{BTreeMap, BTreeSet, VecDeque},
-        iter::Sum,
-        ops::Div,
+
+#[derive(Clone)]
+pub struct OnceFlag {
+    inner: Arc<(AtomicWaker, AtomicBool)>,
+}
+
+impl OnceFlag {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new((AtomicWaker::new(), AtomicBool::new(false))),
+        }
+    }
+
+    pub fn signal(&self) {
+        self.inner.1.store(true, Ordering::Relaxed);
+        self.inner.0.wake();
+    }
+}
+
+impl Future for OnceFlag {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        if self.inner.1.load(Ordering::Relaxed) {
+            return Poll::Ready(());
+        }
+
+        self.inner.0.register(cx.waker());
+
+        if self.inner.1.load(Ordering::Relaxed) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+pub fn new_blocking_task(
+    f: impl FnOnce() + Send + 'static,
+) -> (OnceFlag, impl FnOnce() + Send + 'static) {
+    let ours = OnceFlag::new();
+    let theirs = ours.clone();
+    let task = move || {
+        f();
+        theirs.signal();
     };
+    (ours, task)
+}
 
-    pub struct Max<const N: usize, T, V> {
-        inner: BTreeMap<Reverse<T>, V>,
-    }
-
-    impl<const N: usize, T: Ord, V> Max<N, T, V> {
-        pub const fn new() -> Self {
-            Self {
-                inner: BTreeMap::new(),
-            }
-        }
-
-        pub fn push(&mut self, item: impl Into<T>, data: V) {
-            self.inner.insert(Reverse(item.into()), data);
-            if self.inner.len() > N {
-                self.inner.pop_last();
-            }
-        }
-
-        pub fn len(&self) -> usize {
-            self.inner.len()
-        }
-
-        pub fn is_empty(&self) -> bool {
-            self.inner.is_empty()
-        }
-    }
-
-    impl<const N: usize, T: Ord + std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug
-        for Max<N, T, V>
-    {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_list()
-                .entries(self.inner.iter().map(|(Reverse(item), data)| (item, data)))
-                .finish()
-        }
-    }
-
-    pub struct Min<const N: usize, T> {
-        inner: BTreeSet<T>,
-    }
-
-    impl<const N: usize, T: Ord> Min<N, T> {
-        pub const fn new() -> Self {
-            Self {
-                inner: BTreeSet::new(),
-            }
-        }
-
-        pub fn push(&mut self, item: impl Into<T>) {
-            self.inner.insert(item.into());
-            if self.inner.len() > N {
-                self.inner.pop_last();
-            }
-        }
-
-        pub fn len(&self) -> usize {
-            self.inner.len()
-        }
-
-        pub fn is_empty(&self) -> bool {
-            self.inner.is_empty()
-        }
-    }
-
-    impl<const N: usize, T: Ord + std::fmt::Debug> std::fmt::Debug for Min<N, T> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_list().entries(self.inner.iter()).finish()
-        }
-    }
-
-    pub struct RollingAvg<const N: usize, T> {
-        inner: VecDeque<T>,
-    }
-
-    impl<const N: usize, T> RollingAvg<N, T> {
-        pub const fn new() -> Self {
-            Self {
-                inner: VecDeque::new(),
-            }
-        }
-
-        pub fn preallocated() -> Self {
-            Self {
-                inner: VecDeque::with_capacity(N),
-            }
-        }
-
-        pub fn push(&mut self, item: impl Into<T>) {
-            if self.inner.len() >= N {
-                self.inner.pop_front();
-            }
-            self.inner.push_back(item.into());
-        }
-
-        pub fn mean<'a>(&'a self) -> Option<T>
-        where
-            T: Sum<&'a T> + Div<usize, Output = T>,
-        {
-            if self.inner.is_empty() {
-                return None;
-            }
-            let len = self.inner.len();
-            let sum: T = self.inner.iter().sum();
-            Some(sum / len)
-        }
-
-        pub fn len(&self) -> usize {
-            self.inner.len()
-        }
-
-        pub fn is_empty(&self) -> bool {
-            self.inner.is_empty()
-        }
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    #[repr(transparent)]
-    pub struct Duration(std::time::Duration);
-
-    impl<'a> Sum<&'a Duration> for Duration {
-        fn sum<I: Iterator<Item = &'a Duration>>(iter: I) -> Self {
-            Duration(iter.map(|dur| dur.0).sum())
-        }
-    }
-
-    impl Div<usize> for Duration {
-        type Output = Duration;
-
-        fn div(self, rhs: usize) -> Self::Output {
-            Duration(self.0.checked_div(rhs.try_into().unwrap()).unwrap())
-        }
-    }
-
-    impl From<std::time::Duration> for Duration {
-        fn from(value: std::time::Duration) -> Self {
-            Duration(value)
-        }
-    }
-
-    impl From<Duration> for std::time::Duration {
-        fn from(value: Duration) -> Self {
-            value.0
-        }
-    }
+pub fn spawn_blocking(f: impl FnOnce() + Send + 'static) -> OnceFlag {
+    let (flag, task) = new_blocking_task(f);
+    task::spawn_blocking(task);
+    flag
 }
 
 pub struct Interval {

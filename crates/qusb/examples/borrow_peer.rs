@@ -13,6 +13,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+const DEV: msg::UsbDeviceId = msg::UsbDeviceId {
+    bus_number: 3,
+    device_addr: 2,
+};
+
 #[compio::main]
 async fn main() {
     rustls::crypto::ring::default_provider()
@@ -32,7 +37,7 @@ async fn main() {
                 .parse("none,borrow_self=info,qusb=trace")
                 .unwrap(),
         )
-        .with_writer(Mutex::new(BufWriter::with_capacity(128, log_file)))
+        .with_writer(Mutex::new(BufWriter::with_capacity(64, log_file)))
         .try_init();
 
     let _guard = tracing::info_span!("main");
@@ -50,13 +55,9 @@ async fn main() {
     let session = client.connect(addr, "quesadilla.garden.lan").await.unwrap();
     info!("connected to {}", session.remote_address());
 
-    let dev = msg::UsbDeviceId {
-        bus_number: 3,
-        device_addr: 7,
-    };
-    let usb = session.req_borrow(dev).await.unwrap();
+    let usb = session.req_borrow(DEV).await.unwrap();
     let cancel_token = CancellationToken::new();
-    let timer = compio::runtime::time::sleep(Duration::from_secs(60));
+    let timer = compio::runtime::time::sleep(Duration::from_secs(30));
     let mut handle = compio::runtime::spawn(usb.borrow(cancel_token.clone()));
 
     enum Event {

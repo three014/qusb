@@ -16,7 +16,7 @@ bytes = "1.9.0"
 zerocopy = { version = "0.8.13", default-features = false }
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4", default-features = false }
 fxhash = "0.2.1"
-rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.3.10", features = ["runtime-compio"] }
+rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.4.1", features = ["runtime-compio"] }
 flume = { version = "0.11.1", default-features = false, features = ["async"] }
 # compio = { version = "0.14.0", default-features = false, features = ["runtime", "io-uring", "quic", "rustls", "ring", "io"] }
 futures-lite = { version = "2.6.0", default-features = false }
@@ -28,6 +28,7 @@ compio-runtime = { version = "0.7.0", features = ["io-uring", "event", "time"] }
 compio-quic = { version = "0.3.0", features = ["io-uring"] }
 compio-driver = { version = "0.7.0", features = ["io-uring-sqe128", "io-uring-cqe32", "io-uring-socket", "io-uring-buf-ring"] }
 compio-io = { version = "0.6.0", default-features = false }
+atomic-waker = "1.1.2"
 
 [dev-dependencies]
 tracing-test = "0.2.5"

@@ -21,7 +21,7 @@ use crate::{
     utils::{CloseStream, Interval, blocker},
 };
 
-const TICK: Duration = Duration::from_micros(43);
+const TICK: Duration = Duration::from_micros(87);
 
 pub trait SendHandler {
     fn port_stat(&mut self, stat: ioctl::IocPortStat);
@@ -297,22 +297,7 @@ impl<R> RecvLoop<R> {
                     #[inline(never)]
                     #[cold]
                     fn make_error(status: proto::msg::Status) -> Result<(), Option<io::Error>> {
-                        match status {
-                            proto::msg::Status::Success => unreachable!(),
-                            proto::msg::Status::Failed => todo!(),
-                            proto::msg::Status::DevBusy => todo!(),
-                            proto::msg::Status::DevErr => {
-                                Err(Some(io::Error::other("lender device in error state")))
-                            }
-                            proto::msg::Status::NoDev => Err(Some(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "device disconnected on lender side",
-                            ))),
-                            proto::msg::Status::Unexpected => todo!(),
-                            proto::msg::Status::VersionMismatch => todo!(),
-                            proto::msg::Status::Timeout => todo!(),
-                            proto::msg::Status::Proto => todo!(),
-                        }
+                        Err(Some(io::Error::other(status)))
                     }
 
                     return make_error(status);
