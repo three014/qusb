@@ -4,7 +4,10 @@ use futures_util::sink::SinkExt;
 use std::{
     collections::VecDeque,
     io,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use tracing::{error, info, trace, warn};
@@ -15,9 +18,7 @@ use vhci::{
     utils::{BoundedI16, BoundedU8, TimeoutMillis},
 };
 
-use crate::utils::{
-    mpsc, new_blocking_task, oneshot, spawn_blocking, task, Ctrl, LinkResult, NoHash, OnceFlag, ThreeKeyMap
-};
+use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, mpsc, oneshot, task};
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -89,7 +90,7 @@ impl Demuxer {
         } = self;
 
         let mut register_queue: VecDeque<Port> = VecDeque::new();
-        let mut mailer = Mailer::with_capacities(8, 8, 10, 1024);
+        let mut mailer = Mailer::with_capacities(8, 8, 10, 512);
         let (work_tx, work_rx) = mpsc::channel(0);
         let work_rx: mpsc::AsyncReceiver<vhci::ioctl::IocWork> = work_rx.into_stream();
         let vhci_work_rx = vhci.work_receiver().unwrap();
@@ -185,10 +186,10 @@ impl Demuxer {
 
                                     mailer.remove_by_key2(&NoHash(Address::new(0).unwrap()));
                                     mailer.link_key2_to_key1(NoHash(address), &port);
-                                    assert_eq!(
-                                        LinkResult::Success,
+                                    assert!(matches!(
                                         mailer.link_key3_to_key1(*handle, &port),
-                                    );
+                                        LinkResult::Success | LinkResult::NewKeyAlreadyExists,
+                                    ));
                                     mailer.get_by_key1(&port).cloned()
                                 }
                                 vhci::ioctl::UrbType::Ctrl
@@ -203,14 +204,12 @@ impl Demuxer {
                                 }
                                 _ => {
                                     let address = NoHash(urb.address);
-                                    match mailer.link_key3_to_key2(*handle, &address) {
-                                        LinkResult::Success | LinkResult::NewKeyAlreadyExists => {
-                                            mailer.get_by_key2(&address).cloned()
-                                        }
-                                        LinkResult::ExistingKeyDoesNotExist => panic!(
-                                            "key {address:?} does not exist, was trying to link {handle:?}"
-                                        ),
-                                    }
+                                    assert_ne!(
+                                        mailer.link_key3_to_key2(*handle, &address),
+                                        LinkResult::ExistingKeyDoesNotExist,
+                                        "key {address:?} does not exist, was trying to link {handle:?}"
+                                    );
+                                    mailer.get_by_key2(&address).cloned()
                                 }
                             },
                             vhci::ioctl::Work::CancelUrb(ref handle) => {
@@ -278,7 +277,7 @@ pub struct Controller {
 impl Controller {
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
         let (register_tx, register_rx) = mpsc::channel(0);
-        let (giveback_tx, giveback_rx) = mpsc::channel(0);
+        let (giveback_tx, giveback_rx) = mpsc::channel(32);
         let (disconnect_tx, disconnect_rx) = mpsc::channel(0);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
@@ -320,15 +319,6 @@ impl Controller {
     ) -> io::Result<()> {
         self.remote.fetch_data(urb)
     }
-
-    // #[inline]
-    // pub async fn giveback_urb<T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut>(
-    //     &mut self,
-    //     urb: T,
-    // ) -> io::Result<()> {
-    //     _ = self.giveback_tx.send(urb.handle()).await;
-    //     self.remote.giveback(urb)
-    // }
 
     #[inline]
     pub async fn disconnect(&mut self, port: Port) -> io::Result<()> {
@@ -377,18 +367,30 @@ impl VhciRemote {
     }
 
     #[inline]
-    pub async fn giveback_urb<T>(&mut self, urb: T) -> io::Result<()>
+    pub fn giveback_urb<T>(
+        &mut self,
+        urb: T,
+    ) -> impl Future<Output = io::Result<()>> + 'static + use<T>
     where
         T: vhci::Urb + vhci::IsoPacketGivebackMut + vhci::TransferMut + Send + Sync + 'static,
     {
         let handle = urb.handle();
         let remote = self.remote.clone();
-        let completed = spawn_blocking(move || {
+        task::spawn_blocking(move || {
             _ = remote.giveback(urb);
         });
-        _ = self.giveback_tx.send(handle).await;
-        completed.await;
-        Ok(())
+        let mut tx = self.giveback_tx.clone();
+
+        static NUM_FEEDS: AtomicUsize = AtomicUsize::new(0);
+        async move {
+            _ = tx.feed(handle).await;
+            if 12 < NUM_FEEDS.fetch_add(1, Ordering::Relaxed) {
+                NUM_FEEDS.store(0, Ordering::Relaxed);
+                _ = tx.flush().await;
+            }
+
+            Ok(())
+        }
     }
 
     #[inline(always)]

@@ -37,7 +37,7 @@ async fn main() {
                 .parse("none,borrow_self=info,qusb=trace")
                 .unwrap(),
         )
-        .with_writer(Mutex::new(BufWriter::with_capacity(64, log_file)))
+        .with_writer(Mutex::new(BufWriter::with_capacity(128, log_file)))
         .try_init();
 
     let _guard = tracing::info_span!("main");

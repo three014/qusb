@@ -30,7 +30,7 @@ impl<T> Future for AsyncReceiver<T> {
 }
 
 pub fn channel_async<T>() -> (Sender<T>, AsyncReceiver<T>) {
-    let (tx, rx) = flume::bounded(0);
+    let (tx, rx) = flume::bounded(1);
     (
         Sender { inner: tx },
         AsyncReceiver {

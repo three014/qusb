@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEV: msg::UsbDeviceId = msg::UsbDeviceId {
     bus_number: 1,
-    device_addr: 11,
+    device_addr: 17,
 };
 
 fn main() {

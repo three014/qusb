@@ -47,12 +47,16 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("unsupported qusb protocol version (their version: {0}, our version: {ver})", ver = proto::QUSB_VER)]
     VersionMismatch(msg::Version),
-    #[error("device with id {0:?} not found")]
+    #[error("{0:?} not found")]
     DevNotFound(msg::UsbDeviceId),
     #[error("request failed on the server side")]
     ReqFailed,
     #[error("unknown data from peer")]
     Unknown,
+    #[error("{0:?} in error state")]
+    DevErr(msg::UsbDeviceId),
+    #[error("{0:?} suddenly disconnected")]
+    DevDisconnect(msg::UsbDeviceId)
 }
 
 // impl From<quinn::StoppedError> for Error {
@@ -164,52 +168,6 @@ impl vhci::TransferMut for UrbWithIsoData<'_> {
 impl vhci::IsoPacketDataMut for UrbWithIsoData<'_> {
     fn iso_packet_data_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketData] {
         self.iso_data
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct _UrbWithIsoGiveback<'a> {
-    pub handle: vhci::ioctl::UrbHandle,
-    pub header: &'a msg::UrbHeader,
-    pub transfer: &'a mut [u8],
-    pub iso_giveback: &'a mut [vhci::ioctl::IocIsoPacketGiveback],
-}
-
-impl vhci::Urb for _UrbWithIsoGiveback<'_> {
-    fn kind(&self) -> vhci::ioctl::UrbType {
-        self.header.kind
-    }
-
-    fn handle(&self) -> vhci::ioctl::UrbHandle {
-        self.handle
-    }
-
-    fn status(&self) -> vhci::Status {
-        self.header.status
-    }
-
-    fn dir(&self) -> vhci::usbfs::Dir {
-        self.header.endpoint.direction()
-    }
-
-    fn bytes_transferred(&self) -> u16 {
-        self.header.actual_transfer_len
-    }
-}
-
-impl vhci::TransferMut for _UrbWithIsoGiveback<'_> {
-    fn transfer_mut(&mut self) -> &mut [u8] {
-        self.transfer
-    }
-}
-
-impl vhci::IsoPacketGivebackMut for _UrbWithIsoGiveback<'_> {
-    fn iso_packet_giveback_mut(&mut self) -> &mut [vhci::ioctl::IocIsoPacketGiveback] {
-        self.iso_giveback
-    }
-
-    fn error_count(&self) -> u16 {
-        self.header.num_errors
     }
 }
 

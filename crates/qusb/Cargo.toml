@@ -16,7 +16,7 @@ bytes = "1.9.0"
 zerocopy = { version = "0.8.13", default-features = false }
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4", default-features = false }
 fxhash = "0.2.1"
-rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.4.1", features = ["runtime-compio"] }
+rusb_async = { git = "https://github.com/three014/rusb-async.git", version = "0.5.1", features = ["runtime-compio"] }
 flume = { version = "0.11.1", default-features = false, features = ["async"] }
 # compio = { version = "0.14.0", default-features = false, features = ["runtime", "io-uring", "quic", "rustls", "ring", "io"] }
 futures-lite = { version = "2.6.0", default-features = false }

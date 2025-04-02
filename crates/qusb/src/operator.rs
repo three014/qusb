@@ -23,7 +23,10 @@ use proto::{
     msg::{self, Header, QusbFrame, UrbFrame, UrbHeader},
 };
 use rusb::UsbContext;
-use rusb_async::{IsoPacket, LibusbTransfer2, TransferFlags, TransferStatus};
+use rusb_async::{
+    CancellationToken as CancelTransferToken, IsoPacket, LibusbTransfer2, Transfer2, TransferFlags,
+    TransferStatus,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, trace, warn, warn_span};
 use vhci::{
@@ -34,9 +37,14 @@ use vhci::{
 use zerocopy::{FromBytes, IntoBytes, transmute};
 
 use crate::{
-    stub::{self, RegisterPort}, utils::{
-        align_to_usize, alloc::BytesAllocator, metrics::{self, Max, Min, RollingAvg}, oneshot, task, CloseStream, Counter, SimpleMap
-    }, Result, UrbWithIsoData
+    Result, UrbWithIsoData,
+    stub::{self, RegisterPort},
+    utils::{
+        CloseStream, Counter, SimpleMap, align_to_usize,
+        alloc::BytesAllocator,
+        metrics::{self, Max, Min, RollingAvg},
+        task,
+    },
 };
 
 mod borrow;
@@ -185,7 +193,6 @@ impl BorrowSendHandler {
         const BUF_LEN: usize = 16 << 14;
         Self {
             buf: BytesMut::with_capacity(BUF_LEN),
-            // scratch: vec![0u8; u16::MAX as usize],
             vhci,
             id,
             cur_seq: Counter::new(0),
@@ -265,13 +272,12 @@ impl borrow::SendHandler for BorrowSendHandler {
         self.addr = urb.setup_packet.value() as u8;
         debug!("({}) set local dev address to {:03}", self.id, self.addr);
         let mut remote = self.vhci.clone();
-        async move {
-            let urb = EmptyUrb {
-                handle,
-                ioctl_urb: urb,
-            };
-            remote.giveback_urb(urb).await
-        }
+        let urb = EmptyUrb {
+            handle,
+            ioctl_urb: urb,
+        };
+
+        remote.giveback_urb(urb)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -538,40 +544,39 @@ impl borrow::RecvHandler for BorrowRecvHandler {
             _ = seqnums.remove(&handle).unwrap();
             handle
         };
-        async move {
-            let (urb, data) = data.split::<[u8]>();
-            let mut data = data.unwrap().into_bytes_mut();
 
-            let actual_transfer_len = urb.actual_transfer_len as usize;
+        let (urb, data) = data.split::<[u8]>();
+        let mut data = data.unwrap().into_bytes_mut();
 
-            // We might not be expecting data if we sent some to the usb device
-            let giveback = OwnedUrbGiveback {
-                handle,
-                kind: urb.kind,
-                status: urb.status,
-                data: match urb.is_out() {
-                    true => GivebackData::Out(urb.actual_transfer_len),
-                    false => GivebackData::In({
-                        let mut data = data.split_to(urb.padded_transfer_len());
-                        data.truncate(actual_transfer_len);
-                        data
-                    }),
-                },
-                iso_packets: data,
-            };
+        let actual_transfer_len = urb.actual_transfer_len as usize;
 
-            vhci.giveback_urb(giveback).await?;
-            if vhci::Status::Success != urb.status {
-                let _enter = warn_span!("urb_reply").entered();
-                warn!(
-                    "({id}) {:?} {:?} transfer {seqnum} failed: {:?}",
-                    urb.kind,
-                    urb.endpoint.direction(),
-                    urb.status
-                );
-            }
-            Ok(())
+        // We might not be expecting data if we sent some to the usb device
+        let giveback = OwnedUrbGiveback {
+            handle,
+            kind: urb.kind,
+            status: urb.status,
+            data: match urb.is_out() {
+                true => GivebackData::Out(urb.actual_transfer_len),
+                false => GivebackData::In({
+                    let mut data = data.split_to(urb.padded_transfer_len());
+                    data.truncate(actual_transfer_len);
+                    data
+                }),
+            },
+            iso_packets: data,
+        };
+
+        if vhci::Status::Success != urb.status {
+            let _enter = warn_span!("urb_reply").entered();
+            warn!(
+                "({id}) {:?} {:?} transfer {seqnum} failed: {:?}",
+                urb.kind,
+                urb.endpoint.direction(),
+                urb.status
+            );
         }
+
+        vhci.giveback_urb(giveback)
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -751,7 +756,6 @@ fn convert_libusb_to_vhci(
     seqnum: u32,
     dev_id: msg::UsbDeviceId,
 ) -> vhci::Status {
-    let _guard = tracing::Span::current().entered();
     match status {
         Ok(status) => vhci_from_transfer_status(status),
         Err(rusb::Error::InvalidParam) => vhci::Status::Stall,
@@ -763,6 +767,11 @@ fn convert_libusb_to_vhci(
             unreachable!("will we ever mess with the transfer flags?")
         }
         Err(err) => {
+            let _guard = tracing::Span::current().entered();
+            // TODO: This doesn't really return the actual errno, as:
+            // 1. The processing usually happens on another thread, and
+            // 2. Even if the processing happened on the same thread, this
+            // function is not the next logical thing to run after.
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
             warn! { %err, %errno, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
             vhci::Status::from_errno_raw(-errno, UrbType::Iso == kind)
@@ -872,7 +881,8 @@ impl From<Vec<LibusbTransfer2>> for SmallTransfers {
 
 struct LendRecvHandler {
     dev_id: msg::UsbDeviceId,
-    cancel_tokens: Rc<RefCell<IntMap<u32, CancellationToken>>>,
+    active_transfers: Rc<RefCell<IntMap<u32, CancelTransferToken>>>,
+    cached_cancel_tokens: Rc<RefCell<Vec<CancelTransferToken>>>,
     device: Arc<lend::device::Handle>,
     scratch: BytesAllocator,
     isos: BigTransfers,
@@ -881,9 +891,13 @@ struct LendRecvHandler {
 
 impl LendRecvHandler {
     #[inline]
-    fn register_cancel_token(&mut self, seqnum: u32) -> CancellationToken {
-        let cancel = CancellationToken::new();
-        self.cancel_tokens
+    fn register_cancel_token(&mut self, seqnum: u32) -> CancelTransferToken {
+        let cancel = self
+            .cached_cancel_tokens
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(CancelTransferToken::new);
+        self.active_transfers
             .borrow_mut()
             .insert(seqnum, cancel.clone());
         cancel
@@ -892,7 +906,7 @@ impl LendRecvHandler {
 
 impl lend::RecvHandler for LendRecvHandler {
     fn cancel_urb(&mut self, seqnum: u32) {
-        if let Some(transfer) = self.cancel_tokens.borrow_mut().remove(&seqnum) {
+        if let Some(transfer) = self.active_transfers.borrow_mut().remove(&seqnum) {
             transfer.cancel();
         }
     }
@@ -996,7 +1010,7 @@ impl lend::RecvHandler for LendRecvHandler {
             data: urb_frame,
         }: Seq<Data<UrbFrame>>,
     ) -> impl Future<Output = Seq<Ctrl>> + 'static {
-        let cancel = self.register_cancel_token(seqnum);
+        let mut cancel = self.register_cancel_token(seqnum);
         let header = urb_frame.get().header();
         let actual_transfer_len = header.actual_transfer_len as usize;
         let ctrl_pkt = header.ctrl_packet;
@@ -1005,10 +1019,15 @@ impl lend::RecvHandler for LendRecvHandler {
             let mut buf = urb_frame.into_bytes_mut();
             const SKIP_HEADER: usize = size_of::<UrbHeader>() - size_of::<ioctl::IocSetupPacket>();
             buf.advance(SKIP_HEADER);
-            assert_eq!(align_to_usize(w_length + size_of::<ioctl::IocSetupPacket>()), buf.len());
+            assert_eq!(
+                align_to_usize(w_length + size_of::<ioctl::IocSetupPacket>()),
+                buf.len()
+            );
             buf
         } else {
-            let mut buf = self.scratch.reserve(size_of::<ioctl::IocSetupPacket>() + header.padded_transfer_len());
+            let mut buf = self
+                .scratch
+                .reserve(size_of::<ioctl::IocSetupPacket>() + header.padded_transfer_len());
             buf[..size_of::<ioctl::IocSetupPacket>()].copy_from_slice(ctrl_pkt.as_bytes());
             buf
         };
@@ -1027,22 +1046,24 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let mut cache = self.smalls.clone();
         let dev_id = self.dev_id;
-        let endpoint = match ctrl_pkt.req().dir() {
+        let dir = ctrl_pkt.req().dir();
+        let endpoint = match dir {
             Dir::Out => ioctl::Endpoint(0),
             Dir::In => ioctl::Endpoint(128),
         };
+
+        let transfer = Arc::new(transfer);
+        let ours = Arc::clone(&transfer);
+        task::spawn_blocking(move || {
+            _ = transfer.try_submit();
+        });
         async move {
-            let (tx, rx) = oneshot::channel_async();
-            task::spawn_blocking(move || {
-                _ = transfer.try_submit();
-                _ = tx.send(transfer);
-            });
-            let mut transfer = rx.await.unwrap();
-            let result = transfer.submit_and_wait(&cancel).await;
-            let status = convert_libusb_to_vhci(result, UrbType::Ctrl, seqnum, dev_id);
+            let result = ours.wait(&mut cancel).await;
+            let status = convert_libusb_to_vhci(Ok(result), UrbType::Ctrl, seqnum, dev_id);
 
             let mut buf = {
-                let (transfer, mut buf) = transfer.into_parts().unwrap();
+                let (transfer, mut buf) =
+                    Arc::into_inner(ours).and_then(Transfer2::complete).unwrap();
                 cache.insert(transfer);
                 buf.advance(size_of::<ioctl::IocSetupPacket>());
                 buf
@@ -1053,7 +1074,7 @@ impl lend::RecvHandler for LendRecvHandler {
                 buf[0] = 0x01;
             }
 
-            let res = ResultData::new(buf, ctrl_pkt.req().dir());
+            let res = ResultData::new(buf, dir);
             Seq {
                 seqnum,
                 data: Ctrl {
@@ -1072,7 +1093,7 @@ impl lend::RecvHandler for LendRecvHandler {
             data: urb_frame,
         }: Seq<Data<UrbFrame>>,
     ) -> impl Future<Output = Seq<Int>> + 'static {
-        let cancel = self.register_cancel_token(seqnum);
+        let mut cancel = self.register_cancel_token(seqnum);
         let (header, data) = urb_frame.split::<[u8]>();
         let mut buf = if header.is_out() {
             data.unwrap().into_bytes_mut()
@@ -1093,17 +1114,17 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let mut cache = self.smalls.clone();
         let dev_id = self.dev_id;
-        async move {
-            let (tx, rx) = oneshot::channel_async();
-            task::spawn_blocking(move || {
-                _ = transfer.try_submit();
-                _ = tx.send(transfer);
-            });
-            let mut transfer = rx.await.unwrap();
-            let result = transfer.submit_and_wait(&cancel).await;
-            let status = convert_libusb_to_vhci(result, UrbType::Int, seqnum, dev_id);
 
-            let (transfer, buf) = transfer.into_parts().unwrap();
+        let transfer = Arc::new(transfer);
+        let ours = Arc::clone(&transfer);
+        task::spawn_blocking(move || {
+            _ = transfer.try_submit();
+        });
+        async move {
+            let result = ours.wait(&mut cancel).await;
+            let status = convert_libusb_to_vhci(Ok(result), UrbType::Int, seqnum, dev_id);
+
+            let (transfer, buf) = Arc::into_inner(ours).and_then(Transfer2::complete).unwrap();
             cache.insert(transfer);
 
             let res = ResultData::new(buf, endpoint.direction());
@@ -1154,7 +1175,7 @@ impl lend::RecvHandler for LendRecvHandler {
             }
         }
 
-        let cancel = self.register_cancel_token(seqnum);
+        let mut cancel = self.register_cancel_token(seqnum);
 
         // BUG: By specifying the type as a `[u8]`,
         // the inner NonNull pointer inside becomes a fat
@@ -1198,22 +1219,22 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let mut cache = self.isos.clone();
         let dev_id = self.dev_id;
+
+        let transfer = Arc::new(transfer);
+        let ours = Arc::clone(&transfer);
+        task::spawn_blocking(move || {
+            _ = transfer.try_submit();
+        });
         async move {
-            let (tx, rx) = oneshot::channel_async();
-            task::spawn_blocking(move || {
-                _ = transfer.try_submit();
-                _ = tx.send(transfer);
-            });
-            let mut transfer = rx.await.unwrap();
-            let result = transfer.submit_and_wait(&cancel).await;
-            let status = convert_libusb_to_vhci(result, UrbType::Iso, seqnum, dev_id);
+            let result = ours.wait(&mut cancel).await;
+            let status = convert_libusb_to_vhci(Ok(result), UrbType::Iso, seqnum, dev_id);
 
             let our_pkts = <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
                 &mut raw_iso_buf[..],
                 num_iso_pkts,
             )
             .unwrap();
-            let their_pkts = transfer
+            let their_pkts = ours
                 .iso_packets()
                 .expect("why wouldn't a transfer be done by this point?");
 
@@ -1228,7 +1249,7 @@ impl lend::RecvHandler for LendRecvHandler {
                         num_errors + (our_pkt.status != 0) as u16
                     });
 
-            let (transfer, mut buf) = transfer.into_parts().unwrap();
+            let (transfer, mut buf) = Arc::into_inner(ours).and_then(Transfer2::complete).unwrap();
             cache.insert(transfer);
 
             // SAFETY: Isochronous transfer requires that the full
@@ -1258,7 +1279,7 @@ impl lend::RecvHandler for LendRecvHandler {
             data: urb_frame,
         }: Seq<Data<UrbFrame>>,
     ) -> impl Future<Output = Seq<Bulk>> + 'static {
-        let cancel = self.register_cancel_token(seqnum);
+        let mut cancel = self.register_cancel_token(seqnum);
         let (header, data) = urb_frame.split::<[u8]>();
         let mut buf = if header.is_out() {
             data.unwrap().into_bytes_mut()
@@ -1285,17 +1306,16 @@ impl lend::RecvHandler for LendRecvHandler {
 
         let mut cache = self.smalls.clone();
         let dev_id = self.dev_id;
+        let transfer = Arc::new(transfer);
+        let ours = Arc::clone(&transfer);
+        task::spawn_blocking(move || {
+            _ = transfer.try_submit();
+        });
         async move {
-            let (tx, rx) = oneshot::channel_async();
-            task::spawn_blocking(move || {
-                _ = transfer.try_submit();
-                _ = tx.send(transfer);
-            });
-            let mut transfer = rx.await.unwrap();
-            let result = transfer.submit_and_wait(&cancel).await;
-            let status = convert_libusb_to_vhci(result, UrbType::Bulk, seqnum, dev_id);
+            let result = ours.wait(&mut cancel).await;
+            let status = convert_libusb_to_vhci(Ok(result), UrbType::Bulk, seqnum, dev_id);
 
-            let (transfer, buf) = transfer.into_parts().unwrap();
+            let (transfer, buf) = Arc::into_inner(ours).and_then(Transfer2::complete).unwrap();
             cache.insert(transfer);
 
             let res = ResultData::new(buf, endpoint.direction());
@@ -1313,7 +1333,7 @@ impl lend::RecvHandler for LendRecvHandler {
 
 impl Drop for LendRecvHandler {
     fn drop(&mut self) {
-        self.cancel_tokens
+        self.active_transfers
             .take()
             .into_values()
             .for_each(|transfer| transfer.cancel());
@@ -1450,7 +1470,17 @@ impl<H: lend::RecvHandler> lend::RecvHandler for StatLendRecvHandler<H> {
 struct LendSendHandler {
     dev_id: msg::UsbDeviceId,
     buf: BytesMut,
-    cancel_tokens: Rc<RefCell<IntMap<u32, CancellationToken>>>,
+    active_transfers: Rc<RefCell<IntMap<u32, CancelTransferToken>>>,
+    cached_cancel_tokens: Rc<RefCell<Vec<CancelTransferToken>>>,
+}
+
+impl LendSendHandler {
+    fn deregister_token(&mut self, seqnum: u32) {
+        if let Some(token) = self.active_transfers.borrow_mut().remove(&seqnum) {
+            debug_assert!(!token.is_cancelled());
+            self.cached_cancel_tokens.borrow_mut().push(token);
+        }
+    }
 }
 
 impl lend::SendHandler for LendSendHandler {
@@ -1478,7 +1508,7 @@ impl lend::SendHandler for LendSendHandler {
                 },
         }: Seq<Iso>,
     ) -> std::result::Result<(), lend::Error> {
-        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        self.deregister_token(seqnum);
         let status = msg::Status::from(vhci_status);
         if msg::Status::Success != status {
             let err = lend::Error::Usb(lend::UsbError {
@@ -1547,7 +1577,7 @@ impl lend::SendHandler for LendSendHandler {
                 },
         }: Seq<Int>,
     ) -> std::result::Result<(), lend::Error> {
-        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        self.deregister_token(seqnum);
         let status = msg::Status::from(vhci_status);
         if msg::Status::Success != status {
             let err = lend::Error::Usb(lend::UsbError {
@@ -1614,7 +1644,7 @@ impl lend::SendHandler for LendSendHandler {
                 },
         }: Seq<Ctrl>,
     ) -> std::result::Result<(), lend::Error> {
-        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        self.deregister_token(seqnum);
         let status = msg::Status::from(vhci_status);
         if msg::Status::Success != status {
             let err = lend::Error::Usb(lend::UsbError {
@@ -1681,7 +1711,7 @@ impl lend::SendHandler for LendSendHandler {
                 },
         }: Seq<Bulk>,
     ) -> std::result::Result<(), lend::Error> {
-        self.cancel_tokens.borrow_mut().remove(&seqnum);
+        self.deregister_token(seqnum);
         let status = msg::Status::from(vhci_status);
         if msg::Status::Success != status {
             let err = lend::Error::Usb(lend::UsbError {
@@ -1912,17 +1942,19 @@ where
             trace!("({dev_id} complete)");
         });
 
-        let cancel_tokens = Rc::new(RefCell::new(IntMap::with_capacity_and_hasher(
-            512,
+        let active_transfers = Rc::new(RefCell::new(IntMap::with_capacity_and_hasher(
+            32,
             Default::default(),
         )));
+        let cached_cancel_tokens = Rc::new(RefCell::new(Vec::with_capacity(8)));
 
         const BUF_LEN: usize = u16::MAX as usize;
         let (recv_stats, num_active_transfers) = LendRecvStats::new();
         let recv_handler = LendRecvHandler {
             dev_id,
             device,
-            cancel_tokens: cancel_tokens.clone(),
+            active_transfers: active_transfers.clone(),
+            cached_cancel_tokens: cached_cancel_tokens.clone(),
             scratch: BytesAllocator::with_capacity(2),
             isos: BigTransfers::default(),
             smalls: vec![
@@ -1940,7 +1972,8 @@ where
         let send_handler = LendSendHandler {
             dev_id,
             buf: BytesMut::with_capacity(BUF_LEN),
-            cancel_tokens,
+            active_transfers,
+            cached_cancel_tokens,
         };
         let send_handler = StatLendSendHandler {
             inner: send_handler,
