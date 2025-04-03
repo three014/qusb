@@ -10,7 +10,7 @@ control, interrupt, bulk, and isochronous transfers.
 
 More info on the way... hehe...
 
-# ~~~Main~~~ Previous goal: Get this thing to work
+# ~~Main~~ Previous goal: Get this thing to work
 
 Right now the crate is incomplete. I am still designing the project and am hoping to have a working
 version of this crate by the end of January 2025.
