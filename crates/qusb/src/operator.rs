@@ -676,14 +676,14 @@ where
         let send_handler = BorrowSendHandler::new(vhci.remote(), id, map);
         let send = compio_runtime::spawn(
             send_loop
-                .run(send_handler, cancel_token.clone())
+                .run(Box::new(send_handler), cancel_token.clone())
                 .in_current_span(),
         );
         let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
         let recv_handler = BorrowRecvHandler::new(vhci.remote(), id, cloned_map);
         let recv = compio_runtime::spawn(
             recv_loop
-                .run(recv_handler, cancel_token.clone())
+                .run(Box::new(recv_handler), cancel_token.clone())
                 .in_current_span(),
         );
 
@@ -1983,11 +1983,11 @@ where
         let (send, recv) = lend::loops(tx, rx, buf_rx);
 
         let recv = compio_runtime::spawn(
-            recv.run(recv_handler, cancel_token.clone())
+            recv.run(Box::new(recv_handler), cancel_token.clone())
                 .in_current_span(),
         );
         let send = compio_runtime::spawn(
-            send.run(send_handler, cancel_token.clone())
+            send.run(Box::new(send_handler), cancel_token.clone())
                 .in_current_span(),
         );
         let (recv_result, send_result) = (recv, send).join().await;

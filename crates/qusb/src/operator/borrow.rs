@@ -1,4 +1,4 @@
-use std::{future::Future, io, pin::pin, time::Duration};
+use std::{future::Future, io, ops::DerefMut, pin::pin, time::Duration};
 
 use bytes::Bytes;
 use compio_io::{AsyncRead, AsyncWrite};
@@ -34,6 +34,40 @@ pub trait SendHandler {
     fn cancel_urb(&mut self, handle: ioctl::UrbHandle);
     fn is_buf_empty(&self) -> bool;
     fn flush_buf(&mut self) -> Bytes;
+}
+
+impl<T, U> SendHandler for T
+where
+    T: DerefMut<Target = U>,
+    U: SendHandler + 'static,
+{
+    fn port_stat(&mut self, stat: ioctl::IocPortStat) {
+        self.deref_mut().port_stat(stat);
+    }
+
+    fn set_address(
+        &mut self,
+        urb: ioctl::IocUrb,
+        handle: ioctl::UrbHandle,
+    ) -> impl Future<Output = io::Result<()>> + 'static {
+        self.deref_mut().set_address(urb, handle)
+    }
+
+    fn process_urb(&mut self, urb: ioctl::IocUrb, handle: ioctl::UrbHandle) -> io::Result<()> {
+        self.deref_mut().process_urb(urb, handle)
+    }
+
+    fn cancel_urb(&mut self, handle: ioctl::UrbHandle) {
+        self.deref_mut().cancel_urb(handle);
+    }
+
+    fn is_buf_empty(&self) -> bool {
+        self.deref().is_buf_empty()
+    }
+
+    fn flush_buf(&mut self) -> Bytes {
+        self.deref_mut().flush_buf()
+    }
 }
 
 trait SendHandlerExt {
@@ -206,9 +240,9 @@ impl<W> SendLoop<W> {
         W: AsyncWrite + CloseStream + Unpin + 'static,
     {
         let Self { mut tx, work_rx } = self;
-        let work_rx = pin!(futures_lite::stream::stop_after_future(
+        let work_rx = Box::pin(futures_lite::stream::stop_after_future(
             work_rx,
-            cancel.cancelled_owned()
+            cancel.cancelled_owned(),
         ));
         let result = match Self::do_loop(&mut tx, work_rx, handler)
             .in_current_span()
@@ -231,6 +265,24 @@ pub trait RecvHandler {
         seqnum: u32,
         data: Data<UrbFrame>,
     ) -> impl Future<Output = io::Result<()>> + 'static;
+}
+
+impl<T, U> RecvHandler for T
+where
+    T: DerefMut<Target = U>,
+    U: RecvHandler + 'static,
+{
+    fn device_reset(&mut self, seqnum: u32) -> io::Result<()> {
+        self.deref_mut().device_reset(seqnum)
+    }
+
+    fn urb_reply(
+        &mut self,
+        seqnum: u32,
+        data: Data<UrbFrame>,
+    ) -> impl Future<Output = io::Result<()>> + 'static {
+        self.deref_mut().urb_reply(seqnum, data)
+    }
 }
 
 pub struct RecvLoop<R> {

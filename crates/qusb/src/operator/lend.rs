@@ -1,4 +1,4 @@
-use std::{io, pin::pin, time::Duration};
+use std::{io, ops::DerefMut, pin::pin, time::Duration};
 
 use super::{Seq, compress_frame_len};
 use crate::utils::{CloseStream, Interval, blocker, mpsc};
@@ -14,7 +14,7 @@ use proto::{
 };
 use rusb_async::UsbMemMut;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, Instrument, Span};
+use tracing::{Instrument, Span, trace};
 use vhci::{
     ioctl::{self, Endpoint, IocSetupPacket, UrbType},
     usbfs::Request,
@@ -129,6 +129,40 @@ pub trait SendHandler {
     fn device_resetted(&mut self, reset: Seq<proto::msg::Status>) -> Result<(), Error>;
 }
 
+impl<T, U> SendHandler for T
+where
+    T: DerefMut<Target = U>,
+    U: SendHandler + 'static,
+{
+    fn is_buf_empty(&self) -> bool {
+        self.deref().is_buf_empty()
+    }
+
+    fn flush_buf(&mut self) -> Bytes {
+        self.deref_mut().flush_buf()
+    }
+
+    fn iso_completed(&mut self, iso: Seq<Iso>) -> Result<(), Error> {
+        self.deref_mut().iso_completed(iso)
+    }
+
+    fn int_completed(&mut self, int: Seq<Int>) -> Result<(), Error> {
+        self.deref_mut().int_completed(int)
+    }
+
+    fn ctrl_completed(&mut self, ctrl: Seq<Ctrl>) -> Result<(), Error> {
+        self.deref_mut().ctrl_completed(ctrl)
+    }
+
+    fn bulk_completed(&mut self, bulk: Seq<Bulk>) -> Result<(), Error> {
+        self.deref_mut().bulk_completed(bulk)
+    }
+
+    fn device_resetted(&mut self, reset: Seq<proto::msg::Status>) -> Result<(), Error> {
+        self.deref_mut().device_resetted(reset)
+    }
+}
+
 trait SendHandlerExt {
     fn handle_event(&mut self, event: LendEvent) -> Result<(), Error>;
 }
@@ -163,6 +197,60 @@ pub trait RecvHandler {
     fn new_iso(&mut self, frame: Seq<Data<UrbFrame>>) -> impl Future<Output = Seq<Iso>> + 'static;
     fn new_bulk(&mut self, frame: Seq<Data<UrbFrame>>)
     -> impl Future<Output = Seq<Bulk>> + 'static;
+}
+
+impl<T, U> RecvHandler for T
+where
+    T: DerefMut<Target = U>,
+    U: RecvHandler + 'static,
+{
+    fn cancel_urb(&mut self, seqnum: u32) {
+        self.deref_mut().cancel_urb(seqnum);
+    }
+
+    fn device_reset(
+        &mut self,
+        seqnum: u32,
+    ) -> impl Future<Output = Seq<proto::msg::Status>> + 'static {
+        self.deref_mut().device_reset(seqnum)
+    }
+
+    fn set_config(&mut self, data: Seq<SetConfig>) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        self.deref_mut().set_config(data)
+    }
+
+    fn set_interface(
+        &mut self,
+        data: Seq<SetInterface>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        self.deref_mut().set_interface(data)
+    }
+
+    fn clear_stall(&mut self, data: Seq<ClearStall>) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        self.deref_mut().clear_stall(data)
+    }
+
+    fn new_ctrl(
+        &mut self,
+        frame: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Ctrl>> + 'static {
+        self.deref_mut().new_ctrl(frame)
+    }
+
+    fn new_int(&mut self, frame: Seq<Data<UrbFrame>>) -> impl Future<Output = Seq<Int>> + 'static {
+        self.deref_mut().new_int(frame)
+    }
+
+    fn new_iso(&mut self, frame: Seq<Data<UrbFrame>>) -> impl Future<Output = Seq<Iso>> + 'static {
+        self.deref_mut().new_iso(frame)
+    }
+
+    fn new_bulk(
+        &mut self,
+        frame: Seq<Data<UrbFrame>>,
+    ) -> impl Future<Output = Seq<Bulk>> + 'static {
+        self.deref_mut().new_bulk(frame)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -302,22 +390,20 @@ impl<W> SendLoop<W> {
         let isos = isos.map(LendEvent::Iso);
         let bulks = bulks.map(LendEvent::Bulk);
         let event_rx = (isos, ints, ctrls, bulks, reset).merge();
-        let event_rx = pin!(stream::stop_after_future(event_rx, cancel.cancelled()));
+        let event_rx = Box::pin(stream::stop_after_future(event_rx, cancel.cancelled()));
 
-        let result = match Self::do_loop(&mut tx, event_rx, handler)
-            .in_current_span()
-            .await
-        {
-            Ok(_) | Err(None) => Ok(()),
-            Err(Some(Error::Usb(err))) => {
-                use compio_io::AsyncWriteExt;
-                let header = err.as_header();
-                _ = tx.write_u64_le(transmute!(header)).await;
-                cancel.cancel();
-                Err(err.into())
-            }
-            Err(Some(Error::Io(err))) => Err(err),
-        };
+        let result =
+            match Box::pin(Self::do_loop(&mut tx, event_rx, handler).in_current_span()).await {
+                Ok(_) | Err(None) => Ok(()),
+                Err(Some(Error::Usb(err))) => {
+                    use compio_io::AsyncWriteExt;
+                    let header = err.as_header();
+                    _ = tx.write_u64_le(transmute!(header)).await;
+                    cancel.cancel();
+                    Err(err.into())
+                }
+                Err(Some(Error::Io(err))) => Err(err),
+            };
 
         _ = tx.close();
         _ = tx.stopped().await;
@@ -546,13 +632,14 @@ impl<R> RecvLoop<R> {
                 let result = super::recv_frame(&mut rx, &mut buf).await.transpose()?;
                 Some((result, (rx, buf)))
             });
-            let frame_rx = pin!(stream::stop_after_future(
+            let frame_rx = Box::pin(stream::stop_after_future(
                 frame_rx,
-                cancel.cancelled_owned()
+                cancel.cancelled_owned(),
             ));
-            match Self::do_loop(frame_rx, reset, ctrls, ints, isos, bulks, handler)
-                .in_current_span()
-                .await
+            match Box::pin(
+                Self::do_loop(frame_rx, reset, ctrls, ints, isos, bulks, handler).in_current_span(),
+            )
+            .await
             {
                 Ok(_) | Err(None) => Ok(()),
                 Err(Some(err)) => Err(err),
