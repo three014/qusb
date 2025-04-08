@@ -1,0 +1,10 @@
+[package]
+name = "utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+compio-quic = { version = "0.3.0", default-features = false }
+compio-runtime = { version = "0.7.0", default-features = false, features = ["io-uring"] }
+tachyonix = "0.3.1"
+pin-project-lite = "0.2.16"

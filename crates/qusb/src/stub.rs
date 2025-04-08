@@ -1,13 +1,9 @@
 use futures_concurrency::stream::Merge;
-use futures_lite::StreamExt;
-use futures_util::sink::SinkExt;
+use futures_lite::{StreamExt, future::block_on};
 use std::{
     collections::VecDeque,
     io,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use tracing::{error, info, trace, warn};
@@ -18,7 +14,8 @@ use vhci::{
     utils::{BoundedI16, BoundedU8, TimeoutMillis},
 };
 
-use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, mpsc, oneshot, task};
+use crate::utils::{Ctrl, LinkResult, NoHash, ThreeKeyMap, oneshot, task};
+use utils::mpsc;
 
 pub type RegisterPayload = (Port, WorkReceiver);
 
@@ -91,17 +88,16 @@ impl Demuxer {
 
         let mut register_queue: VecDeque<Port> = VecDeque::new();
         let mut mailer = Mailer::with_capacities(8, 8, 10, 512);
-        let (work_tx, work_rx) = mpsc::channel(0);
-        let work_rx: mpsc::AsyncReceiver<vhci::ioctl::IocWork> = work_rx.into_stream();
+        let (work_tx, work_rx) = mpsc::channel(1);
         let vhci_work_rx = vhci.work_receiver().unwrap();
         let vhci = Arc::new(Mutex::new(vhci));
-        let (controller_tx, controller_rx) = mpsc::channel::<ControllerResult>(0);
+        let (controller_tx, controller_rx) = mpsc::channel::<ControllerResult>(1);
 
         let reg = register_rx.map(Event::Register);
         let giveback = giveback_rx.map(Event::GivebackUrb);
         let disconnect = disconnect_rx.map(Event::Disconnect);
         let work = work_rx.map(Event::Work);
-        let controller = controller_rx.into_stream().map(Event::Controller);
+        let controller = controller_rx.map(Event::Controller);
 
         let mut events = (reg, giveback, disconnect, work, controller).merge();
         let handle = compio_runtime::spawn_blocking(move || recv_work(vhci_work_rx, work_tx));
@@ -120,7 +116,7 @@ impl Demuxer {
                     task::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_connect_any(data_rate);
                         let msg = ControllerResult::Register((result, tx));
-                        _ = controller_tx.send(msg);
+                        block_on(controller_tx.send(msg)).unwrap();
                     });
                 }
                 Event::Register(Ctrl {
@@ -134,10 +130,13 @@ impl Demuxer {
                     let vhci = Arc::clone(&vhci);
                     let controller_tx = controller_tx.clone();
                     task::spawn_blocking(move || {
-                        let result = vhci.lock().unwrap().port_connect(port, data_rate);
-                        let result = result.map(|_| port);
+                        let connect = move |mut vhci: MutexGuard<vhci::Controller>| {
+                            vhci.port_connect(port, data_rate)?;
+                            Ok(port)
+                        };
+                        let result = connect(vhci.lock().unwrap());
                         let msg = ControllerResult::Register((result, tx));
-                        _ = controller_tx.send(msg);
+                        block_on(controller_tx.send(msg)).unwrap();
                     });
                 }
                 Event::GivebackUrb(handle) => {
@@ -149,7 +148,7 @@ impl Demuxer {
                     task::spawn_blocking(move || {
                         let result = vhci.lock().unwrap().port_disconnect(port);
                         let msg = ControllerResult::Disconnect((result, tx));
-                        _ = controller_tx.send(msg);
+                        block_on(controller_tx.send(msg)).unwrap();
                     });
                 }
                 Event::Work(ioc_work) => {
@@ -188,7 +187,7 @@ impl Demuxer {
                                     mailer.link_key2_to_key1(NoHash(address), &port);
                                     assert!(matches!(
                                         mailer.link_key3_to_key1(*handle, &port),
-                                        LinkResult::Success | LinkResult::NewKeyAlreadyExists,
+                                        LinkResult::Success,
                                     ));
                                     mailer.get_by_key1(&port).cloned()
                                 }
@@ -220,7 +219,7 @@ impl Demuxer {
                         }
                     };
 
-                    if let Some(mut tx) = tx {
+                    if let Some(tx) = tx {
                         if tx.send(work).await.is_err() {
                             // TODO: Remove by which key? By the value itself?
                         }
@@ -229,14 +228,9 @@ impl Demuxer {
                     }
                 }
                 Event::Controller(ControllerResult::Register((Ok(port), tx))) => {
-                    let (work_tx, work_rx) = mpsc::channel(0);
-                    assert!(
-                        mailer.insert_by_key1(port, work_tx.into_sink()).is_none(),
-                        "{port:?}"
-                    );
-                    if tx.send(Ok((port, work_rx.into_stream()))).is_err() {
-                        mailer.remove_by_key1(&port);
-                    }
+                    let (work_tx, work_rx) = mpsc::channel(1);
+                    assert!(mailer.insert_by_key1(port, work_tx).is_none(), "{port:?}");
+                    tx.send(Ok((port, work_rx))).unwrap();
                 }
                 Event::Controller(ControllerResult::Register((Err(err), tx))) => {
                     _ = tx.send(Err(err));
@@ -276,26 +270,20 @@ pub struct Controller {
 
 impl Controller {
     pub fn start(num_ports: BoundedU8<1, 32>) -> io::Result<Self> {
-        let (register_tx, register_rx) = mpsc::channel(0);
+        let (register_tx, register_rx) = mpsc::channel(1);
         let (giveback_tx, giveback_rx) = mpsc::channel(32);
-        let (disconnect_tx, disconnect_rx) = mpsc::channel(0);
+        let (disconnect_tx, disconnect_rx) = mpsc::channel(1);
         let vhci = vhci::Controller::open(num_ports)?;
         let remote = vhci.remote();
         let handle = Some(Arc::new(compio_runtime::spawn(
-            Demuxer::new(
-                register_rx.into_stream(),
-                giveback_rx.into_stream(),
-                disconnect_rx.into_stream(),
-                vhci,
-            )
-            .demux(),
+            Demuxer::new(register_rx, giveback_rx, disconnect_rx, vhci).demux(),
         )));
 
         Ok(Self {
             work_rx_handle: handle,
-            register_tx: register_tx.into_sink(),
-            giveback_tx: giveback_tx.into_sink(),
-            disconnect_tx: disconnect_tx.into_sink(),
+            register_tx,
+            giveback_tx,
+            disconnect_tx,
             remote,
         })
     }
@@ -379,16 +367,10 @@ impl VhciRemote {
         task::spawn_blocking(move || {
             _ = remote.giveback(urb);
         });
-        let mut tx = self.giveback_tx.clone();
+        let tx = self.giveback_tx.clone();
 
-        static NUM_FEEDS: AtomicUsize = AtomicUsize::new(0);
         async move {
-            _ = tx.feed(handle).await;
-            if 12 < NUM_FEEDS.fetch_add(1, Ordering::Relaxed) {
-                NUM_FEEDS.store(0, Ordering::Relaxed);
-                _ = tx.flush().await;
-            }
-
+            _ = tx.send(handle).await;
             Ok(())
         }
     }
@@ -402,29 +384,39 @@ impl VhciRemote {
 #[tracing::instrument(level = "trace", skip_all)]
 fn recv_work(
     work_rx: vhci::WorkReceiver,
-    work_tx: mpsc::Sender<vhci::ioctl::IocWork>,
+    work_tx: mpsc::AsyncSender<vhci::ioctl::IocWork>,
 ) -> io::Result<()> {
-    if work_tx.is_disconnected() {
-        info!("done with receiving work for vhci");
-        return Ok(());
-    }
+    use futures_lite::future::block_on;
+    use io::ErrorKind::*;
 
     const TIMEOUT: TimeoutMillis = TimeoutMillis::Time(BoundedI16::new(999).unwrap());
-    while (match work_rx.fetch_work_timeout(TIMEOUT) {
-        Ok(work) => work_tx.send(work).ok(),
-        Err(err)
-            if err.kind() == io::ErrorKind::TimedOut
-                || err.kind() == io::ErrorKind::Interrupted
-                || err
-                    .raw_os_error()
-                    .is_some_and(|err| err == vhci::libc::ENODATA) =>
-        {
-            (!work_tx.is_disconnected()).then_some(())
+
+    let nothing_for_now = |err: &io::Error| {
+        TimedOut == err.kind()
+            || Interrupted == err.kind()
+            || err
+                .raw_os_error()
+                .is_some_and(|err| vhci::libc::ENODATA == err)
+    };
+
+    if !work_tx.is_closed() {
+        loop {
+            match work_rx.fetch_work_timeout(TIMEOUT) {
+                Ok(work) => {
+                    _ = block_on(work_tx.send(work));
+                }
+                Err(ref err) if nothing_for_now(err) => {}
+                Err(err) => {
+                    error!("{err} - done receiving work for vhci");
+                    return Err(err);
+                }
+            }
+
+            if work_tx.is_closed() {
+                break;
+            }
         }
-        Err(err) => return Err(err),
-    })
-    .is_some()
-    {}
+    }
 
     info!("done with receiving work for vhci");
     Ok(())

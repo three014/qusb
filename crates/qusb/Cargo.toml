@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 thiserror = { version = "2.0.3", default-features = false }
 proto = { package = "qusb-proto", path = "../qusb-proto" }
+lend = { package = "qusb-lend", path = "../qusb-lend" }
+borrow = { package = "qusb-borrow", path = "../qusb-borrow" }
+utils = { path = "../utils" }
 nohash-hasher = { version = "0.2.0", default-features = false }
 rand = { version = "0.9.0", default-features = false }
 tracing = { version = "0.1.40", default-features = false, features = ["attributes"] }
@@ -23,12 +26,10 @@ futures-lite = { version = "2.6.0", default-features = false }
 futures-concurrency = { version = "7.6.3", default-features = false }
 rustls = { version = "0.23.23", default-features = false, features = ["ring"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink"] }
-futures-sink = { version = "0.3.31", default-features = false }
 compio-runtime = { version = "0.7.0", features = ["io-uring", "event", "time"] }
 compio-quic = { version = "0.3.0", features = ["io-uring"] }
 compio-driver = { version = "0.7.0", features = ["io-uring-sqe128", "io-uring-cqe32", "io-uring-socket", "io-uring-buf-ring"] }
 compio-io = { version = "0.6.0", default-features = false }
-atomic-waker = "1.1.2"
 
 [dev-dependencies]
 tracing-test = "0.2.5"

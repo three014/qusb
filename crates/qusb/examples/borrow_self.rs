@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEV: msg::UsbDeviceId = msg::UsbDeviceId {
     bus_number: 1,
-    device_addr: 17,
+    device_addr: 8,
 };
 
 fn main() {
@@ -22,7 +22,7 @@ fn main() {
         // .sqpoll_idle(Duration::from_millis(1))
         .clone();
     compio::runtime::RuntimeBuilder::new()
-        .event_interval(29)
+        .event_interval(44)
         .with_proactor(proactor)
         .build()
         .unwrap()

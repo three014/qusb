@@ -11,16 +11,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ::lend::{
+    Bulk, ClearStall, Ctrl, Int, Iso, RecvHandler, ResultData, SendHandler, SetConfig, SetInterface,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_concurrency::future::Join;
-use lend::{
-    Bulk, ClearStall, Ctrl, Int, Iso, ResultData, SetConfig, SetInterface, blocking::BlockingOps,
-};
+use lend::blocking::BlockingOps;
 use nohash_hasher::IntMap;
 use proto::{
-    data::{Data, ReadError, Ring},
-    msg::{self, Header, QusbFrame, UrbFrame, UrbHeader},
+    data::{Data, Ring}, msg::{self, compress_frame_len, Command, Dir, Endpoint, Header, UrbFrame, UrbHeader}, unpacked::Seq, AbortableError, ReportableError
 };
 use rusb::UsbContext;
 use rusb_async::{
@@ -29,67 +29,26 @@ use rusb_async::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, trace, warn, warn_span};
+use utils::CloseStream;
 use vhci::{
     DataRate, PortChange, PortFlag, PortStatus,
     ioctl::{self, UrbType},
-    usbfs::{Dir, Request},
+    usbfs::Request,
 };
-use zerocopy::{FromBytes, IntoBytes, transmute};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
     Result, UrbWithIsoData,
     stub::{self, RegisterPort},
     utils::{
-        CloseStream, Counter, SimpleMap, align_to_usize,
+        Counter, SimpleMap, align_to_usize,
         alloc::BytesAllocator,
         metrics::{self, Max, Min, RollingAvg},
         task,
     },
 };
 
-mod borrow;
 mod lend;
-
-enum Recv {
-    Urb((Header, Option<Data<UrbFrame>>)),
-    PortReset(Header),
-    Unlink(Header),
-}
-
-async fn recv_frame<R: AsyncRead + Unpin>(mut rx: R, buf: &mut Ring) -> io::Result<Option<Recv>> {
-    let mut min_len = size_of::<Header>();
-    let frame: Data<QusbFrame> = loop {
-        if buf.fill_until(&mut rx, min_len).await?.is_none() {
-            return Ok(None);
-        }
-
-        min_len = match buf.claim_dst() {
-            Ok(frame) => break frame,
-            Err(ReadError::CorruptedData) => {
-                #[cold]
-                #[inline(never)]
-                fn report_corrupted_data() -> io::Result<Option<Recv>> {
-                    Err(io::Error::other("corrupted data from peer"))?
-                }
-                return report_corrupted_data();
-            }
-            Err(ReadError::BufferShort { num_bytes_needed }) => buf.len() + num_bytes_needed,
-        };
-    };
-
-    let frame_ref = frame.get();
-    match frame_ref.header.command {
-        msg::Command::CmdUnlink => Ok(Some(Recv::Unlink(frame_ref.header))),
-        msg::Command::CmdPort | msg::Command::RetPort => {
-            Ok(Some(Recv::PortReset(frame_ref.header)))
-        }
-        msg::Command::RetSubmit | msg::Command::CmdSubmit => {
-            let header = frame_ref.header;
-            let urb = frame.split_data::<UrbFrame>();
-            Ok(Some(Recv::Urb((header, urb))))
-        }
-    }
-}
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct BorrowId {
@@ -203,7 +162,7 @@ impl BorrowSendHandler {
     }
 }
 
-impl borrow::SendHandler for BorrowSendHandler {
+impl ::borrow::SendHandler for BorrowSendHandler {
     #[tracing::instrument(level = "trace", skip_all)]
     fn port_stat(&mut self, next: ioctl::IocPortStat) {
         let address_invalidated = next.change().contains(PortChange::CONNECTION);
@@ -243,7 +202,7 @@ impl borrow::SendHandler for BorrowSendHandler {
             let header = Header {
                 total_frame_len: compress_frame_len(size_of::<Header>()),
                 seqnum: next_seqnum,
-                command: msg::Command::CmdPort,
+                command: Command::CmdPort,
                 status: msg::Status::Success,
             };
 
@@ -291,7 +250,7 @@ impl borrow::SendHandler for BorrowSendHandler {
             let header = Header {
                 total_frame_len: (size_of::<Header>() / 8) as u16,
                 seqnum,
-                command: msg::Command::CmdUnlink,
+                command: Command::CmdUnlink,
                 status: msg::Status::Success,
             };
 
@@ -320,16 +279,17 @@ impl borrow::SendHandler for BorrowSendHandler {
 
         const URB_NO_TRANSFER_DMA_MAP: u16 = 0x04;
         let urb_header = UrbHeader {
-            kind: urb.typ,
+            kind: urb.typ.into(),
             actual_transfer_len: actual_transfer_len as u16,
             iso_packet_count: packet_count as u16,
             interval: urb.interval as u16,
             // Remove URB_NO_TRANSFER_DMA_MAP flag
             flags: urb.flags & !URB_NO_TRANSFER_DMA_MAP,
-            endpoint: urb.endpoint,
+            endpoint: msg::Endpoint(urb.endpoint.0),
             num_errors: 0,
-            status: vhci::Status::Pending,
+            status: msg::TransferStatus::Pending,
             ctrl_packet: urb.setup_packet,
+            _padding: Default::default(),
         };
 
         let is_out = urb_header.is_out();
@@ -379,7 +339,15 @@ impl borrow::SendHandler for BorrowSendHandler {
             let transfer =
                 unsafe { transfer.get_unchecked_mut(..actual_transfer_len * is_out as usize) };
 
-            let iso_data = <[ioctl::IocIsoPacketData]>::mut_from_bytes(iso_raw).unwrap();
+            // SAFETY: `iso_raw` was created by splitting `data` into the transfer and iso halves,
+            // and the transfer side is always aligned to 8 bytes thanks to the `padded_transfer_len`
+            // function. Meanwhile the remaining slice will be `iso_byte_len` bytes long, which is
+            // directly calculated from `num_iso_packets * size_of::<ioctl::IocIsoPacketData>()`,
+            // so the alignment and size should be valid.
+            let iso_data = unsafe {
+                <[ioctl::IocIsoPacketData]>::mut_from_bytes_with_elems(iso_raw, packet_count)
+                    .unwrap_unchecked()
+            };
             let mut borrower_urb = UrbWithIsoData {
                 handle,
                 header: &urb_header,
@@ -399,18 +367,18 @@ impl borrow::SendHandler for BorrowSendHandler {
         let header = Header {
             total_frame_len: compress_frame_len(total_frame_len),
             seqnum: next_seq,
-            command: msg::Command::CmdSubmit,
+            command: Command::CmdSubmit,
             status: msg::Status::Success,
         };
 
-        unsafe { headers.as_mut_ptr().cast::<Header>().write(header) };
         unsafe {
+            headers.as_mut_ptr().cast::<Header>().write(header);
             headers
                 .as_mut_ptr()
                 .byte_add(size_of::<Header>())
                 .cast::<UrbHeader>()
-                .write(urb_header)
-        };
+                .write(urb_header);
+        }
 
         // Step 6: Rebuild our buffers and store them in our handler.
         head.unsplit(frame);
@@ -464,8 +432,8 @@ impl vhci::Urb for OwnedUrbGiveback {
 
     fn dir(&self) -> vhci::usbfs::Dir {
         match self.data {
-            GivebackData::In(_) => Dir::In,
-            GivebackData::Out(_) => Dir::Out,
+            GivebackData::In(_) => vhci::usbfs::Dir::In,
+            GivebackData::Out(_) => vhci::usbfs::Dir::Out,
         }
     }
 
@@ -529,11 +497,10 @@ impl BorrowRecvHandler {
     }
 }
 
-impl borrow::RecvHandler for BorrowRecvHandler {
+impl ::borrow::RecvHandler for BorrowRecvHandler {
     fn urb_reply(
         &mut self,
-        seqnum: u32,
-        data: Data<UrbFrame>,
+        Seq { seqnum, data }: Seq<Data<UrbFrame>>,
     ) -> impl Future<Output = io::Result<()>> + 'static {
         let mut vhci = self.vhci.clone();
         let id = self.id;
@@ -553,8 +520,8 @@ impl borrow::RecvHandler for BorrowRecvHandler {
         // We might not be expecting data if we sent some to the usb device
         let giveback = OwnedUrbGiveback {
             handle,
-            kind: urb.kind,
-            status: urb.status,
+            kind: urb.kind.into(),
+            status: urb.status.into(),
             data: match urb.is_out() {
                 true => GivebackData::Out(urb.actual_transfer_len),
                 false => GivebackData::In({
@@ -566,13 +533,11 @@ impl borrow::RecvHandler for BorrowRecvHandler {
             iso_packets: data,
         };
 
-        if vhci::Status::Success != urb.status {
+        if let Ok(err) = ReportableError::try_from(urb.status) {
             let _enter = warn_span!("urb_reply").entered();
             warn!(
-                "({id}) {:?} {:?} transfer {seqnum} failed: {:?}",
-                urb.kind,
-                urb.endpoint.direction(),
-                urb.status
+                "({id}) {:?} transfer {seqnum} on endpoint {} failed: {err}",
+                urb.kind, urb.endpoint,
             );
         }
 
@@ -672,14 +637,14 @@ where
             IntMap::with_capacity_and_hasher(512, Default::default()),
         )));
         let cloned_map = Arc::clone(&map);
-        let send_loop = borrow::SendLoop::new(tx, work_rx);
+        let send_loop = ::borrow::SendLoop::new(tx, work_rx);
         let send_handler = BorrowSendHandler::new(vhci.remote(), id, map);
         let send = compio_runtime::spawn(
             send_loop
                 .run(Box::new(send_handler), cancel_token.clone())
                 .in_current_span(),
         );
-        let recv_loop = borrow::RecvLoop::new(rx, buf_rx);
+        let recv_loop = ::borrow::RecvLoop::new(rx, buf_rx);
         let recv_handler = BorrowRecvHandler::new(vhci.remote(), id, cloned_map);
         let recv = compio_runtime::spawn(
             recv_loop
@@ -693,6 +658,7 @@ where
 
         info!("disconnecting {id}");
         vhci.disconnect(port).await?;
+        info!("send: {send_result:?}, recv: {recv_result:?}");
         send_result?;
         recv_result?;
         Ok(())
@@ -749,53 +715,26 @@ const fn vhci_from_transfer_status(status: TransferStatus) -> vhci::Status {
     }
 }
 
-#[inline]
-fn convert_libusb_to_vhci(
+fn convert_libusb_to_proto(
     status: rusb::Result<TransferStatus>,
-    kind: UrbType,
-    seqnum: u32,
-    dev_id: msg::UsbDeviceId,
-) -> vhci::Status {
+) -> std::result::Result<(), proto::TransferError> {
+    use proto::TransferError::*;
     match status {
-        Ok(status) => vhci_from_transfer_status(status),
-        Err(rusb::Error::InvalidParam) => vhci::Status::Stall,
-        Err(rusb::Error::NoDevice) => vhci::Status::DeviceDisconnected,
-        Err(rusb::Error::Busy) => {
-            unreachable!("for now, no transfer can be resubmitted")
-        }
-        Err(rusb::Error::NotSupported) => {
-            unreachable!("will we ever mess with the transfer flags?")
-        }
-        Err(err) => {
-            let _guard = tracing::Span::current().entered();
-            // TODO: This doesn't really return the actual errno, as:
-            // 1. The processing usually happens on another thread, and
-            // 2. Even if the processing happened on the same thread, this
-            // function is not the next logical thing to run after.
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-            warn! { %err, %errno, "({seqnum}) {kind:?} transfer failed on {dev_id:?}" };
-            vhci::Status::from_errno_raw(-errno, UrbType::Iso == kind)
-        }
+        Ok(TransferStatus::Completed) => Ok(()),
+        Ok(TransferStatus::Error) => Err(Abortable(AbortableError::Other)),
+        Ok(TransferStatus::TimedOut) => Err(Reportable(ReportableError::TimedOut)),
+        Ok(TransferStatus::Cancelled) => Err(Reportable(ReportableError::Cancelled)),
+        Ok(TransferStatus::Stall) => Err(Reportable(ReportableError::Stall)),
+        Ok(TransferStatus::NoDevice) => Err(Abortable(AbortableError::DeviceDisconnected)),
+        Ok(TransferStatus::Overflow) => Err(Reportable(ReportableError::Overflow)),
+        Err(rusb::Error::Io) => Err(Abortable(AbortableError::Proto)),
+        Err(rusb::Error::InvalidParam) => Err(Abortable(AbortableError::Proto)),
+        Err(rusb::Error::NoDevice) => Err(Abortable(AbortableError::DeviceDisconnected)),
+        Err(rusb::Error::Timeout) => Err(Reportable(ReportableError::TimedOut)),
+        Err(rusb::Error::Overflow) => Err(Reportable(ReportableError::Overflow)),
+        Err(rusb::Error::Pipe) => Err(Reportable(ReportableError::Stall)),
+        Err(_) => Err(Abortable(AbortableError::Other)),
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Seq<T> {
-    pub seqnum: u32,
-    pub data: T,
-}
-
-#[inline]
-fn padding(actual_transfer_len: u16) -> &'static [u8] {
-    static PADDING: [u8; 7] = [0; 7];
-    let actual_transfer_len = usize::from(actual_transfer_len);
-    let padded_len = align_to_usize(actual_transfer_len) - actual_transfer_len;
-    &PADDING[..padded_len]
-}
-
-#[inline]
-const fn compress_frame_len(len: usize) -> u16 {
-    (len / size_of::<u64>()) as u16
 }
 
 #[derive(Default, Clone)]
@@ -880,9 +819,8 @@ impl From<Vec<LibusbTransfer2>> for SmallTransfers {
 }
 
 struct LendRecvHandler {
-    dev_id: msg::UsbDeviceId,
-    active_transfers: Rc<RefCell<IntMap<u32, CancelTransferToken>>>,
-    cached_cancel_tokens: Rc<RefCell<Vec<CancelTransferToken>>>,
+    active_transfers: Rc<Mutex<IntMap<u32, CancelTransferToken>>>,
+    cached_cancel_tokens: Rc<Mutex<Vec<CancelTransferToken>>>,
     device: Arc<lend::device::Handle>,
     scratch: BytesAllocator,
     isos: BigTransfers,
@@ -894,19 +832,21 @@ impl LendRecvHandler {
     fn register_cancel_token(&mut self, seqnum: u32) -> CancelTransferToken {
         let cancel = self
             .cached_cancel_tokens
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .pop()
             .unwrap_or_else(CancelTransferToken::new);
         self.active_transfers
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .insert(seqnum, cancel.clone());
         cancel
     }
 }
 
-impl lend::RecvHandler for LendRecvHandler {
+impl RecvHandler for LendRecvHandler {
     fn cancel_urb(&mut self, seqnum: u32) {
-        if let Some(transfer) = self.active_transfers.borrow_mut().remove(&seqnum) {
+        if let Some(transfer) = self.active_transfers.lock().unwrap().remove(&seqnum) {
             transfer.cancel();
         }
     }
@@ -914,11 +854,11 @@ impl lend::RecvHandler for LendRecvHandler {
     fn device_reset(
         &mut self,
         seqnum: u32,
-    ) -> impl Future<Output = Seq<proto::msg::Status>> + 'static {
+    ) -> impl Future<Output = Seq<std::result::Result<(), AbortableError>>> + 'static {
         async move {
             Seq {
                 seqnum,
-                data: msg::Status::Success,
+                data: Ok(()),
             }
         }
     }
@@ -942,8 +882,8 @@ impl lend::RecvHandler for LendRecvHandler {
                     res: ResultData::Out {
                         bytes_transferred: 0,
                     },
-                    endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
-                    status,
+                    endpoint: Endpoint(Dir::Out as u8),
+                    status: status.into(),
                 },
             }
         }
@@ -970,7 +910,7 @@ impl lend::RecvHandler for LendRecvHandler {
                     res: ResultData::Out {
                         bytes_transferred: 0,
                     },
-                    endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
+                    endpoint: Endpoint(Dir::Out as u8),
                     status,
                 },
             }
@@ -996,7 +936,7 @@ impl lend::RecvHandler for LendRecvHandler {
                     res: ResultData::Out {
                         bytes_transferred: 0,
                     },
-                    endpoint: ioctl::Endpoint(vhci::usbfs::Dir::Out as u8),
+                    endpoint: Endpoint(Dir::Out as u8),
                     status,
                 },
             }
@@ -1028,7 +968,10 @@ impl lend::RecvHandler for LendRecvHandler {
             let mut buf = self
                 .scratch
                 .reserve(size_of::<ioctl::IocSetupPacket>() + header.padded_transfer_len());
-            buf[..size_of::<ioctl::IocSetupPacket>()].copy_from_slice(ctrl_pkt.as_bytes());
+            *ioctl::IocSetupPacket::mut_from_bytes(
+                &mut buf[..size_of::<ioctl::IocSetupPacket>()],
+            )
+            .unwrap() = ctrl_pkt;
             buf
         };
         let is_get_status = Request::STANDARD_DEVICE_GET_STATUS == ctrl_pkt.req();
@@ -1037,7 +980,8 @@ impl lend::RecvHandler for LendRecvHandler {
         let transfer = self
             .smalls
             .remove()
-            .unwrap_or_else(|| LibusbTransfer2::new_with_zero_packets());
+            .unwrap_or_else(LibusbTransfer2::new_with_zero_packets);
+        let endpoint = header.endpoint;
 
         // SAFETY: Transfer buf is exactly the length needed for a control
         // transfer, and its capacity matches w_length + 8.
@@ -1045,13 +989,6 @@ impl lend::RecvHandler for LendRecvHandler {
             unsafe { transfer.into_ctrl(self.device.as_device(), buf, Duration::from_millis(900)) };
 
         let mut cache = self.smalls.clone();
-        let dev_id = self.dev_id;
-        let dir = ctrl_pkt.req().dir();
-        let endpoint = match dir {
-            Dir::Out => ioctl::Endpoint(0),
-            Dir::In => ioctl::Endpoint(128),
-        };
-
         let transfer = Arc::new(transfer);
         let ours = Arc::clone(&transfer);
         task::spawn_blocking(move || {
@@ -1059,7 +996,7 @@ impl lend::RecvHandler for LendRecvHandler {
         });
         async move {
             let result = ours.wait(&mut cancel).await;
-            let status = convert_libusb_to_vhci(Ok(result), UrbType::Ctrl, seqnum, dev_id);
+            let status = convert_libusb_to_proto(Ok(result));
 
             let mut buf = {
                 let (transfer, mut buf) =
@@ -1074,7 +1011,7 @@ impl lend::RecvHandler for LendRecvHandler {
                 buf[0] = 0x01;
             }
 
-            let res = ResultData::new(buf, dir);
+            let res = ResultData::new(buf, endpoint.dir());
             Seq {
                 seqnum,
                 data: Ctrl {
@@ -1105,7 +1042,7 @@ impl lend::RecvHandler for LendRecvHandler {
         let transfer = self
             .smalls
             .remove()
-            .unwrap_or_else(|| LibusbTransfer2::new_with_zero_packets());
+            .unwrap_or_else(LibusbTransfer2::new_with_zero_packets);
         let endpoint = header.endpoint;
         let interval = header.interval;
 
@@ -1113,8 +1050,6 @@ impl lend::RecvHandler for LendRecvHandler {
         let transfer = unsafe { transfer.into_int(self.device.as_device(), endpoint.0, buf) };
 
         let mut cache = self.smalls.clone();
-        let dev_id = self.dev_id;
-
         let transfer = Arc::new(transfer);
         let ours = Arc::clone(&transfer);
         task::spawn_blocking(move || {
@@ -1122,12 +1057,12 @@ impl lend::RecvHandler for LendRecvHandler {
         });
         async move {
             let result = ours.wait(&mut cancel).await;
-            let status = convert_libusb_to_vhci(Ok(result), UrbType::Int, seqnum, dev_id);
+            let status = convert_libusb_to_proto(Ok(result));
 
             let (transfer, buf) = Arc::into_inner(ours).and_then(Transfer2::complete).unwrap();
             cache.insert(transfer);
 
-            let res = ResultData::new(buf, endpoint.direction());
+            let res = ResultData::new(buf, endpoint.dir());
             Seq {
                 seqnum,
                 data: Int {
@@ -1218,8 +1153,6 @@ impl lend::RecvHandler for LendRecvHandler {
         };
 
         let mut cache = self.isos.clone();
-        let dev_id = self.dev_id;
-
         let transfer = Arc::new(transfer);
         let ours = Arc::clone(&transfer);
         task::spawn_blocking(move || {
@@ -1227,7 +1160,7 @@ impl lend::RecvHandler for LendRecvHandler {
         });
         async move {
             let result = ours.wait(&mut cancel).await;
-            let status = convert_libusb_to_vhci(Ok(result), UrbType::Iso, seqnum, dev_id);
+            let status = convert_libusb_to_proto(Ok(result));
 
             let our_pkts = <[ioctl::IocIsoPacketGiveback]>::mut_from_bytes_with_elems(
                 &mut raw_iso_buf[..],
@@ -1256,7 +1189,7 @@ impl lend::RecvHandler for LendRecvHandler {
             // buffer be sent back to the caller.
             unsafe { buf.set_len(buf.capacity()) };
 
-            let res = ResultData::new(buf, endpoint.direction());
+            let res = ResultData::new(buf, endpoint.dir());
             Seq {
                 seqnum,
                 data: Iso {
@@ -1291,7 +1224,7 @@ impl lend::RecvHandler for LendRecvHandler {
         let transfer = self
             .smalls
             .remove()
-            .unwrap_or_else(|| LibusbTransfer2::new_with_zero_packets());
+            .unwrap_or_else(LibusbTransfer2::new_with_zero_packets);
         let endpoint = header.endpoint;
 
         // SAFETY: Transfer buffer has a capacity of actual_transfer_len.
@@ -1305,7 +1238,6 @@ impl lend::RecvHandler for LendRecvHandler {
         };
 
         let mut cache = self.smalls.clone();
-        let dev_id = self.dev_id;
         let transfer = Arc::new(transfer);
         let ours = Arc::clone(&transfer);
         task::spawn_blocking(move || {
@@ -1313,12 +1245,12 @@ impl lend::RecvHandler for LendRecvHandler {
         });
         async move {
             let result = ours.wait(&mut cancel).await;
-            let status = convert_libusb_to_vhci(Ok(result), UrbType::Bulk, seqnum, dev_id);
+            let status = convert_libusb_to_proto(Ok(result));
 
             let (transfer, buf) = Arc::into_inner(ours).and_then(Transfer2::complete).unwrap();
             cache.insert(transfer);
 
-            let res = ResultData::new(buf, endpoint.direction());
+            let res = ResultData::new(buf, endpoint.dir());
             Seq {
                 seqnum,
                 data: Bulk {
@@ -1334,8 +1266,9 @@ impl lend::RecvHandler for LendRecvHandler {
 impl Drop for LendRecvHandler {
     fn drop(&mut self) {
         self.active_transfers
-            .take()
-            .into_values()
+            .lock()
+            .unwrap()
+            .values()
             .for_each(|transfer| transfer.cancel());
     }
 }
@@ -1396,7 +1329,7 @@ struct StatLendRecvHandler<H> {
     stats: LendRecvStats,
 }
 
-impl<H: lend::RecvHandler> lend::RecvHandler for StatLendRecvHandler<H> {
+impl<H: RecvHandler> RecvHandler for StatLendRecvHandler<H> {
     fn cancel_urb(&mut self, seqnum: u32) {
         self.inner.cancel_urb(seqnum);
     }
@@ -1404,7 +1337,7 @@ impl<H: lend::RecvHandler> lend::RecvHandler for StatLendRecvHandler<H> {
     fn device_reset(
         &mut self,
         seqnum: u32,
-    ) -> impl Future<Output = Seq<proto::msg::Status>> + 'static {
+    ) -> impl Future<Output = Seq<std::result::Result<(), AbortableError>>> + 'static {
         self.inner.device_reset(seqnum)
     }
 
@@ -1470,20 +1403,21 @@ impl<H: lend::RecvHandler> lend::RecvHandler for StatLendRecvHandler<H> {
 struct LendSendHandler {
     dev_id: msg::UsbDeviceId,
     buf: BytesMut,
-    active_transfers: Rc<RefCell<IntMap<u32, CancelTransferToken>>>,
-    cached_cancel_tokens: Rc<RefCell<Vec<CancelTransferToken>>>,
+    active_transfers: Rc<Mutex<IntMap<u32, CancelTransferToken>>>,
+    cached_cancel_tokens: Rc<Mutex<Vec<CancelTransferToken>>>,
 }
 
 impl LendSendHandler {
+    #[inline]
     fn deregister_token(&mut self, seqnum: u32) {
-        if let Some(token) = self.active_transfers.borrow_mut().remove(&seqnum) {
+        if let Some(token) = self.active_transfers.lock().unwrap().remove(&seqnum) {
             debug_assert!(!token.is_cancelled());
-            self.cached_cancel_tokens.borrow_mut().push(token);
+            self.cached_cancel_tokens.lock().unwrap().push(token);
         }
     }
 }
 
-impl lend::SendHandler for LendSendHandler {
+impl SendHandler for LendSendHandler {
     fn is_buf_empty(&self) -> bool {
         self.buf.is_empty()
     }
@@ -1504,27 +1438,30 @@ impl lend::SendHandler for LendSendHandler {
                     raw_iso_buf,
                     num_errors,
                     num_iso_packets,
-                    status: vhci_status,
+                    status,
                 },
         }: Seq<Iso>,
-    ) -> std::result::Result<(), lend::Error> {
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.deregister_token(seqnum);
-        let status = msg::Status::from(vhci_status);
-        if msg::Status::Success != status {
-            let err = lend::Error::Usb(lend::UsbError {
-                id: self.dev_id,
-                seqnum,
-                status,
-                kind: lend::FrameKind::Transfer {
-                    kind: UrbType::Iso,
-                    endpoint,
-                    status: vhci_status,
-                },
-            });
-            return Err(err);
-        }
+        let status = match status {
+            Ok(()) => msg::TransferStatus::Success,
+            Err(proto::TransferError::Reportable(err)) => err.into(),
+            Err(proto::TransferError::Abortable(err)) => {
+                return Err(::lend::error::UsbError {
+                    id: self.dev_id,
+                    seq: Seq {
+                        seqnum,
+                        data: ::lend::error::SeqError::Transfer {
+                            kind: msg::TransferKind::Isochronous,
+                            endpoint,
+                            err,
+                        },
+                    },
+                });
+            }
+        };
 
-        let lend::HeaderData {
+        let ::lend::HeaderData {
             actual_transfer_len,
             transfer,
             padding,
@@ -1540,20 +1477,21 @@ impl lend::SendHandler for LendSendHandler {
 
         let header = Header {
             total_frame_len,
-            command: msg::Command::RetSubmit,
-            status,
+            command: Command::RetSubmit,
+            status: msg::Status::Success,
             seqnum,
         };
         let urb_header = UrbHeader {
             actual_transfer_len,
             iso_packet_count: num_iso_packets,
             endpoint,
-            kind: UrbType::Iso,
+            kind: msg::TransferKind::Isochronous,
             interval,
-            status: vhci_status,
+            status,
             flags: 0,
             num_errors,
             ctrl_packet: Default::default(),
+            _padding: Default::default(),
         };
 
         self.buf.put_slice(header.as_bytes());
@@ -1573,27 +1511,30 @@ impl lend::SendHandler for LendSendHandler {
                     res,
                     endpoint,
                     interval,
-                    status: vhci_status,
+                    status,
                 },
         }: Seq<Int>,
-    ) -> std::result::Result<(), lend::Error> {
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.deregister_token(seqnum);
-        let status = msg::Status::from(vhci_status);
-        if msg::Status::Success != status {
-            let err = lend::Error::Usb(lend::UsbError {
-                id: self.dev_id,
-                seqnum,
-                status,
-                kind: lend::FrameKind::Transfer {
-                    kind: UrbType::Int,
-                    endpoint,
-                    status: vhci_status,
-                },
-            });
-            return Err(err);
-        }
+        let status = match status {
+            Ok(()) => msg::TransferStatus::Success,
+            Err(proto::TransferError::Reportable(err)) => err.into(),
+            Err(proto::TransferError::Abortable(err)) => {
+                return Err(::lend::error::UsbError {
+                    id: self.dev_id,
+                    seq: Seq {
+                        seqnum,
+                        data: ::lend::error::SeqError::Transfer {
+                            kind: msg::TransferKind::Interrupt,
+                            endpoint,
+                            err,
+                        },
+                    },
+                });
+            }
+        };
 
-        let lend::HeaderData {
+        let ::lend::HeaderData {
             actual_transfer_len,
             transfer,
             padding,
@@ -1609,20 +1550,21 @@ impl lend::SendHandler for LendSendHandler {
 
         let header = Header {
             total_frame_len,
-            command: msg::Command::RetSubmit,
-            status,
+            command: Command::RetSubmit,
+            status: msg::Status::Success,
             seqnum,
         };
         let urb_header = UrbHeader {
             actual_transfer_len,
             iso_packet_count: 0,
             endpoint,
-            kind: UrbType::Int,
+            kind: msg::TransferKind::Interrupt,
             interval,
-            status: vhci_status,
+            status,
             flags: 0,
             num_errors: 0,
             ctrl_packet: Default::default(),
+            _padding: Default::default(),
         };
 
         self.buf.put_slice(header.as_bytes());
@@ -1640,27 +1582,30 @@ impl lend::SendHandler for LendSendHandler {
                 Ctrl {
                     res,
                     endpoint,
-                    status: vhci_status,
+                    status,
                 },
         }: Seq<Ctrl>,
-    ) -> std::result::Result<(), lend::Error> {
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.deregister_token(seqnum);
-        let status = msg::Status::from(vhci_status);
-        if msg::Status::Success != status {
-            let err = lend::Error::Usb(lend::UsbError {
-                id: self.dev_id,
-                seqnum,
-                status,
-                kind: lend::FrameKind::Transfer {
-                    kind: UrbType::Ctrl,
-                    endpoint,
-                    status: vhci_status,
-                },
-            });
-            return Err(err);
-        }
+        let status = match status {
+            Ok(()) => msg::TransferStatus::Success,
+            Err(proto::TransferError::Reportable(err)) => err.into(),
+            Err(proto::TransferError::Abortable(err)) => {
+                return Err(::lend::error::UsbError {
+                    id: self.dev_id,
+                    seq: Seq {
+                        seqnum,
+                        data: ::lend::error::SeqError::Transfer {
+                            kind: msg::TransferKind::Control,
+                            endpoint,
+                            err,
+                        },
+                    },
+                });
+            }
+        };
 
-        let lend::HeaderData {
+        let ::lend::HeaderData {
             actual_transfer_len,
             transfer,
             padding,
@@ -1676,20 +1621,21 @@ impl lend::SendHandler for LendSendHandler {
 
         let header = Header {
             total_frame_len,
-            command: msg::Command::RetSubmit,
-            status,
+            command: Command::RetSubmit,
+            status: msg::Status::Success,
             seqnum,
         };
         let urb_header = UrbHeader {
             actual_transfer_len,
             iso_packet_count: 0,
             endpoint,
-            kind: UrbType::Ctrl,
+            kind: msg::TransferKind::Control,
             interval: 0,
-            status: vhci_status,
+            status,
             flags: 0,
             num_errors: 0,
             ctrl_packet: Default::default(),
+            _padding: Default::default(),
         };
 
         self.buf.put_slice(header.as_bytes());
@@ -1707,27 +1653,30 @@ impl lend::SendHandler for LendSendHandler {
                 Bulk {
                     res,
                     endpoint,
-                    status: vhci_status,
+                    status,
                 },
         }: Seq<Bulk>,
-    ) -> std::result::Result<(), lend::Error> {
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.deregister_token(seqnum);
-        let status = msg::Status::from(vhci_status);
-        if msg::Status::Success != status {
-            let err = lend::Error::Usb(lend::UsbError {
-                id: self.dev_id,
-                seqnum,
-                status,
-                kind: lend::FrameKind::Transfer {
-                    kind: UrbType::Bulk,
-                    endpoint,
-                    status: vhci_status,
-                },
-            });
-            return Err(err);
-        }
+        let status = match status {
+            Ok(()) => msg::TransferStatus::Success,
+            Err(proto::TransferError::Reportable(err)) => err.into(),
+            Err(proto::TransferError::Abortable(err)) => {
+                return Err(::lend::error::UsbError {
+                    id: self.dev_id,
+                    seq: Seq {
+                        seqnum,
+                        data: ::lend::error::SeqError::Transfer {
+                            kind: msg::TransferKind::Bulk,
+                            endpoint,
+                            err,
+                        },
+                    },
+                });
+            }
+        };
 
-        let lend::HeaderData {
+        let ::lend::HeaderData {
             actual_transfer_len,
             transfer,
             padding,
@@ -1743,20 +1692,21 @@ impl lend::SendHandler for LendSendHandler {
 
         let header = Header {
             total_frame_len,
-            command: msg::Command::RetSubmit,
-            status,
+            command: Command::RetSubmit,
+            status: msg::Status::Success,
             seqnum,
         };
         let urb_header = UrbHeader {
             actual_transfer_len,
             iso_packet_count: 0,
             endpoint,
-            kind: UrbType::Bulk,
+            kind: msg::TransferKind::Bulk,
             interval: 0,
-            status: vhci_status,
+            status,
             flags: 0,
             num_errors: 0,
             ctrl_packet: Default::default(),
+            _padding: Default::default(),
         };
 
         self.buf.put_slice(header.as_bytes());
@@ -1771,23 +1721,27 @@ impl lend::SendHandler for LendSendHandler {
         Seq {
             seqnum,
             data: status,
-        }: Seq<proto::msg::Status>,
-    ) -> std::result::Result<(), lend::Error> {
-        if msg::Status::Success == status {
-            self.buf.put_u64_le(transmute!(Header {
-                command: msg::Command::RetPort,
-                status,
-                total_frame_len: compress_frame_len(size_of::<Header>()),
-                seqnum
-            }));
-            Ok(())
-        } else {
-            Err(lend::Error::Usb(lend::UsbError {
-                id: self.dev_id,
-                seqnum,
-                status,
-                kind: lend::FrameKind::Reset,
-            }))
+        }: Seq<std::result::Result<(), AbortableError>>,
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
+        match status {
+            Ok(()) => Ok(self.buf.put_u64_le(
+                Header {
+                    total_frame_len: compress_frame_len(size_of::<Header>()),
+                    command: Command::RetPort,
+                    status: msg::Status::Success,
+                    seqnum,
+                }
+                .as_u64_le(),
+            )),
+            Err(_) => {
+                Err(::lend::error::UsbError {
+                    id: self.dev_id,
+                    seq: Seq {
+                        seqnum,
+                        data: ::lend::error::SeqError::Reset,
+                    },
+                })
+            }
         }
     }
 }
@@ -1846,7 +1800,7 @@ struct StatLendSendHandler<H> {
     stats: LendSendStats,
 }
 
-impl<H: lend::SendHandler> lend::SendHandler for StatLendSendHandler<H> {
+impl<H: SendHandler> SendHandler for StatLendSendHandler<H> {
     fn is_buf_empty(&self) -> bool {
         self.inner.is_buf_empty()
     }
@@ -1856,31 +1810,37 @@ impl<H: lend::SendHandler> lend::SendHandler for StatLendSendHandler<H> {
         self.inner.flush_buf()
     }
 
-    fn iso_completed(&mut self, iso: Seq<Iso>) -> std::result::Result<(), lend::Error> {
+    fn iso_completed(&mut self, iso: Seq<Iso>) -> std::result::Result<(), ::lend::error::UsbError> {
         self.stats.mark_complete();
         self.stats.mark_iso();
         self.inner.iso_completed(iso)
     }
 
-    fn int_completed(&mut self, int: Seq<Int>) -> std::result::Result<(), lend::Error> {
+    fn int_completed(&mut self, int: Seq<Int>) -> std::result::Result<(), ::lend::error::UsbError> {
         self.stats.mark_complete();
         self.inner.int_completed(int)
     }
 
-    fn ctrl_completed(&mut self, ctrl: Seq<Ctrl>) -> std::result::Result<(), lend::Error> {
+    fn ctrl_completed(
+        &mut self,
+        ctrl: Seq<Ctrl>,
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.stats.mark_complete();
         self.inner.ctrl_completed(ctrl)
     }
 
-    fn bulk_completed(&mut self, bulk: Seq<Bulk>) -> std::result::Result<(), lend::Error> {
+    fn bulk_completed(
+        &mut self,
+        bulk: Seq<Bulk>,
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.stats.mark_complete();
         self.inner.bulk_completed(bulk)
     }
 
     fn device_resetted(
         &mut self,
-        reset: Seq<proto::msg::Status>,
-    ) -> std::result::Result<(), lend::Error> {
+        reset: Seq<std::result::Result<(), AbortableError>>,
+    ) -> std::result::Result<(), ::lend::error::UsbError> {
         self.inner.device_resetted(reset)
     }
 }
@@ -1942,16 +1902,15 @@ where
             trace!("({dev_id} complete)");
         });
 
-        let active_transfers = Rc::new(RefCell::new(IntMap::with_capacity_and_hasher(
+        let active_transfers = Rc::new(Mutex::new(IntMap::with_capacity_and_hasher(
             32,
             Default::default(),
         )));
-        let cached_cancel_tokens = Rc::new(RefCell::new(Vec::with_capacity(8)));
+        let cached_cancel_tokens = Rc::new(Mutex::new(Vec::with_capacity(8)));
 
         const BUF_LEN: usize = u16::MAX as usize;
         let (recv_stats, num_active_transfers) = LendRecvStats::new();
         let recv_handler = LendRecvHandler {
-            dev_id,
             device,
             active_transfers: active_transfers.clone(),
             cached_cancel_tokens: cached_cancel_tokens.clone(),
@@ -1980,7 +1939,7 @@ where
             stats: send_stats,
         };
 
-        let (send, recv) = lend::loops(tx, rx, buf_rx);
+        let (send, recv) = ::lend::loops(tx, rx, buf_rx);
 
         let recv = compio_runtime::spawn(
             recv.run(Box::new(recv_handler), cancel_token.clone())
@@ -1994,13 +1953,31 @@ where
 
         info!("({dev_id}) shutting down");
 
-        recv_result.unwrap()?;
-        send_result.unwrap()?;
+        let result = {
+            use ::lend::error::Error::*;
+            use proto::RecvError::*;
+
+            // Since we have two different tasks that can return
+            // different and simultaneous errors, we decide
+            // to prioritize our errors.
+            match (recv_result.unwrap(), send_result.unwrap()) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(err)) | (Err(err), Ok(())) => Err(err),
+                (Err(Recv(_)), Err(Usb(err))) => Err(Usb(err)),
+                (Err(Recv(CorruptedData)), Err(Send(_))) => Err(Recv(CorruptedData)),
+                (Err(Recv(Io(_))), Err(Send(err))) => Err(Send(err)),
+                (Err(Send(_)), Err(_)) | (Err(_), Err(Recv(_))) | (Err(Usb(_)), Err(_)) => {
+                    unreachable!()
+                }
+            }
+        };
 
         cancel_token.cancel();
         drop(our_device);
         libusb.await.unwrap();
 
+        info!("{result:?}");
+        result?;
         Ok(())
     }
 }

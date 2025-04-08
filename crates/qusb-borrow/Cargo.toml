@@ -1,0 +1,20 @@
+[package]
+name = "qusb-borrow"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.10.1"
+compio-buf = { version = "0.5.1", default-features = false, features = ["bytes"] }
+compio-io = { version = "0.6.0", default-features = false }
+proto = { package = "qusb-proto", path = "../qusb-proto" }
+utils = { path = "../utils" }
+vhci = { package = "usb_vhci", git = "https://github.com/three014/usb_vhci", features = ["zerocopy"], version = "0.2.1" }
+tracing = { version = "0.1.40", default-features = false }
+thiserror = { version = "2.0.3", default-features = false }
+fxhash = "0.2.1"
+nohash-hasher = "0.2.0"
+futures-lite = { version = "2.6.0", default-features = false }
+tokio-util = { version = "0.7.14", default-features = false }
+futures-concurrency = "7.6.3"
+futures-util = { version = "0.3.31", default-features = false, features = ["sink"] }

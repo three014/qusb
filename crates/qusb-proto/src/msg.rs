@@ -23,10 +23,14 @@ use std::{
 
 use compio_io::AsyncWrite;
 use thiserror::Error;
-use zerocopy::{FromBytes, IntoBytes, TryFromBytes, try_transmute};
+use zerocopy::{transmute, try_transmute, IntoBytes, TryFromBytes};
 use zerocopy_derive::*;
 
-use crate::{GetSliceLen, GetSliceLenErr};
+use crate::{
+    AbortableError, GetSliceLen, GetSliceLenErr, ReportableError, unpacked::UrbKind, utils::align,
+};
+
+pub use vhci::{ioctl::IocSetupPacket, usbfs};
 
 pub const BUS_ID_MAX_LEN: u8 = 32;
 pub const PATH_MAX_LEN: u16 = 256;
@@ -92,7 +96,7 @@ impl From<vhci::Status> for Status {
             vhci::Status::Pending => todo!(),
             vhci::Status::ShortPacket => todo!(),
             vhci::Status::Error => Self::DevErr,
-            vhci::Status::DeviceDisconnected => todo!(),
+            vhci::Status::DeviceDisconnected => Self::NoDev,
             vhci::Status::BitStuff => todo!(),
             vhci::Status::Crc => todo!(),
             vhci::Status::NoResponse => todo!(),
@@ -100,6 +104,90 @@ impl From<vhci::Status> for Status {
             vhci::Status::BufferUnderrun => todo!(),
             vhci::Status::AllIsoPacketsFailed => todo!(),
             _ => Self::Success,
+        }
+    }
+}
+
+impl From<AbortableError> for Status {
+    fn from(value: AbortableError) -> Self {
+        value.as_proto()
+    }
+}
+
+impl From<Result<(), AbortableError>> for Status {
+    fn from(value: Result<(), AbortableError>) -> Self {
+        match value {
+            Ok(()) => Self::Success,
+            Err(err) => err.into(),
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Immutable, FromZeros, KnownLayout, Unaligned, PartialEq, Eq, IntoBytes,
+)]
+#[repr(u8)]
+pub enum TransferStatus {
+    Success = 0,
+    Pending,
+    TimedOut = ReportableError::TimedOut as u8,
+    Cancelled = ReportableError::Cancelled as u8,
+    Stall = ReportableError::Stall as u8,
+    Overflow = ReportableError::Overflow as u8,
+    NotEnoughBandwidth = ReportableError::NotEnoughBandwidth as u8,
+}
+
+impl From<ReportableError> for TransferStatus {
+    fn from(value: ReportableError) -> Self {
+        match value {
+            ReportableError::TimedOut => Self::TimedOut,
+            ReportableError::Cancelled => Self::Cancelled,
+            ReportableError::Stall => Self::Stall,
+            ReportableError::Overflow => Self::Overflow,
+            ReportableError::NotEnoughBandwidth => Self::NotEnoughBandwidth,
+        }
+    }
+}
+
+impl From<Result<(), ReportableError>> for TransferStatus {
+    fn from(value: Result<(), ReportableError>) -> Self {
+        match value {
+            Ok(()) => Self::Success,
+            Err(err) => err.into(),
+        }
+    }
+}
+
+impl From<TransferStatus> for vhci::Status {
+    fn from(value: TransferStatus) -> Self {
+        match value {
+            TransferStatus::Success => vhci::Status::Success,
+            TransferStatus::Pending => vhci::Status::Pending,
+            TransferStatus::TimedOut => vhci::Status::TimedOut,
+            TransferStatus::Cancelled => vhci::Status::Canceled,
+            TransferStatus::Stall => vhci::Status::Stall,
+            TransferStatus::Overflow => vhci::Status::Babble,
+            TransferStatus::NotEnoughBandwidth => vhci::Status::Error,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("could not convert the transfer status to a reportable error")]
+pub struct TryFromTransferStatusErr;
+
+impl TryFrom<TransferStatus> for ReportableError {
+    type Error = TryFromTransferStatusErr;
+
+    fn try_from(value: TransferStatus) -> Result<Self, Self::Error> {
+        match value {
+            TransferStatus::Success => Err(TryFromTransferStatusErr),
+            TransferStatus::Pending => Err(TryFromTransferStatusErr),
+            TransferStatus::TimedOut => Ok(ReportableError::TimedOut),
+            TransferStatus::Cancelled => Ok(ReportableError::Cancelled),
+            TransferStatus::Stall => Ok(ReportableError::Stall),
+            TransferStatus::Overflow => Ok(ReportableError::Overflow),
+            TransferStatus::NotEnoughBandwidth => Ok(ReportableError::NotEnoughBandwidth),
         }
     }
 }
@@ -116,6 +204,88 @@ pub struct UsbDeviceId {
 impl std::fmt::Display for UsbDeviceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:03}/{:03}", self.bus_number, self.device_addr)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromZeros, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(u8)]
+pub enum Dir {
+    Out = 0,
+    In = 128,
+}
+
+impl Dir {
+    #[inline]
+    pub const fn from_u8(num: u8) -> Dir {
+        match num & 0x80 {
+            0 => Dir::Out,
+            128 => Dir::In,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl From<Dir> for vhci::usbfs::Dir {
+    fn from(value: Dir) -> Self {
+        match value {
+            Dir::Out => Self::Out,
+            Dir::In => Self::In,
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(transparent)]
+pub struct Endpoint(pub u8);
+
+impl Endpoint {
+    #[inline]
+    pub const fn dir(&self) -> Dir {
+        Dir::from_u8(self.0)
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}/{}", self.dir(), self.0)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromZeros, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(u8)]
+pub enum TransferKind {
+    Isochronous = 0,
+    Interrupt,
+    Control,
+    Bulk,
+}
+
+impl From<TransferKind> for vhci::ioctl::UrbType {
+    fn from(value: TransferKind) -> Self {
+        match value {
+            TransferKind::Isochronous => vhci::ioctl::UrbType::Iso,
+            TransferKind::Interrupt => vhci::ioctl::UrbType::Int,
+            TransferKind::Control => vhci::ioctl::UrbType::Ctrl,
+            TransferKind::Bulk => vhci::ioctl::UrbType::Bulk,
+        }
+    }
+}
+
+impl From<vhci::ioctl::UrbType> for TransferKind {
+    fn from(value: vhci::ioctl::UrbType) -> Self {
+        use vhci::ioctl::UrbType::*;
+        match value {
+            Iso => Self::Isochronous,
+            Int => Self::Interrupt,
+            Ctrl => Self::Control,
+            Bulk => Self::Bulk,
+        }
     }
 }
 
@@ -271,8 +441,8 @@ pub trait SendUsbDeviceInfo {
     fn interfaces(&self) -> &[UsbInterfaceInfo];
 }
 
-#[derive(FromZeros, KnownLayout, Immutable, IntoBytes)]
-#[repr(C, packed)]
+#[derive(FromZeros, KnownLayout, Immutable)]
+#[repr(C)]
 pub struct UsbDeviceInfo {
     pub header: UsbDeviceInfoHeader,
     pub interfaces: [UsbInterfaceInfo],
@@ -379,6 +549,17 @@ pub struct Header {
     pub seqnum: u32,
 }
 
+impl Header {
+    pub const fn as_u64_le(&self) -> u64 {
+        transmute!(*self)
+    }
+}
+
+#[inline]
+pub const fn compress_frame_len(len: usize) -> u16 {
+    (len / size_of::<u64>()) as u16
+}
+
 /// A URB frame header
 ///
 /// # How to fill in this header
@@ -457,18 +638,34 @@ pub struct Header {
 ///
 /// let real_buffer_len = padded_transfer_len * (has_transfer as usize) + iso_byte_len;
 /// ```
-#[derive(Debug, Clone, KnownLayout, Immutable, IntoBytes, FromZeros)]
+#[derive(Debug, Clone, Copy, KnownLayout, Immutable, IntoBytes, FromZeros)]
 #[repr(C)]
 pub struct UrbHeader {
     pub actual_transfer_len: u16,
     pub iso_packet_count: u16,
-    pub endpoint: vhci::ioctl::Endpoint,
-    pub kind: vhci::ioctl::UrbType,
+    pub endpoint: Endpoint,
+    pub kind: TransferKind,
     pub interval: u16,
-    pub status: vhci::Status,
+    pub status: TransferStatus,
+    pub _padding: [u8; 3],
     pub flags: u16,
     pub num_errors: u16,
     pub ctrl_packet: vhci::ioctl::IocSetupPacket,
+}
+
+#[inline]
+pub fn padding(actual_transfer_len: u16) -> &'static [u8] {
+    static PADDING: [u8; 7] = [0; 7];
+    let actual_transfer_len = usize::from(actual_transfer_len);
+    let padded_len = align(actual_transfer_len, size_of::<u64>()) - actual_transfer_len;
+    &PADDING[..padded_len]
+}
+
+#[derive(KnownLayout, Immutable, FromZeros)]
+#[repr(C)]
+pub struct Ctrl {
+    setup: IocSetupPacket,
+    data: [u8],
 }
 
 /*
@@ -478,7 +675,6 @@ struct UrbRequestHeader {
     endpoint: vhci::ioctl::Endpoint,
     interval: u8,
     _padding: [u8; 3],
-    ctrl_packet: vhci::ioctl::IocSetupPacket,
 }
 Request: 2 + 1 + 1 + 1 + 3 + 8 = 16
 
@@ -486,21 +682,14 @@ struct UrbReplyHeader {
     actual_transfer_len: u16,
     kind_and_iso_packet_count: KindAndPacketCnt,
     endpoint: vhci::ioctl::Endpoint,
-    status: vhci::Status,
+    status: <T that reports status>,
+    _padding: [u8; 3]
 }
-Reply: 2 + 1 + 1 + 4 = 8
+Reply: 2 + 1 + 1 + 1 + 3 = 8
 
 We can calculate `num_errors` on the fly if we need to.
 
 */
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UrbKind {
-    Iso(u8),
-    Int,
-    Ctrl,
-    Bulk,
-}
 
 const PKT_MASK: u8 = 0b00111111;
 const MAX_PKTS: u8 = 0b00111111;
@@ -569,17 +758,17 @@ impl PackedKind {
 impl UrbHeader {
     #[inline]
     pub const fn padded_transfer_len(&self) -> usize {
-        crate::utils::align(self.actual_transfer_len as usize, size_of::<u64>())
+        align(self.actual_transfer_len as usize, size_of::<u64>())
     }
 
     #[inline]
     pub const fn is_out(&self) -> bool {
-        matches!(self.endpoint.direction(), vhci::usbfs::Dir::Out)
+        matches!(self.endpoint.dir(), Dir::Out)
     }
 
     #[inline]
     pub const fn is_pending(&self) -> bool {
-        matches!(self.status, vhci::Status::Pending)
+        matches!(self.status, TransferStatus::Pending)
     }
 
     #[inline]
@@ -596,8 +785,8 @@ impl UrbHeader {
     }
 }
 
-#[derive(KnownLayout, Immutable, FromZeros, IntoBytes)]
-#[repr(C, packed)]
+#[derive(KnownLayout, Immutable, FromZeros)]
+#[repr(C)]
 pub struct UrbFrame {
     pub header: UrbHeader,
     pub data: [u8],
@@ -605,9 +794,7 @@ pub struct UrbFrame {
 
 impl UrbFrame {
     pub const fn header(&self) -> UrbHeader {
-        // SAFETY: UrbHeader pointer is valid if UrbFrame is valid,
-        //         which it is.
-        unsafe { (&raw const self.header).read_unaligned() }
+        self.header
     }
 }
 
@@ -615,6 +802,7 @@ impl GetSliceLen for UrbFrame {
     type Header = UrbHeader;
     type Data = u8;
 
+    #[inline]
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const BASE_LEN: usize = size_of::<UrbHeader>();
 
@@ -645,8 +833,8 @@ impl GetSliceLen for UrbFrame {
     }
 }
 
-#[derive(KnownLayout, Immutable, FromZeros, IntoBytes)]
-#[repr(C, packed)]
+#[derive(KnownLayout, Immutable, FromZeros)]
+#[repr(C)]
 pub struct QusbFrame {
     pub header: Header,
     pub data: [u8],
@@ -656,13 +844,14 @@ impl GetSliceLen for QusbFrame {
     type Header = Header;
     type Data = u8;
 
+    #[inline]
     fn get_slice_len(buf: &[u8]) -> Result<usize, GetSliceLenErr> {
         const BASE_LEN: usize = size_of::<Header>();
 
         let frame_len = buf
             .split_first_chunk::<{ size_of::<u16>() }>()
             .map(|(arr, _)| u16::from_le_bytes(*arr))
-            .ok_or(GetSliceLenErr::BufferShort {
+            .ok_or_else(|| GetSliceLenErr::BufferShort {
                 num_bytes_needed: BASE_LEN - buf.len(),
             })?;
 

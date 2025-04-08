@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use atomic_waker::AtomicWaker;
 use core::fmt;
 use fxhash::FxBuildHasher;
 use nohash_hasher::IsEnabled;
@@ -10,12 +9,6 @@ use std::{
     fmt::Debug,
     future::Future,
     hash::Hash,
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -80,7 +73,7 @@ pub mod alloc {
     }
 }
 pub mod task {
-    use std::sync::{LazyLock, RwLock};
+    use std::sync::LazyLock;
     use super::mpsc;
 
     struct Task(Box<dyn FnOnce() + Send + 'static>);
@@ -89,7 +82,7 @@ pub mod task {
 
     struct BlockingThread {
         handle: std::thread::JoinHandle<()>,
-        task_tx: RwLock<mpsc::AsyncSender<Task>>,
+        task_tx: mpsc::AsyncSender<Task>,
     }
 
     static THREAD: LazyLock<BlockingThread> = LazyLock::new(|| {
@@ -100,67 +93,13 @@ pub mod task {
                     thunk();
                 }
             }),
-            task_tx: RwLock::new(tx.into_sink()),
+            task_tx: tx.into_sink(),
         }
     });
 
     pub fn spawn_blocking(f: impl FnOnce() + Send + 'static) {
-        THREAD.task_tx.read().unwrap().sender().send(Task(Box::new(f))).unwrap();
+        THREAD.task_tx.sender().send(Task(Box::new(f))).unwrap();
     }
-}
-
-#[derive(Clone)]
-pub struct OnceFlag {
-    inner: Arc<(AtomicWaker, AtomicBool)>,
-}
-
-impl OnceFlag {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new((AtomicWaker::new(), AtomicBool::new(false))),
-        }
-    }
-
-    pub fn signal(&self) {
-        self.inner.1.store(true, Ordering::Relaxed);
-        self.inner.0.wake();
-    }
-}
-
-impl Future for OnceFlag {
-    type Output = ();
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        if self.inner.1.load(Ordering::Relaxed) {
-            return Poll::Ready(());
-        }
-
-        self.inner.0.register(cx.waker());
-
-        if self.inner.1.load(Ordering::Relaxed) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-pub fn new_blocking_task(
-    f: impl FnOnce() + Send + 'static,
-) -> (OnceFlag, impl FnOnce() + Send + 'static) {
-    let ours = OnceFlag::new();
-    let theirs = ours.clone();
-    let task = move || {
-        f();
-        theirs.signal();
-    };
-    (ours, task)
-}
-
-pub fn spawn_blocking(f: impl FnOnce() + Send + 'static) -> OnceFlag {
-    let (flag, task) = new_blocking_task(f);
-    task::spawn_blocking(task);
-    flag
 }
 
 pub struct Interval {
@@ -758,22 +697,6 @@ pub const fn align_to_usize(val: usize) -> usize {
 //     buf.clear();
 //     Ok(Some(recv))
 // }
-
-pub trait CloseStream {
-    fn close(&mut self) -> io::Result<()>;
-    fn stopped(&mut self) -> impl Future<Output = io::Result<()>> + Send;
-}
-
-impl CloseStream for compio_quic::SendStream {
-    fn close(&mut self) -> io::Result<()> {
-        self.finish().map_err(io::Error::from)
-    }
-
-    async fn stopped(&mut self) -> io::Result<()> {
-        self.stopped().await.map_err(io::Error::from)?;
-        Ok(())
-    }
-}
 
 pub struct Timer(Instant);
 

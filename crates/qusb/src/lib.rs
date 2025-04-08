@@ -43,8 +43,8 @@ pub fn usb_ids() -> &'static UsbIds {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{0}")]
-    Io(#[from] io::Error),
+    #[error(transparent)]
+    Network(#[from] io::Error),
     #[error("unsupported qusb protocol version (their version: {0}, our version: {ver})", ver = proto::QUSB_VER)]
     VersionMismatch(msg::Version),
     #[error("{0:?} not found")]
@@ -53,10 +53,32 @@ pub enum Error {
     ReqFailed,
     #[error("unknown data from peer")]
     Unknown,
-    #[error("{0:?} in error state")]
-    DevErr(msg::UsbDeviceId),
-    #[error("{0:?} suddenly disconnected")]
-    DevDisconnect(msg::UsbDeviceId)
+    #[error("device err: {0}")]
+    Usb(#[from] lend::error::UsbError),
+    #[error(transparent)]
+    Vhci(#[from] borrow::error::VhciError),
+}
+
+impl From<::lend::error::Error> for Error {
+    fn from(value: ::lend::error::Error) -> Self {
+        match value {
+            lend::error::Error::Usb(err) => err.into(),
+            lend::error::Error::Recv(proto::RecvError::Io(err)) | lend::error::Error::Send(err) => {
+                err.into()
+            }
+            lend::error::Error::Recv(proto::RecvError::CorruptedData) => Error::Unknown,
+        }
+    }
+}
+
+impl From<::borrow::error::Error> for Error {
+    fn from(value: ::borrow::error::Error) -> Self {
+        match value {
+            borrow::error::Error::Vhci(err) => err.into(),
+            borrow::error::Error::Recv(proto::RecvError::Io(err)) | borrow::error::Error::Send(err) => err.into(),
+            borrow::error::Error::Recv(proto::RecvError::CorruptedData) => Error::Unknown,
+        }
+    }
 }
 
 // impl From<quinn::StoppedError> for Error {
@@ -93,18 +115,18 @@ impl From<RusbError> for Error {
     fn from(value: RusbError) -> Self {
         match value.kind {
             rusb::Error::Io => todo!(),
-            rusb::Error::InvalidParam => Error::Io(io::ErrorKind::InvalidInput.into()),
-            rusb::Error::Access => Error::Io(io::ErrorKind::PermissionDenied.into()),
+            rusb::Error::InvalidParam => Error::Network(io::ErrorKind::InvalidInput.into()),
+            rusb::Error::Access => Error::Network(io::ErrorKind::PermissionDenied.into()),
             rusb::Error::NoDevice | rusb::Error::NotFound => Error::DevNotFound(value.dev_id),
-            rusb::Error::Busy => Error::Io(io::ErrorKind::ResourceBusy.into()),
-            rusb::Error::Timeout => Error::Io(io::ErrorKind::TimedOut.into()),
+            rusb::Error::Busy => Error::Network(io::ErrorKind::ResourceBusy.into()),
+            rusb::Error::Timeout => Error::Network(io::ErrorKind::TimedOut.into()),
             rusb::Error::Overflow => todo!(),
-            rusb::Error::Pipe => Error::Io(io::ErrorKind::BrokenPipe.into()),
-            rusb::Error::Interrupted => Error::Io(io::ErrorKind::Interrupted.into()),
-            rusb::Error::NoMem => Error::Io(io::ErrorKind::OutOfMemory.into()),
-            rusb::Error::NotSupported => Error::Io(io::ErrorKind::Unsupported.into()),
+            rusb::Error::Pipe => Error::Network(io::ErrorKind::BrokenPipe.into()),
+            rusb::Error::Interrupted => Error::Network(io::ErrorKind::Interrupted.into()),
+            rusb::Error::NoMem => Error::Network(io::ErrorKind::OutOfMemory.into()),
+            rusb::Error::NotSupported => Error::Network(io::ErrorKind::Unsupported.into()),
             rusb::Error::BadDescriptor => todo!(),
-            rusb::Error::Other => Error::Io(io::ErrorKind::Other.into()),
+            rusb::Error::Other => Error::Network(io::ErrorKind::Other.into()),
         }
     }
 }
@@ -139,7 +161,7 @@ pub(crate) struct UrbWithIsoData<'a> {
 
 impl vhci::Urb for UrbWithIsoData<'_> {
     fn kind(&self) -> vhci::ioctl::UrbType {
-        self.header.kind
+        self.header.kind.into()
     }
 
     fn handle(&self) -> vhci::ioctl::UrbHandle {
@@ -147,11 +169,11 @@ impl vhci::Urb for UrbWithIsoData<'_> {
     }
 
     fn status(&self) -> vhci::Status {
-        self.header.status
+        self.header.status.into()
     }
 
     fn dir(&self) -> vhci::usbfs::Dir {
-        self.header.endpoint.direction()
+        self.header.endpoint.dir().into()
     }
 
     fn bytes_transferred(&self) -> u16 {
@@ -384,7 +406,7 @@ impl Session {
             msg::Resp::Failure {
                 stat: msg::Status::DevBusy,
                 ..
-            } => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
+            } => return Err(Error::Network(io::ErrorKind::ResourceBusy.into())),
             msg::Resp::Failure {
                 stat: msg::Status::NoDev,
                 ..
@@ -472,7 +494,7 @@ impl Session {
             msg::Resp::Failure {
                 stat: msg::Status::DevBusy,
                 ..
-            } => return Err(Error::Io(io::ErrorKind::ResourceBusy.into())),
+            } => return Err(Error::Network(io::ErrorKind::ResourceBusy.into())),
             msg::Resp::Failure {
                 stat: msg::Status::NoDev,
                 ..
@@ -721,8 +743,8 @@ impl Server {
                 }
             }
 
-            cancel_for_serve.cancel();
             drop(task_tx);
+            cancel_for_serve.cancel();
             while let Some(result) = task_rx.next().await {
                 match result {
                     (id, Ok(_)) => info!("session {id} completed successfully"),

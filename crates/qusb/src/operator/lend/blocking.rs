@@ -5,7 +5,8 @@ use std::{
     task::{Poll, ready},
 };
 
-use tracing::{Span, debug, error, warn};
+use proto::TransferError;
+use tracing::{Span, error, warn};
 
 use crate::operator::Seq;
 
@@ -22,7 +23,7 @@ enum State {
     Waiting {
         join: compio_runtime::JoinHandle<rusb::Result<()>>,
     },
-    Complete(vhci::Status),
+    Complete(Result<(), TransferError>),
 }
 
 impl BlockingOps for Arc<super::device::Handle> {
@@ -69,7 +70,7 @@ pub struct SetInterface {
 }
 
 impl Future for SetInterface {
-    type Output = Seq<vhci::Status>;
+    type Output = Seq<Result<(), TransferError>>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -96,7 +97,7 @@ impl Future for SetInterface {
                         //     "({}) set alternate setting {} for interface {}",
                         //     self.seqnum, self.setting, self.interface
                         // );
-                        State::Complete(vhci::Status::Success)
+                        State::Complete(Ok(()))
                     }
                     Err(rusb::Error::NotFound) => todo!(),
                     Err(rusb::Error::NoDevice) => todo!(),
@@ -108,7 +109,7 @@ impl Future for SetInterface {
                             self.setting,
                             self.interface,
                         };
-                        State::Complete(vhci::Status::Stall)
+                        State::Complete(Err(TransferError::Reportable(proto::ReportableError::Stall)))
                     }
                 },
                 State::Complete(status) => {
@@ -130,7 +131,7 @@ pub struct SetConfig {
 }
 
 impl Future for SetConfig {
-    type Output = Seq<vhci::Status>;
+    type Output = Seq<Result<(), TransferError>>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -147,11 +148,11 @@ impl Future for SetConfig {
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
                     Ok(_) => {
                         // debug!("({}) set config {}", self.seqnum, self.config);
-                        State::Complete(vhci::Status::Success)
+                        State::Complete(Ok(()))
                     }
                     Err(err) => {
                         warn!(%err, "({}) couldn't set configuration", self.seqnum);
-                        State::Complete(vhci::Status::Stall)
+                        State::Complete(Err(TransferError::Reportable(proto::ReportableError::Stall)))
                     }
                 },
                 State::Complete(status) => {
@@ -173,7 +174,7 @@ pub struct ClearStall {
 }
 
 impl Future for ClearStall {
-    type Output = Seq<vhci::Status>;
+    type Output = Seq<Result<(), TransferError>>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
@@ -190,10 +191,10 @@ impl Future for ClearStall {
                     State::Waiting { join }
                 }
                 State::Waiting { ref mut join } => match ready!(pin!(join).poll(cx)).unwrap() {
-                    Ok(_) => State::Complete(vhci::Status::Success),
+                    Ok(_) => State::Complete(Ok(())),
                     Err(err) => {
                         warn! { %err, "({}) couldn't clear stall for endpoint {}", self.seqnum, self.endpoint };
-                        State::Complete(vhci::Status::Stall)
+                        State::Complete(Err(TransferError::Reportable(proto::ReportableError::Stall)))
                     }
                 },
                 State::Complete(status) => {

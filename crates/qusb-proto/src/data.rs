@@ -1,5 +1,4 @@
 use std::fmt::Debug;
-use std::ptr::NonNull;
 use std::{io, marker::PhantomData};
 
 use bytes::{Buf as _, BufMut};
@@ -56,23 +55,29 @@ where
 }
 
 pub struct Data<T: ?Sized> {
-    value: NonNull<T>,
     buf: BytesMut,
     _p: PhantomData<T>,
 }
 
 impl<T> Data<T>
 where
-    T: KnownLayout + TryFromBytes + Immutable + ?Sized + IntoBytes,
+    T: KnownLayout + TryFromBytes + Immutable + ?Sized,
 {
     pub fn get(&self) -> &T {
-        // SAFETY: The value is accessible as long as we hold the buffer.
-        unsafe { self.value.as_ref() }
+        // SAFETY: We already verified that this was valid
+        // in the constructor and there's no other way to mutate
+        // our bytes.
+        unsafe { T::try_ref_from_bytes(&self.buf).unwrap_unchecked() }
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
-        // SAFETY: The value is accessible as long as we hold the buffer.
-        unsafe { self.value.as_mut() }
+    pub fn get_mut(&mut self) -> &mut T
+    where
+        T: IntoBytes
+    {
+        // SAFETY: We already verified that this was valid
+        // in the constructor and there's no other way to mutate
+        // our bytes.
+        unsafe { T::try_mut_from_bytes(&mut self.buf).unwrap_unchecked() }
     }
 
     #[inline]
@@ -83,18 +88,16 @@ where
         // SAFETY: The value is accessible as long as we hold the buffer.
         // Plus, we already verified that type T can be trivially read
         // when we created Data<T>.
-        unsafe { self.value.read() }
+        unsafe { T::try_read_from_bytes(&self.buf).unwrap_unchecked() }
     }
 
     #[inline]
     fn new(mut buf: BytesMut) -> Result<Self, ReadError> {
-        let ptr = T::try_mut_from_bytes(&mut buf).map_err(|_| ReadError::CorruptedData)?;
-        // SAFETY: We own the buffer so we ensure that
-        // its data never gets mutated nor moved.
-        let value = unsafe { NonNull::new_unchecked(ptr) };
+        // This verifies that we're safe to trust this
+        // result for the rest of `Data`'s lifetime.
+        T::try_ref_from_bytes(&mut buf).map_err(|_| ReadError::CorruptedData)?;
         Ok(Self {
             buf,
-            value,
             _p: PhantomData,
         })
     }
@@ -121,7 +124,7 @@ where
     pub fn split<U>(self) -> (T::Header, Option<Data<U>>)
     where
         T: GetSliceLen,
-        U: TryFromBytes + Immutable + KnownLayout + ?Sized + IntoBytes,
+        U: TryFromBytes + Immutable + KnownLayout + ?Sized,
     {
         let header = self.get().header();
         let data = self.split_data();
@@ -132,7 +135,7 @@ where
     pub fn split_data<U>(mut self) -> Option<Data<U>>
     where
         T: GetSliceLen,
-        U: ?Sized + TryFromBytes + IntoBytes + KnownLayout + Immutable,
+        U: ?Sized + TryFromBytes + KnownLayout + Immutable,
     {
         self.buf.advance(size_of::<T::Header>());
         Data::new(self.buf).ok()
@@ -315,52 +318,52 @@ impl Ring {
         self.buf.as_mut().reserve(additional);
     }
 
-    pub fn peek<T>(&self) -> Result<&T, ReadError>
-    where
-        T: TryFromBytes + KnownLayout + Immutable,
-    {
-        let size_of_t = std::mem::size_of::<T>();
-        if self.buf.as_ref().len() < size_of_t {
-            return Err(ReadError::BufferShort {
-                num_bytes_needed: size_of_t - self.buf.as_ref().len(),
-            });
-        }
-        T::try_ref_from_bytes(&self.buf.as_ref()[..size_of_t]).map_err(|_| ReadError::CorruptedData)
-    }
+    // pub fn peek<T>(&self) -> Result<&T, ReadError>
+    // where
+    //     T: TryFromBytes + KnownLayout + Immutable,
+    // {
+    //     let size_of_t = std::mem::size_of::<T>();
+    //     if self.buf.as_ref().len() < size_of_t {
+    //         return Err(ReadError::BufferShort {
+    //             num_bytes_needed: size_of_t - self.buf.as_ref().len(),
+    //         });
+    //     }
+    //     T::try_ref_from_bytes(&self.buf.as_ref()[..size_of_t]).map_err(|_| ReadError::CorruptedData)
+    // }
 
-    pub fn peek_dst<T>(&self) -> Result<&T, ReadError>
-    where
-        T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
-    {
-        let len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
-        T::try_ref_from_prefix_with_elems(self.buf.as_ref(), len)
-            .map_err(|_| ReadError::CorruptedData)
-            .map(|(item, _)| item)
-    }
+    // pub fn peek_dst<T>(&self) -> Result<&T, ReadError>
+    // where
+    //     T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+    // {
+    //     let len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
+    //     T::try_ref_from_prefix_with_elems(self.buf.as_ref(), len)
+    //         .map_err(|_| ReadError::CorruptedData)
+    //         .map(|(item, _)| item)
+    // }
 
-    pub fn peek_mut<T>(&mut self) -> Result<&mut T, ReadError>
-    where
-        T: TryFromBytes + KnownLayout + Immutable + IntoBytes,
-    {
-        let size_of = std::mem::size_of::<T>();
-        if self.buf.as_ref().len() < size_of {
-            return Err(ReadError::BufferShort {
-                num_bytes_needed: size_of - self.buf.as_ref().len(),
-            });
-        }
-        T::try_mut_from_bytes(&mut self.buf.as_mut()[..size_of])
-            .map_err(|_| ReadError::CorruptedData)
-    }
+    // pub fn peek_mut<T>(&mut self) -> Result<&mut T, ReadError>
+    // where
+    //     T: TryFromBytes + KnownLayout + Immutable + IntoBytes,
+    // {
+    //     let size_of = std::mem::size_of::<T>();
+    //     if self.buf.as_ref().len() < size_of {
+    //         return Err(ReadError::BufferShort {
+    //             num_bytes_needed: size_of - self.buf.as_ref().len(),
+    //         });
+    //     }
+    //     T::try_mut_from_bytes(&mut self.buf.as_mut()[..size_of])
+    //         .map_err(|_| ReadError::CorruptedData)
+    // }
 
-    pub fn peek_mut_dst<T>(&mut self) -> Result<&mut T, ReadError>
-    where
-        T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
-    {
-        let len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
-        T::try_mut_from_prefix_with_elems(self.buf.as_mut(), len)
-            .map_err(|_| ReadError::CorruptedData)
-            .map(|(item, _)| item)
-    }
+    // pub fn peek_mut_dst<T>(&mut self) -> Result<&mut T, ReadError>
+    // where
+    //     T: TryFromBytes + GetSliceLen + Immutable + ?Sized,
+    // {
+    //     let len = T::get_slice_len(self.buf.as_ref()).map_err(ReadError::from)?;
+    //     T::try_mut_from_prefix_with_elems(self.buf.as_mut(), len)
+    //         .map_err(|_| ReadError::CorruptedData)
+    //         .map(|(item, _)| item)
+    // }
 
     /// Copies out `size_of::<T>()` bytes from the buffer
     /// as a pointer read operation, then consumes
